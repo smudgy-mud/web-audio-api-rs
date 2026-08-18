@@ -8,6 +8,8 @@ pub use base::*;
 mod concrete_base;
 pub use concrete_base::*;
 
+mod injected_admission;
+
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
 #[cfg(feature = "diagnostics")]
