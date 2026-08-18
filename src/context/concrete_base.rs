@@ -1,8 +1,8 @@
 //! The `ConcreteBaseAudioContext` type
 
 use crate::context::{
-    AudioContextRegistration, AudioContextState, AudioNodeId, BaseAudioContext,
-    DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS,
+    AdmissionError, AudioContextRegistration, AudioContextState, AudioNodeId, BaseAudioContext,
+    InjectedContextAdmissionGate, DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS,
 };
 use crate::events::{EventDispatch, EventHandler, EventLoop, EventType};
 use crate::message::{ControlBatchApplied, ControlBatchSender, ControlMessage};
@@ -13,10 +13,175 @@ use crate::spatial::AudioListenerParams;
 
 use crate::AudioListener;
 
-use crossbeam_channel::{SendError, Sender};
+use crossbeam_channel::{Sender, TrySendError};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
+
+/// Control-side authority for submitting public event records.
+///
+/// Legacy and offline contexts retain their blocking sender behavior. The private injected form
+/// never exposes its raw sender: every attempt first acquires a short admission and holds it until
+/// a rejected record has been destroyed on the caller thread. Render-owned event producers keep a
+/// separate raw sender in `RenderThreadInit` and deliberately do not use this capability.
+#[derive(Clone)]
+pub(crate) struct ControlEventDispatch {
+    mode: ControlEventDispatchMode,
+}
+
+#[derive(Clone)]
+enum ControlEventDispatchMode {
+    Legacy(Sender<EventDispatch>),
+    Injected {
+        sender: Sender<EventDispatch>,
+        gate: InjectedContextAdmissionGate,
+        #[cfg(test)]
+        after_admission: Option<Arc<dyn Fn() + Send + Sync>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControlEventSendOutcome {
+    Delivered,
+    Full,
+    Disconnected,
+    AdmissionRejected(AdmissionError),
+}
+
+impl ControlEventDispatch {
+    fn legacy(sender: Sender<EventDispatch>) -> Self {
+        Self {
+            mode: ControlEventDispatchMode::Legacy(sender),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy_for_test(sender: Sender<EventDispatch>) -> Self {
+        Self::legacy(sender)
+    }
+
+    #[allow(dead_code)] // selected by the pending private injected AudioContext constructor
+    pub(crate) fn injected(
+        sender: Sender<EventDispatch>,
+        gate: InjectedContextAdmissionGate,
+    ) -> Self {
+        Self {
+            mode: ControlEventDispatchMode::Injected {
+                sender,
+                gate,
+                #[cfg(test)]
+                after_admission: None,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn injected_with_observer(
+        sender: Sender<EventDispatch>,
+        gate: InjectedContextAdmissionGate,
+        after_admission: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            mode: ControlEventDispatchMode::Injected {
+                sender,
+                gate,
+                after_admission: Some(after_admission),
+            },
+        }
+    }
+
+    pub(crate) fn injected_gate(&self) -> Option<InjectedContextAdmissionGate> {
+        match &self.mode {
+            ControlEventDispatchMode::Legacy(_) => None,
+            ControlEventDispatchMode::Injected { gate, .. } => Some(gate.clone()),
+        }
+    }
+
+    /// Submit an ordinary control-side event.
+    ///
+    /// This preserves the legacy blocking send. Injected contexts are always non-waiting and can
+    /// drop an event on phase-lock contention or a full event queue.
+    pub(crate) fn send_with<F>(&self, make_event: F) -> ControlEventSendOutcome
+    where
+        F: FnOnce() -> EventDispatch + Copy,
+    {
+        match &self.mode {
+            ControlEventDispatchMode::Legacy(sender) => match sender.send(make_event()) {
+                Ok(()) => ControlEventSendOutcome::Delivered,
+                Err(error) => {
+                    drop(error.into_inner());
+                    ControlEventSendOutcome::Disconnected
+                }
+            },
+            ControlEventDispatchMode::Injected { .. } => self.try_send_injected(make_event),
+        }
+    }
+
+    /// Submit a diagnostic event without waiting for queue capacity.
+    pub(crate) fn try_send_with<F>(&self, make_event: F) -> ControlEventSendOutcome
+    where
+        F: FnOnce() -> EventDispatch + Copy,
+    {
+        match &self.mode {
+            ControlEventDispatchMode::Legacy(sender) => match sender.try_send(make_event()) {
+                Ok(()) => ControlEventSendOutcome::Delivered,
+                Err(TrySendError::Full(event)) => {
+                    drop(event);
+                    ControlEventSendOutcome::Full
+                }
+                Err(TrySendError::Disconnected(event)) => {
+                    drop(event);
+                    ControlEventSendOutcome::Disconnected
+                }
+            },
+            ControlEventDispatchMode::Injected { .. } => self.try_send_injected(make_event),
+        }
+    }
+
+    fn try_send_injected<F>(&self, make_event: F) -> ControlEventSendOutcome
+    where
+        F: FnOnce() -> EventDispatch + Copy,
+    {
+        let ControlEventDispatchMode::Injected {
+            sender,
+            gate,
+            #[cfg(test)]
+            after_admission,
+        } = &self.mode
+        else {
+            unreachable!("injected event submission requires injected capability")
+        };
+
+        let admission = match gate.try_external_event() {
+            Ok(admission) => admission,
+            Err(error) => return ControlEventSendOutcome::AdmissionRejected(error),
+        };
+        #[cfg(test)]
+        if let Some(observer) = after_admission {
+            observer();
+        }
+
+        // Construct the record only after admission. `Copy` structurally excludes an owned
+        // destructor-bearing capture, so rejecting admission can discard the uninvoked factory
+        // without hidden cleanup. Event payload ownership begins within the admitted region and
+        // rejected channel payloads are destroyed before the permit is released.
+        let outcome = match sender.try_send(make_event()) {
+            Ok(()) => ControlEventSendOutcome::Delivered,
+            Err(TrySendError::Full(event)) => {
+                // The short permit deliberately covers caller-side destruction of a rejected
+                // payload; sealing cannot claim this producer drained while cleanup is running.
+                drop(event);
+                ControlEventSendOutcome::Full
+            }
+            Err(TrySendError::Disconnected(event)) => {
+                drop(event);
+                ControlEventSendOutcome::Disconnected
+            }
+        };
+        drop(admission);
+        outcome
+    }
+}
 
 /// This struct assigns new [`AudioNodeId`]s for [`AudioNode`]s
 ///
@@ -114,8 +279,8 @@ struct ConcreteBaseAudioContextInner {
     state: Arc<AtomicU8>,
     /// Stores the event handlers
     event_loop: EventLoop,
-    /// Sender for events that will be handled by the EventLoop
-    event_send: Sender<EventDispatch>,
+    /// Opaque control-side capability for events handled by the EventLoop.
+    control_events: ControlEventDispatch,
     /// Current audio graph connections (from node, output port, to node, input port)
     connections: Mutex<HashSet<(AudioNodeId, usize, AudioNodeId, usize)>>,
 }
@@ -142,6 +307,68 @@ impl ConcreteBaseAudioContext {
         offline: bool,
         node_id_consumer: llq::Consumer<AudioNodeId>,
     ) -> Self {
+        Self::new_with_control_events(
+            sample_rate,
+            max_channel_count,
+            state,
+            frames_played,
+            render_channel,
+            control_batch_sender,
+            control_batch_applied,
+            ControlEventDispatch::legacy(event_send),
+            event_loop,
+            offline,
+            node_id_consumer,
+        )
+    }
+
+    /// Private construction seam for a future injected context. The raw event sender is consumed
+    /// here and is never recoverable through the resulting base or capacity clones.
+    #[allow(dead_code)] // selected by the pending private injected AudioContext constructor
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_injected(
+        sample_rate: f32,
+        max_channel_count: usize,
+        state: Arc<AtomicU8>,
+        frames_played: Arc<AtomicU64>,
+        render_channel: Sender<ControlMessage>,
+        control_batch_sender: ControlBatchSender,
+        control_batch_applied: ControlBatchApplied,
+        event_send: Sender<EventDispatch>,
+        event_loop: EventLoop,
+        offline: bool,
+        node_id_consumer: llq::Consumer<AudioNodeId>,
+        gate: InjectedContextAdmissionGate,
+    ) -> Self {
+        Self::new_with_control_events(
+            sample_rate,
+            max_channel_count,
+            state,
+            frames_played,
+            render_channel,
+            control_batch_sender,
+            control_batch_applied,
+            ControlEventDispatch::injected(event_send, gate),
+            event_loop,
+            offline,
+            node_id_consumer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_control_events(
+        sample_rate: f32,
+        max_channel_count: usize,
+        state: Arc<AtomicU8>,
+        frames_played: Arc<AtomicU64>,
+        render_channel: Sender<ControlMessage>,
+        control_batch_sender: ControlBatchSender,
+        control_batch_applied: ControlBatchApplied,
+        control_events: ControlEventDispatch,
+        event_loop: EventLoop,
+        offline: bool,
+        node_id_consumer: llq::Consumer<AudioNodeId>,
+    ) -> Self {
         let audio_node_id_provider = AudioNodeIdProvider::new(node_id_consumer);
 
         let base_inner = ConcreteBaseAudioContextInner {
@@ -160,7 +387,7 @@ impl ConcreteBaseAudioContext {
             offline,
             state,
             event_loop,
-            event_send,
+            control_events,
             connections: Mutex::new(HashSet::new()),
         };
         let base = Self {
@@ -345,14 +572,20 @@ impl ConcreteBaseAudioContext {
         *existing = messages;
     }
 
-    pub(crate) fn send_event(&self, msg: EventDispatch) -> Result<(), SendError<EventDispatch>> {
-        self.inner.event_send.send(msg)
+    pub(crate) fn send_event_with<F>(&self, make_event: F) -> Result<(), ControlEventSendOutcome>
+    where
+        F: FnOnce() -> EventDispatch + Copy,
+    {
+        match self.inner.control_events.send_with(make_event) {
+            ControlEventSendOutcome::Delivered => Ok(()),
+            error => Err(error),
+        }
     }
 
-    /// Clone the bounded event capability without retaining this entire context in a background
-    /// metrics worker.
-    pub(crate) fn event_sender(&self) -> Sender<EventDispatch> {
-        self.inner.event_send.clone()
+    /// Clone only the opaque control-side event capability. In injected contexts this cannot be
+    /// converted back into a raw event sender.
+    pub(crate) fn control_event_dispatch(&self) -> ControlEventDispatch {
+        self.inner.control_events.clone()
     }
 
     /// Clone the render-frame clock without retaining this entire context in a background metrics
@@ -445,7 +678,7 @@ impl ConcreteBaseAudioContext {
         let current_state = self.state();
         if current_state != state {
             self.inner.state.store(state as u8, Ordering::Release);
-            let _ = self.send_event(EventDispatch::state_change(state));
+            let _ = self.send_event_with(|| EventDispatch::state_change(state));
         }
     }
 
@@ -714,7 +947,7 @@ mod tests {
 
         context
             .base()
-            .send_event(EventDispatch::sink_change())
+            .send_event_with(EventDispatch::sink_change)
             .unwrap();
         context.base().inner.event_loop.handle_pending_events();
         assert_eq!(activity_count.load(Ordering::Relaxed), 1);
@@ -722,7 +955,7 @@ mod tests {
         context.clear_event_activity_handler();
         context
             .base()
-            .send_event(EventDispatch::sink_change())
+            .send_event_with(EventDispatch::sink_change)
             .unwrap();
         context.base().inner.event_loop.handle_pending_events();
         assert_eq!(activity_count.load(Ordering::Relaxed), 1);

@@ -537,7 +537,7 @@ impl AudioContext {
         drop(backend_manager_guard);
 
         // trigger event when all the work is done
-        let _ = self.base.send_event(EventDispatch::sink_change());
+        let _ = self.base.send_event_with(EventDispatch::sink_change);
 
         log::debug!("SinkChange: done");
         Ok(())

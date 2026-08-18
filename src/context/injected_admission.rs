@@ -1,8 +1,10 @@
 //! Admission and sealing foundation for the future injected online context.
 //!
-//! This module is intentionally not wired into `ConcreteBaseAudioContext` yet. Legacy and offline
-//! contexts therefore keep their existing producer behavior. The gate covers control-owned
-//! producers only: raw render-owned `EventDispatch` production remains outside this phase.
+//! A private construction seam wires this gate to injected control-side event production and
+//! render-capacity workers. No public `AudioContext` constructor selects that seam yet. Legacy and
+//! offline contexts therefore keep their existing producer behavior. The gate covers
+//! control-owned producers only: raw render-owned `EventDispatch` production remains outside this
+//! phase.
 
 #![allow(dead_code)] // Private foundation consumed by the later injected-context integration.
 
@@ -364,6 +366,23 @@ impl InjectedContextAdmissionGate {
                 drain_wake,
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_phase_lock_for_test(
+        &self,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    ) {
+        let _state = self.inner.state.lock().unwrap();
+        entered.send(()).unwrap();
+        release.recv().unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_phase_lock_for_test(&self) {
+        let _state = self.inner.state.lock().unwrap();
+        panic!("poison injected admission gate for test");
     }
 
     fn try_short_admission(&self, kind: AdmissionKind) -> Result<AdmissionPermit, AdmissionError> {
