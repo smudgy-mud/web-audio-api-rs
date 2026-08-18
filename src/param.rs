@@ -171,6 +171,21 @@ pub(crate) struct AudioParamEvent {
     values: Option<Box<[f32]>>, // populated by `SetValueCurveAtTime` events
 }
 
+/// Fixed-size injected-construction payload for an AudioParam's initial value.
+///
+/// Unlike the general `NodeMessage` payload this closed command cannot hide an allocator-backed
+/// value or destructor. It is safe to move through an atomic injected batch and handle directly
+/// on the render thread.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AudioParamInitialValue(f32);
+
+impl AudioParamInitialValue {
+    pub(crate) fn new(value: f32) -> Self {
+        assert_is_finite(value);
+        Self(value)
+    }
+}
+
 // Event queue that contains `AudioParamEvent`s, most of the time, events must be
 // ordered (using stable sort), some operation may break this ordering (e.g. `push`)
 // in which cases `sort` must be called explicitly.
@@ -423,6 +438,16 @@ impl AudioParam {
             duration: None,
             values: None,
         }
+    }
+
+    #[allow(dead_code)] // called by the pending injected Gain transaction
+    pub(crate) fn set_initial_value_for_injected(&self, value: f32) -> AudioParamInitialValue {
+        let initial = AudioParamInitialValue::new(value);
+        let clamped = value.clamp(self.raw_parts.min_value, self.raw_parts.max_value);
+        self.raw_parts
+            .current_value
+            .store(clamped, Ordering::Release);
+        initial
     }
 
     /// Schedules a parameter value change at the given time.
@@ -722,6 +747,19 @@ impl AudioProcessor for AudioParamProcessor {
             self.handle_incoming_event(event);
             return;
         };
+
+        if let Some(AudioParamInitialValue(value)) = msg.downcast_ref::<AudioParamInitialValue>() {
+            self.handle_incoming_event(AudioParamEvent {
+                event_type: AudioParamEventType::SetValue,
+                value: *value,
+                time: 0.,
+                time_constant: None,
+                cancel_time: None,
+                duration: None,
+                values: None,
+            });
+            return;
+        }
 
         log::warn!("AudioParamProcessor: Dropping incoming message {msg:?}");
     }
@@ -1661,6 +1699,37 @@ mod tests {
     use crate::render::Alloc;
 
     use super::*;
+
+    #[test]
+    fn injected_initial_value_is_fixed_size_and_updates_control_and_render_state() {
+        fn assert_copy_send_sync<T: Copy + Send + Sync>() {}
+        assert_copy_send_sync::<AudioParamInitialValue>();
+
+        let context = OfflineAudioContext::new(1, 128, 48_000.);
+        let descriptor = AudioParamDescriptor {
+            name: String::new(),
+            automation_rate: AutomationRate::A,
+            default_value: 1.,
+            min_value: -10.,
+            max_value: 10.,
+        };
+        let (param, mut processor) = audio_param_pair(descriptor, context.mock_registration());
+        let mut initial = param.set_initial_value_for_injected(3.5);
+        assert_eq!(param.value(), 3.5);
+        processor.onmessage(&mut initial);
+        assert_eq!(processor.event_timeline.inner.len(), 1);
+        assert_eq!(processor.event_timeline.inner[0].value, 3.5);
+        assert_eq!(
+            processor.event_timeline.inner[0].event_type,
+            AudioParamEventType::SetValue
+        );
+    }
+
+    #[test]
+    fn injected_initial_value_rejects_non_finite_values_before_construction() {
+        assert!(std::panic::catch_unwind(|| AudioParamInitialValue::new(f32::NAN)).is_err());
+        assert!(std::panic::catch_unwind(|| AudioParamInitialValue::new(f32::INFINITY)).is_err());
+    }
 
     #[test]
     #[should_panic]

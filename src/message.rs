@@ -282,28 +282,48 @@ pub(crate) enum ControlBatchSendError {
     SequenceExhausted,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ControlBatchStorageInFlight {
     count: AtomicUsize,
+    activity: Option<crossbeam_channel::Sender<()>>,
+}
+
+impl Default for ControlBatchStorageInFlight {
+    fn default() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            activity: None,
+        }
+    }
 }
 
 /// Clone-shared, atomically accounted logical command budget for injected control batches.
 #[derive(Clone, Debug)]
 pub(crate) struct InjectedCommandCreditPool {
-    in_flight: Arc<AtomicUsize>,
+    inner: Arc<InjectedCommandCreditState>,
     limit: usize,
 }
 
+#[derive(Debug)]
+struct InjectedCommandCreditState {
+    in_flight: AtomicUsize,
+    activity: crossbeam_channel::Sender<()>,
+}
+
 impl InjectedCommandCreditPool {
-    pub(crate) fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize, activity: crossbeam_channel::Sender<()>) -> Self {
         Self {
-            in_flight: Arc::new(AtomicUsize::new(0)),
+            inner: Arc::new(InjectedCommandCreditState {
+                in_flight: AtomicUsize::new(0),
+                activity,
+            }),
             limit,
         }
     }
 
     pub(crate) fn try_acquire(&self, count: usize) -> Option<InjectedCommandCredit> {
-        self.in_flight
+        self.inner
+            .in_flight
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(count)
@@ -311,14 +331,14 @@ impl InjectedCommandCreditPool {
             })
             .ok()
             .map(|_| InjectedCommandCredit {
-                in_flight: Arc::clone(&self.in_flight),
+                inner: Arc::clone(&self.inner),
                 count,
             })
     }
 
     #[allow(dead_code)] // Observable by the private injected transport tests.
     pub(crate) fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::Acquire)
+        self.inner.in_flight.load(Ordering::Acquire)
     }
 }
 
@@ -326,61 +346,76 @@ impl InjectedCommandCreditPool {
 /// storage is reclaimed off RT; it is deliberately unrelated to physical channel capacity.
 #[derive(Debug)]
 pub(crate) struct InjectedCommandCredit {
-    in_flight: Arc<AtomicUsize>,
+    inner: Arc<InjectedCommandCreditState>,
     count: usize,
 }
 
 impl Drop for InjectedCommandCredit {
     fn drop(&mut self) {
-        let previous = self.in_flight.fetch_sub(self.count, Ordering::AcqRel);
+        let previous = self.inner.in_flight.fetch_sub(self.count, Ordering::AcqRel);
         debug_assert!(previous >= self.count);
+        let _ = self.inner.activity.try_send(());
     }
 }
 
 /// Atomic credit pool for injected physical channel records.
 ///
 /// The render thread retains a pool owner while callbacks can dequeue tokens. Therefore token
-/// Drop performs only atomic operations and cannot destroy the final allocation on RT.
+/// Drop performs one atomic decrement plus a non-waiting best-effort bounded wake, and cannot
+/// destroy the final allocation on RT. The channel wake is not claimed to be lock-free.
 #[derive(Clone, Debug)]
 pub(crate) struct InjectedPhysicalCreditPool {
-    in_flight: Arc<AtomicUsize>,
+    inner: Arc<InjectedPhysicalCreditState>,
     limit: usize,
 }
 
+#[derive(Debug)]
+struct InjectedPhysicalCreditState {
+    in_flight: AtomicUsize,
+    activity: crossbeam_channel::Sender<()>,
+}
+
 impl InjectedPhysicalCreditPool {
-    pub(crate) fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize, activity: crossbeam_channel::Sender<()>) -> Self {
         Self {
-            in_flight: Arc::new(AtomicUsize::new(0)),
+            inner: Arc::new(InjectedPhysicalCreditState {
+                in_flight: AtomicUsize::new(0),
+                activity,
+            }),
             limit,
         }
     }
 
     pub(crate) fn try_acquire(&self) -> Option<InjectedPhysicalCredit> {
-        self.in_flight
+        self.inner
+            .in_flight
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < self.limit).then_some(current + 1)
             })
             .ok()
             .map(|_| InjectedPhysicalCredit {
-                in_flight: Arc::clone(&self.in_flight),
+                inner: Arc::clone(&self.inner),
             })
     }
 
     #[allow(dead_code)] // Observable by the private injected transport tests.
     pub(crate) fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::Acquire)
+        self.inner.in_flight.load(Ordering::Acquire)
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct InjectedPhysicalCredit {
-    in_flight: Arc<AtomicUsize>,
+    inner: Arc<InjectedPhysicalCreditState>,
 }
 
 impl Drop for InjectedPhysicalCredit {
     fn drop(&mut self) {
-        let previous = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.inner.in_flight.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
+        // A best-effort, capacity-one hint. The render-side pool owner guarantees this token does
+        // not destroy the final allocation on RT; the authoritative credit count is atomic.
+        let _ = self.inner.activity.try_send(());
     }
 }
 
@@ -416,6 +451,9 @@ impl Drop for ControlBatchPermit {
     fn drop(&mut self) {
         let previous = self.0.count.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
+        if let Some(activity) = &self.0.activity {
+            let _ = activity.try_send(());
+        }
     }
 }
 
@@ -513,6 +551,15 @@ impl ControlBatchStoragePool {
         }
     }
 
+    pub(crate) fn new_with_activity(activity: crossbeam_channel::Sender<()>) -> Self {
+        Self {
+            inner: Arc::new(ControlBatchStorageInFlight {
+                count: AtomicUsize::new(0),
+                activity: Some(activity),
+            }),
+        }
+    }
+
     pub(crate) fn try_acquire(&self) -> Option<ControlBatchPermit> {
         self.inner.try_acquire()
     }
@@ -582,6 +629,7 @@ impl ControlMessage {
             | Self::ConnectNode { .. }
             | Self::DisconnectNode { .. }
             | Self::MarkCycleBreaker { .. }
+            | Self::AudioParamInitialValue { .. }
             | Self::NodeMessage { .. }
             | Self::SetChannelCount { .. }
             | Self::SetChannelCountMode { .. }
@@ -830,6 +878,13 @@ pub(crate) enum ControlMessage {
         msg: llq::Node<Box<dyn Any + Send>>,
     },
 
+    /// Closed, fixed-size initial AudioParam update for injected construction.
+    #[allow(dead_code)] // constructed by the pending injected Gain transaction
+    AudioParamInitialValue {
+        id: AudioNodeId,
+        value: crate::param::AudioParamInitialValue,
+    },
+
     /// Request a diagnostic report of the audio graph
     #[cfg(feature = "diagnostics")]
     RunDiagnostics { backend: AudioBackendDiagnostics },
@@ -885,6 +940,66 @@ impl OneshotNotify {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn injected_credit_release_wakes_are_coalesced_and_counts_remain_authoritative() {
+        let (activity, receiver) = crossbeam_channel::bounded(1);
+
+        let commands = InjectedCommandCreditPool::new(2, activity.clone());
+        let command_credit = commands.try_acquire(2).unwrap();
+        drop(command_credit);
+        receiver.recv().unwrap();
+        assert_eq!(commands.in_flight(), 0);
+
+        let physical = InjectedPhysicalCreditPool::new(1, activity.clone());
+        let physical_credit = physical.try_acquire().unwrap();
+        drop(physical_credit);
+        receiver.recv().unwrap();
+        assert_eq!(physical.in_flight(), 0);
+
+        let storage = ControlBatchStoragePool::new_with_activity(activity);
+        let first = storage.try_acquire().unwrap();
+        let second = storage.try_acquire().unwrap();
+        drop(first);
+        drop(second);
+        // Capacity one deliberately coalesces multiple releases. The atomic count, not wake
+        // multiplicity, is authoritative.
+        receiver.recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(storage.in_flight(), 0);
+    }
+
+    #[test]
+    fn physical_credit_wake_is_allocation_free_when_empty_full_or_disconnected() {
+        let (empty_send, empty_recv) = crossbeam_channel::bounded(1);
+        let empty = InjectedPhysicalCreditPool::new(1, empty_send);
+        let token = empty.try_acquire().unwrap();
+        alloc_counter::deny_alloc(|| drop(token));
+        empty_recv.recv().unwrap();
+
+        let (full_send, full_recv) = crossbeam_channel::bounded(1);
+        full_send.try_send(()).unwrap();
+        let full = InjectedPhysicalCreditPool::new(1, full_send);
+        let token = full.try_acquire().unwrap();
+        alloc_counter::deny_alloc(|| drop(token));
+        full_recv.recv().unwrap();
+
+        let (disconnected_send, disconnected_recv) = crossbeam_channel::bounded(1);
+        drop(disconnected_recv);
+        let disconnected = InjectedPhysicalCreditPool::new(1, disconnected_send);
+        let token = disconnected.try_acquire().unwrap();
+        alloc_counter::deny_alloc(|| drop(token));
+    }
+
+    #[test]
+    fn injected_initial_param_command_is_closed_and_batchable() {
+        assert!(!std::mem::needs_drop::<crate::param::AudioParamInitialValue>());
+        assert!(ControlMessage::AudioParamInitialValue {
+            id: AudioNodeId(3),
+            value: crate::param::AudioParamInitialValue::new(0.5),
+        }
+        .is_batchable());
+    }
 
     #[test]
     fn batch_submission_contention_is_immediate_and_does_not_consume_sequence() {
