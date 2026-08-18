@@ -7,10 +7,12 @@
 //! and represented-resource guards, then consume the owner's opaque pending reclaim. Fresh ids use
 //! checked arithmetic and never wrap their namespace.
 //!
-//! The later constructor transaction also needs an internal commit-finalizer seam: after the
-//! batch is accepted it must non-panickingly arm registrations and disarm this rollback guard
-//! before releasing its short graph admission. The current ordinary producer releases admission
-//! as `try_commit` returns, so this module is not directly wired until that seam exists.
+//! The injected transport now provides an accepted-batch ordering finalizer, but deliberately
+//! restricts it to `Copy` atomic work. A later concrete Gain transaction wrapper must still own
+//! and non-panickingly disarm provisional ids and arm registrations; those destructor-bearing
+//! guards cannot be captured by the generic ordering hook. B2 must also tolerate a registered
+//! processor rendering and reclaiming before its control-side finalizer returns by representing an
+//! accepted-pending state rather than treating that race as corruption.
 
 #![allow(dead_code)]
 
@@ -18,6 +20,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 
 use super::AudioNodeId;
+use crate::render::graph::Graph;
 
 pub(crate) const MAX_PROVISIONAL_NODE_IDS: usize = 11;
 
@@ -72,12 +75,56 @@ pub(crate) struct InjectedNodeIdOwner {
     inner: Arc<InjectedNodeIdInner>,
     graph_reclaims: llq::Consumer<AudioNodeId>,
     pending_reclaim: Option<llq::Node<AudioNodeId>>,
+    reclaim_activity: crossbeam_channel::Receiver<()>,
+    // While the lifecycle owner is retained, dropping the Graph's publisher cannot destroy the
+    // final channel allocation on the render thread. Lifecycle integration must retire the Graph
+    // before this unique owner.
+    _reclaim_activity_owner: crossbeam_channel::Sender<()>,
+}
+
+/// Opaque, consuming graph initializer. It binds one internally matched reclaim producer and wake
+/// publisher, so publisher installation cannot be omitted. Until a later context wrapper brands
+/// the returned triple, crate code could still misassociate an owner from one call with the
+/// initializer from another.
+pub(crate) struct InjectedGraphReclaimInit {
+    graph_reclaims: llq::Producer<AudioNodeId>,
+    publisher: InjectedGraphReclaimPublisher,
+}
+
+/// Render-side best-effort wake publisher. The authoritative record remains the exact LLQ node.
+/// While its matching lifecycle owner is retained, the channel allocation is lifecycle-owned;
+/// `publish` is bounded and non-waiting but the channel implementation is not claimed lock-free.
+pub(crate) struct InjectedGraphReclaimPublisher {
+    activity: crossbeam_channel::Sender<()>,
+}
+
+impl InjectedGraphReclaimPublisher {
+    pub(crate) fn publish(&self) {
+        let _ = self.activity.try_send(());
+    }
+}
+
+impl InjectedGraphReclaimInit {
+    pub(crate) fn into_graph(self) -> Graph {
+        Graph::new_injected(self.graph_reclaims, self.publisher)
+    }
+
+    #[cfg(test)]
+    fn push_for_test(&mut self, node: llq::Node<AudioNodeId>) {
+        self.graph_reclaims.push(node);
+        self.publisher.publish();
+    }
 }
 
 pub(crate) fn injected_node_id_pair(
     first_id: u64,
-    graph_reclaims: llq::Consumer<AudioNodeId>,
-) -> (InjectedNodeIdAllocator, InjectedNodeIdOwner) {
+) -> (
+    InjectedNodeIdAllocator,
+    InjectedNodeIdOwner,
+    InjectedGraphReclaimInit,
+) {
+    let (graph_reclaims, graph_reclaim_consumer) = llq::Queue::new().split();
+    let (reclaim_activity_owner, reclaim_activity) = crossbeam_channel::bounded(1);
     let (available_return, available) = llq::Queue::new().split();
     let inner = Arc::new(InjectedNodeIdInner {
         allocation: Mutex::new(AllocationState {
@@ -95,8 +142,16 @@ pub(crate) fn injected_node_id_pair(
         },
         InjectedNodeIdOwner {
             inner,
-            graph_reclaims,
+            graph_reclaims: graph_reclaim_consumer,
             pending_reclaim: None,
+            reclaim_activity,
+            _reclaim_activity_owner: reclaim_activity_owner.clone(),
+        },
+        InjectedGraphReclaimInit {
+            graph_reclaims,
+            publisher: InjectedGraphReclaimPublisher {
+                activity: reclaim_activity_owner,
+            },
         },
     )
 }
@@ -274,6 +329,12 @@ impl Drop for ProvisionalNodeIds {
 }
 
 impl InjectedNodeIdOwner {
+    /// Borrowed, lossy wake hint. The future lifecycle driver must always drain the authoritative
+    /// exact-node queue through `try_pending_reclaim`; a wake is never an acknowledgement.
+    pub(crate) const fn reclaim_activity_receiver(&self) -> &crossbeam_channel::Receiver<()> {
+        &self.reclaim_activity
+    }
+
     /// Borrows one exact graph acknowledgement without exposing its `llq::Node`. If reconciliation
     /// returns an error or panics and this value is dropped, the owner retains the exact pending
     /// node in quarantine and the id cannot be reused. Slice B will match its id+generation and
@@ -367,13 +428,42 @@ mod tests {
     fn pair(
         first: u64,
     ) -> (
-        llq::Producer<AudioNodeId>,
+        InjectedGraphReclaimInit,
         InjectedNodeIdAllocator,
         InjectedNodeIdOwner,
     ) {
-        let (graph_return, graph_reclaims) = llq::Queue::new().split();
-        let (allocator, owner) = injected_node_id_pair(first, graph_reclaims);
-        (graph_return, allocator, owner)
+        let (allocator, owner, graph_init) = injected_node_id_pair(first);
+        (graph_init, allocator, owner)
+    }
+
+    #[test]
+    fn reclaim_activity_wake_is_bounded_allocation_free_and_authoritative_queue_wins() {
+        let (_allocator, mut owner, graph) = injected_node_id_pair(0);
+
+        alloc_counter::deny_alloc(|| graph.publisher.publish());
+        owner.reclaim_activity_receiver().recv().unwrap();
+        // Full coalesces without blocking or allocation.
+        graph.publisher.publish();
+        alloc_counter::deny_alloc(|| graph.publisher.publish());
+        owner.reclaim_activity_receiver().recv().unwrap();
+
+        // Disconnect is equally non-waiting. Replace/drop the matching receiver only in this
+        // module-private test; production exposes a borrowed receiver and cannot do this.
+        let (_replacement_send, replacement_recv) = crossbeam_channel::bounded(1);
+        let old = std::mem::replace(&mut owner.reclaim_activity, replacement_recv);
+        drop(old);
+        alloc_counter::deny_alloc(|| graph.publisher.publish());
+        assert!(owner.try_pending_reclaim().is_none());
+    }
+
+    #[test]
+    fn render_publisher_drop_cannot_destroy_lifecycle_owned_wake_allocation() {
+        let (_allocator, owner, graph) = injected_node_id_pair(0);
+        std::thread::spawn(move || drop(graph)).join().unwrap();
+        assert_eq!(
+            owner.reclaim_activity_receiver().try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        );
     }
 
     #[test]
@@ -406,7 +496,7 @@ mod tests {
     #[test]
     fn graph_reclaim_requires_explicit_reconciliation_before_reuse() {
         let (mut graph_return, allocator, mut owner) = pair(30);
-        graph_return.push(llq::Node::new(AudioNodeId(7)));
+        graph_return.push_for_test(llq::Node::new(AudioNodeId(7)));
 
         let fresh = allocator.try_reserve(1).unwrap();
         assert_eq!(fresh.id(0), AudioNodeId(30));
@@ -495,8 +585,8 @@ mod tests {
     #[test]
     fn close_reconciliation_observes_each_exact_reclaim_before_returning_it() {
         let (mut graph_return, allocator, mut owner) = pair(100);
-        graph_return.push(llq::Node::new(AudioNodeId(4)));
-        graph_return.push(llq::Node::new(AudioNodeId(9)));
+        graph_return.push_for_test(llq::Node::new(AudioNodeId(4)));
+        graph_return.push_for_test(llq::Node::new(AudioNodeId(9)));
         let first = owner.try_pending_reclaim().unwrap();
         assert_eq!(first.id(), AudioNodeId(4));
         first.make_available();
@@ -512,7 +602,7 @@ mod tests {
     #[test]
     fn failed_or_panicking_reconciliation_quarantines_exact_node_until_success() {
         let (mut graph_return, allocator, mut owner) = pair(40);
-        graph_return.push(llq::Node::new(AudioNodeId(6)));
+        graph_return.push_for_test(llq::Node::new(AudioNodeId(6)));
         let result = catch_unwind(AssertUnwindSafe(|| {
             let pending = owner.try_pending_reclaim().unwrap();
             assert_eq!(pending.id(), AudioNodeId(6));
@@ -534,7 +624,7 @@ mod tests {
         let provisional = allocator.try_reserve(2).unwrap();
         assert_eq!(provisional.id(0), AudioNodeId(11));
         assert_eq!(provisional.id(1), AudioNodeId(12));
-        graph_return.push(llq::Node::new(AudioNodeId(7)));
+        graph_return.push_for_test(llq::Node::new(AudioNodeId(7)));
         owner
             .try_pending_reclaim()
             .expect("graph return")

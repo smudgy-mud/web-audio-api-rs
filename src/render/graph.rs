@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
 
 use crate::context::AudioNodeId;
+use crate::context::InjectedGraphReclaimPublisher;
 #[cfg(feature = "diagnostics")]
 use crate::context::{AudioGraphDiagnostics, AudioGraphEdgeDiagnostics, AudioNodeDiagnostics};
 use smallvec::{smallvec, SmallVec};
@@ -129,6 +130,14 @@ pub(crate) struct Graph {
     alloc: Alloc,
     /// Message channel to notify control thread of reclaimable AudioNodeIds
     reclaim_id_channel: llq::Producer<AudioNodeId>,
+    /// Exact reclaim nodes whose processor cleanup completed in this quantum. This intrusive
+    /// queue uses the nodes themselves as storage, so publication can wait for the complete graph
+    /// cleanup suffix without allocating on the render thread.
+    pending_reclaim_return: Option<llq::Producer<AudioNodeId>>,
+    pending_reclaims: Option<llq::Consumer<AudioNodeId>>,
+    /// Installed only by the opaque injected graph initializer. The exact LLQ node remains the
+    /// authoritative acknowledgement; this is a lossy bounded activity hint.
+    injected_reclaim_publisher: Option<InjectedGraphReclaimPublisher>,
     /// Topological ordering of the nodes
     ordered: Vec<AudioNodeId>,
     /// Topological sorting helper
@@ -152,16 +161,48 @@ impl std::fmt::Debug for Graph {
 
 impl Graph {
     pub fn new(reclaim_id_channel: llq::Producer<AudioNodeId>) -> Self {
+        Self::new_inner(reclaim_id_channel, None, None)
+    }
+
+    pub(crate) fn new_injected(
+        reclaim_id_channel: llq::Producer<AudioNodeId>,
+        publisher: InjectedGraphReclaimPublisher,
+    ) -> Self {
+        let (pending_return, pending_reclaims) = llq::Queue::new().split();
+        Self::new_inner(
+            reclaim_id_channel,
+            Some((pending_return, pending_reclaims)),
+            Some(publisher),
+        )
+    }
+
+    fn new_inner(
+        reclaim_id_channel: llq::Producer<AudioNodeId>,
+        pending_reclaims: Option<(llq::Producer<AudioNodeId>, llq::Consumer<AudioNodeId>)>,
+        injected_reclaim_publisher: Option<InjectedGraphReclaimPublisher>,
+    ) -> Self {
+        let (pending_reclaim_return, pending_reclaims) = pending_reclaims
+            .map_or((None, None), |(producer, consumer)| {
+                (Some(producer), Some(consumer))
+            });
         Graph {
             nodes: NodeCollection::new(),
             alloc: Alloc::with_capacity(64),
             reclaim_id_channel,
+            pending_reclaim_return,
+            pending_reclaims,
+            injected_reclaim_publisher,
             ordered: vec![],
             marked: AudioNodeIdSet::default(),
             marked_temp: vec![],
             in_cycle: AudioNodeIdSet::default(),
             cycle_breakers: vec![],
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_injected_reclaim_publisher(&self) -> bool {
+        self.injected_reclaim_publisher.is_some()
     }
 
     #[cfg(feature = "diagnostics")]
@@ -558,10 +599,33 @@ impl Graph {
             if can_free {
                 // Node is dropped, remove it from the node list
                 let mut node = self.nodes.remove(*index).into_inner();
-                self.reclaim_id_channel
-                    .push(node.reclaim_id.take().unwrap());
-                node.processor.before_drop(scope);
-                drop(node);
+                let injected_reclaim = self.injected_reclaim_publisher.is_some();
+                let mut reclaim_id = Some(node.reclaim_id.take().unwrap());
+                if !injected_reclaim {
+                    // Preserve the legacy graph's established ordering exactly. Its id becomes
+                    // visible before `before_drop` and processor destruction, and it has no wake.
+                    self.reclaim_id_channel.push(reclaim_id.take().unwrap());
+                    node.processor.before_drop(scope);
+                    drop(node);
+                } else {
+                    // Injected reclaim is authoritative only after all processor-owned cleanup
+                    // completes. Keep the exact node local while each potentially hostile
+                    // hook/destructor runs. On panic, leak it and remaining processor state
+                    // fail-closed; the outer callback reports death and the id is never reusable.
+                    // Node destruction itself remains on RT as in the pre-existing Graph design;
+                    // this slice only makes publication/wake allocation-free and correctly ordered.
+                    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| {
+                        node.processor.before_drop(scope);
+                    })) {
+                        std::mem::forget(node);
+                        std::mem::forget(reclaim_id.take().unwrap());
+                        panic::resume_unwind(payload);
+                    }
+                    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(node))) {
+                        std::mem::forget(reclaim_id.take().unwrap());
+                        panic::resume_unwind(payload);
+                    }
+                }
 
                 // And remove it from the ordering after we have processed all nodes
                 nodes_dropped = true;
@@ -576,6 +640,15 @@ impl Graph {
                         .outgoing_edges
                         .retain(|e| e.other_id != *index);
                 });
+
+                // Defer external publication until ordering cleanup for the entire quantum has
+                // completed. The intrusive pending queue itself performs no allocation.
+                if let Some(reclaim_id) = reclaim_id {
+                    self.pending_reclaim_return
+                        .as_mut()
+                        .expect("injected graphs retain their pending reclaim queue")
+                        .push(reclaim_id);
+                }
             }
         });
 
@@ -587,6 +660,17 @@ impl Graph {
                     self.ordered.remove(i);
                 } else {
                     i += 1;
+                }
+            }
+        }
+
+        // Publish only after processor hooks/destructors, incident-edge pruning, and graph-order
+        // cleanup have all completed. A panic anywhere above leaves pending ids unpublished.
+        if let Some(pending) = self.pending_reclaims.as_mut() {
+            while let Some(reclaim_id) = pending.pop() {
+                self.reclaim_id_channel.push(reclaim_id);
+                if let Some(publisher) = self.injected_reclaim_publisher.as_ref() {
+                    publisher.publish();
                 }
             }
         }
@@ -605,8 +689,11 @@ impl Graph {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use super::*;
-    use crate::context::DESTINATION_NODE_ID;
+    use crate::context::{injected_node_id_pair, DESTINATION_NODE_ID};
 
     #[derive(Debug, Clone)]
     struct TestNode {
@@ -622,6 +709,106 @@ mod tests {
             _scope: &AudioWorkletGlobalScope,
         ) -> bool {
             self.tail_time
+        }
+    }
+
+    struct CleanupProbe {
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl AudioProcessor for CleanupProbe {
+        fn process(
+            &mut self,
+            _inputs: &[AudioRenderQuantum],
+            _outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            _scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            false
+        }
+
+        fn before_drop(&mut self, _scope: &AudioWorkletGlobalScope) {
+            self.log.lock().unwrap().push("before_drop");
+        }
+    }
+
+    impl Drop for CleanupProbe {
+        fn drop(&mut self) {
+            self.log.lock().unwrap().push("drop");
+        }
+    }
+
+    struct TailOnce(bool);
+
+    impl AudioProcessor for TailOnce {
+        fn process(
+            &mut self,
+            _inputs: &[AudioRenderQuantum],
+            _outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            _scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            std::mem::take(&mut self.0)
+        }
+    }
+
+    struct BeforeDropPanic;
+
+    impl AudioProcessor for BeforeDropPanic {
+        fn process(
+            &mut self,
+            _inputs: &[AudioRenderQuantum],
+            _outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            _scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            false
+        }
+
+        fn before_drop(&mut self, _scope: &AudioWorkletGlobalScope) {
+            panic!("before_drop panic");
+        }
+    }
+
+    struct DestructorPanic;
+
+    impl AudioProcessor for DestructorPanic {
+        fn process(
+            &mut self,
+            _inputs: &[AudioRenderQuantum],
+            _outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            _scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            false
+        }
+    }
+
+    impl Drop for DestructorPanic {
+        fn drop(&mut self) {
+            panic!("processor destructor panic");
+        }
+    }
+
+    struct LegacyVisibilityProbe {
+        reclaim: llq::Consumer<AudioNodeId>,
+        observed: Arc<AtomicBool>,
+    }
+
+    impl AudioProcessor for LegacyVisibilityProbe {
+        fn process(
+            &mut self,
+            _inputs: &[AudioRenderQuantum],
+            _outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            _scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            false
+        }
+
+        fn before_drop(&mut self, _scope: &AudioWorkletGlobalScope) {
+            self.observed
+                .store(self.reclaim.pop().is_some(), Ordering::Release);
         }
     }
 
@@ -645,6 +832,151 @@ mod tests {
 
     fn add_audioparam(graph: &mut Graph, from: u64, to: u64) {
         graph.add_edge((AudioNodeId(from), 0), (AudioNodeId(to), usize::MAX));
+    }
+
+    fn scope() -> AudioWorkletGlobalScope {
+        AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48_000.,
+            node_id: std::cell::Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        }
+    }
+
+    #[test]
+    fn injected_reclaim_follows_processor_edge_and_order_cleanup() {
+        let (allocator, mut owner, graph_init) = injected_node_id_pair(100);
+        let mut graph = graph_init.into_graph();
+        add_node(&mut graph, 0, Box::new(TestNode { tail_time: false }));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        add_node(
+            &mut graph,
+            1,
+            Box::new(CleanupProbe {
+                log: Arc::clone(&log),
+            }),
+        );
+        add_node(&mut graph, 2, Box::new(TestNode { tail_time: false }));
+        add_edge(&mut graph, 2, 1);
+        graph
+            .nodes
+            .get_unchecked_mut(AudioNodeId(1))
+            .control_handle_dropped = true;
+
+        graph.render(&scope());
+        owner.reclaim_activity_receiver().recv().unwrap();
+        assert_eq!(&*log.lock().unwrap(), &["before_drop", "drop"]);
+        assert!(!graph.ordered.contains(&AudioNodeId(1)));
+        assert!(graph
+            .nodes
+            .get_unchecked(AudioNodeId(2))
+            .borrow()
+            .outgoing_edges
+            .is_empty());
+        let pending = owner.try_pending_reclaim().unwrap();
+        assert_eq!(pending.id(), AudioNodeId(1));
+        pending.make_available();
+        assert_eq!(allocator.try_reserve(1).unwrap().id(0), AudioNodeId(1));
+    }
+
+    #[test]
+    fn injected_tail_time_delays_reclaim_publication() {
+        let (_allocator, mut owner, graph_init) = injected_node_id_pair(100);
+        let mut graph = graph_init.into_graph();
+        add_node(&mut graph, 0, Box::new(TestNode { tail_time: false }));
+        add_node(&mut graph, 1, Box::new(TailOnce(true)));
+        add_edge(&mut graph, 1, 0);
+        graph
+            .nodes
+            .get_unchecked_mut(AudioNodeId(1))
+            .control_handle_dropped = true;
+
+        graph.render(&scope());
+        assert!(owner.reclaim_activity_receiver().try_recv().is_err());
+        assert!(owner.try_pending_reclaim().is_none());
+        graph.render(&scope());
+        owner.reclaim_activity_receiver().recv().unwrap();
+        assert_eq!(owner.try_pending_reclaim().unwrap().id(), AudioNodeId(1));
+    }
+
+    #[test]
+    fn injected_cleanup_panics_never_publish_reclaim_id() {
+        for node in [
+            Box::new(BeforeDropPanic) as Box<dyn AudioProcessor>,
+            Box::new(DestructorPanic) as Box<dyn AudioProcessor>,
+        ] {
+            let (_allocator, mut owner, graph_init) = injected_node_id_pair(100);
+            let mut graph = graph_init.into_graph();
+            add_node(&mut graph, 0, Box::new(TestNode { tail_time: false }));
+            add_node(&mut graph, 1, node);
+            graph
+                .nodes
+                .get_unchecked_mut(AudioNodeId(1))
+                .control_handle_dropped = true;
+
+            assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = graph.render(&scope());
+            }))
+            .is_err());
+            assert!(owner.reclaim_activity_receiver().try_recv().is_err());
+            assert!(owner.try_pending_reclaim().is_none());
+        }
+    }
+
+    #[test]
+    fn later_cleanup_panic_withholds_earlier_completed_reclaim() {
+        let (_allocator, mut owner, graph_init) = injected_node_id_pair(100);
+        let mut graph = graph_init.into_graph();
+        add_node(&mut graph, 0, Box::new(TestNode { tail_time: false }));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        add_node(
+            &mut graph,
+            1,
+            Box::new(CleanupProbe {
+                log: Arc::clone(&log),
+            }),
+        );
+        add_node(&mut graph, 2, Box::new(BeforeDropPanic));
+        add_edge(&mut graph, 1, 2);
+        graph
+            .nodes
+            .get_unchecked_mut(AudioNodeId(1))
+            .control_handle_dropped = true;
+        graph
+            .nodes
+            .get_unchecked_mut(AudioNodeId(2))
+            .control_handle_dropped = true;
+
+        assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = graph.render(&scope());
+        }))
+        .is_err());
+        assert_eq!(&*log.lock().unwrap(), &["before_drop", "drop"]);
+        assert!(owner.reclaim_activity_receiver().try_recv().is_err());
+        assert!(owner.try_pending_reclaim().is_none());
+    }
+
+    #[test]
+    fn legacy_graph_keeps_reclaim_visible_before_before_drop() {
+        let (producer, consumer) = llq::Queue::new().split();
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut graph = Graph::new(producer);
+        add_node(&mut graph, 0, Box::new(TestNode { tail_time: false }));
+        add_node(
+            &mut graph,
+            1,
+            Box::new(LegacyVisibilityProbe {
+                reclaim: consumer,
+                observed: Arc::clone(&observed),
+            }),
+        );
+        graph
+            .nodes
+            .get_unchecked_mut(AudioNodeId(1))
+            .control_handle_dropped = true;
+        graph.render(&scope());
+        assert!(observed.load(Ordering::Acquire));
     }
 
     // regression test for:

@@ -17,7 +17,8 @@ use crate::buffer::AudioBuffer;
 #[cfg(feature = "diagnostics")]
 use crate::context::{AudioContextDiagnostics, AudioRenderThreadDiagnostics};
 use crate::context::{
-    AudioContextState, AudioNodeId, OfflineAudioContext, OfflineAudioContextCallback,
+    AudioContextState, AudioNodeId, InjectedGraphReclaimInit, OfflineAudioContext,
+    OfflineAudioContextCallback,
 };
 use crate::events::{EventDispatch, EventLoop};
 use crate::message::{
@@ -88,6 +89,27 @@ impl std::fmt::Debug for RenderThread {
 }
 
 impl RenderThread {
+    /// Installs the only graph accepted by the injected renderer foundation. Consuming the opaque
+    /// initializer binds its exact reclaim queue and activity publisher; injected construction
+    /// cannot create a renderer while omitting that publisher.
+    pub(crate) fn install_injected_graph(
+        &mut self,
+        graph: InjectedGraphReclaimInit,
+    ) -> Result<(), InjectedGraphReclaimInit> {
+        if self.graph.is_some() {
+            return Err(graph);
+        }
+        self.graph = Some(graph.into_graph());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_injected_reclaim_publisher(&self) -> bool {
+        self.graph
+            .as_ref()
+            .is_some_and(Graph::has_injected_reclaim_publisher)
+    }
+
     #[cfg(feature = "diagnostics")]
     fn diagnostics(&self) -> AudioRenderThreadDiagnostics {
         AudioRenderThreadDiagnostics {
