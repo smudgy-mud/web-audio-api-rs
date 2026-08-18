@@ -216,6 +216,17 @@ struct RegistrationKey {
     generation: NonZeroU64,
 }
 
+/// Weak, non-owning identity for one exact lifetime slot generation.
+///
+/// This token retains neither the registry nor a live registration. It exists so a separately
+/// cloneable post-construction capability cannot be attached to a later registration that merely
+/// recycled the same numeric AudioNodeId.
+#[derive(Clone)]
+pub(crate) struct InjectedNodeRegistrationIdentity {
+    inner: Weak<NodeLifetimeInner>,
+    key: RegistrationKey,
+}
+
 #[derive(Clone)]
 pub(crate) struct InjectedNodeLifetimeRegistrar {
     inner: Weak<NodeLifetimeInner>,
@@ -1406,6 +1417,13 @@ pub(crate) struct NodeRegistrationArm<'a> {
 }
 
 impl ProvisionalNodeRegistration {
+    pub(crate) fn identity(&self) -> InjectedNodeRegistrationIdentity {
+        InjectedNodeRegistrationIdentity {
+            inner: Weak::clone(&self.inner),
+            key: self.key,
+        }
+    }
+
     /// Copy ordering token suitable for B1's accepted-batch finalizer. It temporarily upgrades
     /// the weak capability; lifecycle retirement either waits for that upgrade or makes arm fail.
     pub(crate) fn arm_token(&self) -> NodeRegistrationArm<'_> {
@@ -1642,6 +1660,12 @@ impl Drop for ProvisionalNodeRegistration {
 pub(crate) struct InjectedNodeRegistration {
     inner: Weak<NodeLifetimeInner>,
     key: RegistrationKey,
+}
+
+impl InjectedNodeRegistration {
+    pub(crate) fn matches_identity(&self, identity: &InjectedNodeRegistrationIdentity) -> bool {
+        Weak::ptr_eq(&self.inner, &identity.inner) && self.key == identity.key
+    }
 }
 
 impl Drop for InjectedNodeRegistration {

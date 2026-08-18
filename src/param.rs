@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arrayvec::ArrayVec;
 
-use crate::context::AudioContextRegistration;
+use crate::context::{AudioContextRegistration, InjectedAudioParamMutation};
 use crate::node::{
     AudioNode, AudioNodeOptions, ChannelConfig, ChannelCountMode, ChannelInterpretation,
 };
@@ -186,6 +186,25 @@ impl AudioParamInitialValue {
     }
 }
 
+/// Fixed-size post-construction value update for an exact injected AudioParam.
+///
+/// This deliberately does not reuse [`AudioParamEvent`]: that general automation payload may own
+/// a boxed curve and its render timeline may grow. Exact runtime value updates instead coalesce in
+/// one render-owned scalar slot until the next quantum.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InjectedAudioParamValue(f32);
+
+impl InjectedAudioParamValue {
+    pub(crate) fn new(value: f32) -> Self {
+        assert_is_finite(value);
+        Self(value)
+    }
+
+    pub(crate) const fn get(self) -> f32 {
+        self.0
+    }
+}
+
 // Event queue that contains `AudioParamEvent`s, most of the time, events must be
 // ordered (using stable sort), some operation may break this ordering (e.g. `push`)
 // in which cases `sort` must be called explicitly.
@@ -279,10 +298,15 @@ impl AudioParamEventTimeline {
 }
 
 /// AudioParam controls an individual aspect of an AudioNode's functionality, such as volume.
+///
+/// The private exact injected context currently supports only [`AudioParam::set_value`] after
+/// construction. Scheduled automation and automation-rate changes remain available on legacy
+/// contexts and are deliberately rejected before mutation on that not-yet-public injected path.
 #[derive(Clone)] // `Clone` for the node bindings, see #378
 pub struct AudioParam {
     registration: Arc<AudioContextRegistration>,
     raw_parts: AudioParamInner,
+    injected_mutation: Option<InjectedAudioParamMutation>,
 }
 
 impl std::fmt::Debug for AudioParam {
@@ -310,6 +334,82 @@ pub(crate) struct AudioParamInner {
     automation_rate_constrained: bool,           // effectively immutable
     automation_rate: Arc<Mutex<AutomationRate>>, // shared with clones
     current_value: Arc<AtomicF32>,               // shared with clones and with render thread
+}
+
+/// Opaque identity and accepted-finalizer authority for one AudioParam host mirror.
+///
+/// It is created together with the exact processor and retained by the accepted mutation
+/// capability. No caller can substitute a different `AtomicF32` at mutation time.
+#[derive(Clone)]
+pub(crate) struct InjectedAudioParamMirror(Arc<AtomicF32>);
+
+impl InjectedAudioParamMirror {
+    pub(crate) fn matches_inner(&self, inner: &AudioParamInner) -> bool {
+        Arc::ptr_eq(&self.0, &inner.current_value)
+    }
+
+    fn matches_processor(&self, processor: &AudioParamProcessor) -> bool {
+        Arc::ptr_eq(&self.0, &processor.current_value)
+    }
+
+    pub(crate) fn store(&self, value: f32) {
+        self.0.store(value, Ordering::Release);
+    }
+}
+
+/// Exact typed processor boxed while construction can still roll back, but kept distinct from a
+/// type-erased graph payload until its host mirror is preflighted.
+pub(crate) struct InjectedAudioParamProcessor {
+    processor: InjectedAudioParamProcessorInner,
+    mirror: InjectedAudioParamMirror,
+}
+
+enum InjectedAudioParamProcessorInner {
+    Exact(Box<AudioParamProcessor>),
+    #[cfg(test)]
+    Test(Box<dyn AudioProcessor>),
+}
+
+impl InjectedAudioParamProcessor {
+    pub(crate) fn into_boxed_prevalidated(
+        self,
+    ) -> Result<(Box<dyn AudioProcessor>, InjectedAudioParamMirror), Self> {
+        let exact = match &self.processor {
+            InjectedAudioParamProcessorInner::Exact(processor) => {
+                self.mirror.matches_processor(processor)
+            }
+            #[cfg(test)]
+            InjectedAudioParamProcessorInner::Test(_) => true,
+        };
+        if !exact {
+            return Err(self);
+        }
+        let Self { processor, mirror } = self;
+        #[cfg(not(test))]
+        let processor: Box<dyn AudioProcessor> = {
+            let InjectedAudioParamProcessorInner::Exact(processor) = processor;
+            processor
+        };
+        #[cfg(test)]
+        let processor: Box<dyn AudioProcessor> = match processor {
+            InjectedAudioParamProcessorInner::Exact(processor) => processor,
+            InjectedAudioParamProcessorInner::Test(processor) => processor,
+        };
+        Ok((processor, mirror))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_boxed_for_test(processor: Box<dyn AudioProcessor>) -> Self {
+        Self {
+            processor: InjectedAudioParamProcessorInner::Test(processor),
+            mirror: InjectedAudioParamMirror(Arc::new(AtomicF32::new(0.))),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn swap_exact_processors_for_test(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.processor, &mut other.processor);
+    }
 }
 
 impl AudioNode for AudioParam {
@@ -361,6 +461,7 @@ impl AudioParam {
     ///
     /// Some nodes have automation rate constraints and may panic when updating the value.
     pub fn set_automation_rate(&self, value: AutomationRate) {
+        self.reject_deferred_exact_mutation("automationRate");
         assert!(
             !self.raw_parts.automation_rate_constrained || value == self.automation_rate(),
             "InvalidStateError - automation rate cannot be changed for this param"
@@ -415,7 +516,28 @@ impl AudioParam {
     // Any exceptions that would be thrown by setValueAtTime() will also be
     // thrown by setting this attribute.
     // cf. https://www.w3.org/TR/webaudio/#dom-audioparam-value
+    ///
+    /// # Panics
+    ///
+    /// Panics for non-finite values, or when the private exact injected context rejects this
+    /// bounded mutation because it is closing, saturated, or terminally degraded.
     pub fn set_value(&self, value: f32) -> &Self {
+        if self.is_exact_context() {
+            let mutation = self.injected_mutation.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "NotSupportedError - this exact injected AudioParam has no runtime mutation capability"
+                )
+            });
+            let value = InjectedAudioParamValue::new(value);
+            let clamped = value
+                .get()
+                .clamp(self.raw_parts.min_value, self.raw_parts.max_value);
+            let result = mutation.try_set_value(value, clamped);
+            result.unwrap_or_else(|error| {
+                panic!("InvalidStateError - injected AudioParam value update failed: {error:?}")
+            });
+            return self;
+        }
         self.send_event(self.set_value_raw(value))
     }
 
@@ -451,6 +573,7 @@ impl AudioParam {
     ///
     /// Will panic if `start_time` is negative
     pub fn set_value_at_time(&self, value: f32, start_time: f64) -> &Self {
+        self.reject_deferred_exact_mutation("setValueAtTime");
         self.send_event(self.set_value_at_time_raw(value, start_time))
     }
 
@@ -476,6 +599,7 @@ impl AudioParam {
     ///
     /// Will panic if `end_time` is negative
     pub fn linear_ramp_to_value_at_time(&self, value: f32, end_time: f64) -> &Self {
+        self.reject_deferred_exact_mutation("linearRampToValueAtTime");
         self.send_event(self.linear_ramp_to_value_at_time_raw(value, end_time))
     }
 
@@ -503,6 +627,7 @@ impl AudioParam {
     /// - `value` is zero
     /// - `end_time` is negative
     pub fn exponential_ramp_to_value_at_time(&self, value: f32, end_time: f64) -> &Self {
+        self.reject_deferred_exact_mutation("exponentialRampToValueAtTime");
         self.send_event(self.exponential_ramp_to_value_at_time_raw(value, end_time))
     }
 
@@ -530,6 +655,7 @@ impl AudioParam {
     /// - `start_time` is negative
     /// - `time_constant` is negative
     pub fn set_target_at_time(&self, value: f32, start_time: f64, time_constant: f64) -> &Self {
+        self.reject_deferred_exact_mutation("setTargetAtTime");
         self.send_event(self.set_target_at_time_raw(value, start_time, time_constant))
     }
 
@@ -574,6 +700,7 @@ impl AudioParam {
     ///
     /// Will panic if `cancel_time` is negative
     pub fn cancel_scheduled_values(&self, cancel_time: f64) -> &Self {
+        self.reject_deferred_exact_mutation("cancelScheduledValues");
         self.send_event(self.cancel_scheduled_values_raw(cancel_time))
     }
 
@@ -599,6 +726,7 @@ impl AudioParam {
     ///
     /// Will panic if `cancel_time` is negative
     pub fn cancel_and_hold_at_time(&self, cancel_time: f64) -> &Self {
+        self.reject_deferred_exact_mutation("cancelAndHoldAtTime");
         self.send_event(self.cancel_and_hold_at_time_raw(cancel_time))
     }
 
@@ -626,6 +754,7 @@ impl AudioParam {
     /// - `start_time` is negative
     /// - `duration` is negative or equal to zero
     pub fn set_value_curve_at_time(&self, values: &[f32], start_time: f64, duration: f64) -> &Self {
+        self.reject_deferred_exact_mutation("setValueCurveAtTime");
         self.send_event(self.set_value_curve_at_time_raw(values, start_time, duration))
     }
 
@@ -660,6 +789,7 @@ impl AudioParam {
         let Self {
             registration: _,
             raw_parts,
+            injected_mutation: _,
         } = self;
         raw_parts
     }
@@ -672,7 +802,93 @@ impl AudioParam {
         Self {
             registration: registration.into(),
             raw_parts,
+            injected_mutation: None,
         }
+    }
+
+    pub(crate) fn from_injected_raw_parts(
+        registration: AudioContextRegistration,
+        raw_parts: AudioParamInner,
+        injected_mutation: InjectedAudioParamMutation,
+    ) -> Self {
+        let Some(constructor) = registration.context().injected_node_constructor() else {
+            injected_mutation.fail_closed_protocol();
+            panic!("injected AudioParam mutation attached to a legacy context")
+        };
+        if !injected_mutation.matches_registration(&registration, constructor, &raw_parts) {
+            injected_mutation.fail_closed_protocol();
+            panic!("injected AudioParam mutation brand does not match its registration")
+        }
+        Self {
+            registration: registration.into(),
+            raw_parts,
+            injected_mutation: Some(injected_mutation),
+        }
+    }
+
+    fn is_exact_context(&self) -> bool {
+        self.registration
+            .context()
+            .injected_node_constructor()
+            .is_some()
+    }
+
+    #[track_caller]
+    fn reject_deferred_exact_mutation(&self, operation: &str) {
+        assert!(
+            !self.is_exact_context(),
+            "NotSupportedError - {operation} is not available on exact injected AudioParams yet"
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_injected_value_finalizer_for_test(
+        &self,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+        panics: bool,
+    ) {
+        self.injected_mutation
+            .as_ref()
+            .expect("test hook requires an accepted exact Gain AudioParam")
+            .hold_next_finalizer_for_test(entered, release, panics);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_injected_value_rollback_for_test(
+        &self,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+        panics: bool,
+    ) {
+        self.injected_mutation
+            .as_ref()
+            .expect("test hook requires an accepted exact Gain AudioParam")
+            .hold_next_rollback_for_test(entered, release, panics);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signal_next_injected_serializer_attempt_for_test(
+        &self,
+        attempted: crossbeam_channel::Sender<()>,
+    ) {
+        self.injected_mutation
+            .as_ref()
+            .expect("test hook requires an accepted exact Gain AudioParam")
+            .signal_next_serializer_attempt_for_test(attempted);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clone_injected_parts_for_test(
+        &self,
+    ) -> (AudioParamInner, InjectedAudioParamMutation) {
+        (
+            self.raw_parts.clone(),
+            self.injected_mutation
+                .as_ref()
+                .expect("test hook requires an accepted exact Gain AudioParam")
+                .clone(),
+        )
     }
 
     fn send_event(&self, event: AudioParamEvent) -> &Self {
@@ -706,6 +922,10 @@ pub(crate) struct AudioParamProcessor {
     intrinsic_value: f32,
     automation_rate: AutomationRate,
     current_value: Arc<AtomicF32>,
+    /// Allocation-free immediate value path used only by exact injected construction/mutation.
+    /// Scheduled automation is not admitted on that private path yet, so multiple values before
+    /// one quantum correctly coalesce to the last accepted value.
+    pending_injected_value: Option<f32>,
     event_timeline: AudioParamEventTimeline,
     last_event: Option<AudioParamEvent>,
     buffer: ArrayVec<f32, RENDER_QUANTUM_SIZE>,
@@ -753,15 +973,12 @@ impl AudioProcessor for AudioParamProcessor {
         };
 
         if let Some(AudioParamInitialValue(value)) = msg.downcast_ref::<AudioParamInitialValue>() {
-            self.handle_incoming_event(AudioParamEvent {
-                event_type: AudioParamEventType::SetValue,
-                value: *value,
-                time: 0.,
-                time_constant: None,
-                cancel_time: None,
-                duration: None,
-                values: None,
-            });
+            self.pending_injected_value = Some(*value);
+            return;
+        }
+
+        if let Some(value) = msg.downcast_ref::<InjectedAudioParamValue>() {
+            self.pending_injected_value = Some(value.get());
             return;
         }
 
@@ -1546,6 +1763,10 @@ impl AudioParamProcessor {
     }
 
     fn compute_buffer(&mut self, block_time: f64, dt: f64, count: usize) {
+        if let Some(value) = self.pending_injected_value.take() {
+            self.intrinsic_value = value;
+        }
+
         // Set [[current value]] to the value of paramIntrinsicValue at the
         // beginning of this render quantum.
         let clamped = self.intrinsic_value.clamp(self.min_value, self.max_value);
@@ -1697,12 +1918,28 @@ pub(crate) fn audio_param_raw_parts(
         min_value,
         max_value,
         automation_rate,
+        pending_injected_value: None,
         event_timeline: AudioParamEventTimeline::new(),
         last_event: None,
         buffer: ArrayVec::new(),
     };
 
     (raw_parts, processor)
+}
+
+/// Builds one inseparable exact host-mirror/processor pair before injected Gain acceptance.
+pub(crate) fn injected_audio_param_raw_parts(
+    descriptor: AudioParamDescriptor,
+) -> (AudioParamInner, InjectedAudioParamProcessor) {
+    let (raw_parts, processor) = audio_param_raw_parts(descriptor);
+    let mirror = InjectedAudioParamMirror(Arc::clone(&raw_parts.current_value));
+    (
+        raw_parts,
+        InjectedAudioParamProcessor {
+            processor: InjectedAudioParamProcessorInner::Exact(Box::new(processor)),
+            mirror,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1731,12 +1968,36 @@ mod tests {
         let mut initial = param.set_initial_value_for_injected(3.5);
         assert_eq!(param.value(), 3.5);
         processor.onmessage(&mut initial);
-        assert_eq!(processor.event_timeline.inner.len(), 1);
-        assert_eq!(processor.event_timeline.inner[0].value, 3.5);
-        assert_eq!(
-            processor.event_timeline.inner[0].event_type,
-            AudioParamEventType::SetValue
-        );
+        assert!(processor.event_timeline.inner.is_empty());
+        assert_eq!(processor.pending_injected_value, Some(3.5));
+        let values = processor.compute_intrinsic_values(0., 1. / 48_000., 128);
+        assert!(values.iter().all(|value| *value == 3.5));
+        assert_eq!(processor.pending_injected_value, None);
+        assert_eq!(param.value(), 3.5);
+    }
+
+    #[test]
+    fn injected_fixed_values_over_timeline_capacity_coalesce_without_allocation() {
+        let descriptor = AudioParamDescriptor {
+            name: String::new(),
+            automation_rate: AutomationRate::A,
+            default_value: 1.,
+            min_value: -10.,
+            max_value: 10.,
+        };
+        let (_raw, mut exact) = injected_audio_param_raw_parts(descriptor);
+        let InjectedAudioParamProcessorInner::Exact(processor) = &mut exact.processor else {
+            unreachable!("production exact pair contains its concrete processor")
+        };
+        alloc_counter::deny_alloc(|| {
+            for value in 0..40 {
+                let mut value = InjectedAudioParamValue::new(value as f32 / 10.);
+                processor.onmessage(&mut value);
+            }
+            let values = processor.compute_intrinsic_values(0., 1. / 48_000., 128);
+            assert!(values.iter().all(|value| *value == 3.9));
+        });
+        assert!(processor.event_timeline.inner.is_empty());
     }
 
     #[test]

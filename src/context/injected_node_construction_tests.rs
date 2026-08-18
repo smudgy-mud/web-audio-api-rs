@@ -16,9 +16,11 @@ use super::injected_node_construction::{
 };
 use super::injected_node_lifetime::{
     injected_node_lifetime_registry, InjectedNodeLifetimeOwner, InjectedNodeLifetimeRegistrar,
+    NodeLifetimeDriveOutcome,
 };
 use super::{
-    AudioContextState, AudioNodeId, ConcreteBaseAudioContext, InjectedContextAdmissionGate,
+    AudioContextRegistration, AudioContextState, AudioNodeId, ConcreteBaseAudioContext,
+    InjectedContextAdmissionGate,
 };
 use crate::events::{EventDispatch, EventLoop};
 use crate::message::{ControlBatchApplied, ControlBatchSender, ControlMessage};
@@ -26,7 +28,10 @@ use crate::node::{
     AudioNode, AudioNodeOptions, ChannelConfigInner, ChannelCountMode, ChannelInterpretation,
     GainNode, GainOptions,
 };
-use crate::param::AudioParamInitialValue;
+use crate::param::{
+    injected_audio_param_raw_parts, AudioParam, AudioParamDescriptor, AudioParamInitialValue,
+    AutomationRate, InjectedAudioParamProcessor,
+};
 use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope, RenderThread,
 };
@@ -71,6 +76,31 @@ impl Drop for PanicDropProcessor {
     }
 }
 
+struct BlockingPanicDropProcessor {
+    entered: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+impl AudioProcessor for BlockingPanicDropProcessor {
+    fn process(
+        &mut self,
+        _inputs: &[AudioRenderQuantum],
+        _outputs: &mut [AudioRenderQuantum],
+        _params: AudioParamValues<'_>,
+        _scope: &AudioWorkletGlobalScope,
+    ) -> bool {
+        false
+    }
+}
+
+impl Drop for BlockingPanicDropProcessor {
+    fn drop(&mut self) {
+        self.entered.send(()).unwrap();
+        self.release.recv().unwrap();
+        panic!("hostile blocked processor destructor");
+    }
+}
+
 fn channel_config() -> ChannelConfigInner {
     ChannelConfigInner {
         count: 1,
@@ -80,12 +110,32 @@ fn channel_config() -> ChannelConfigInner {
 }
 
 fn payload(param: Box<dyn AudioProcessor>, gain: Box<dyn AudioProcessor>) -> InjectedGainPayload {
+    payload_with_param(
+        InjectedAudioParamProcessor::from_boxed_for_test(param),
+        gain,
+    )
+}
+
+fn payload_with_param(
+    param: InjectedAudioParamProcessor,
+    gain: Box<dyn AudioProcessor>,
+) -> InjectedGainPayload {
     InjectedGainPayload {
         param_processor: param,
         gain_processor: gain,
         param_channel_config: channel_config(),
         gain_channel_config: channel_config(),
         initial_value: AudioParamInitialValue::new(1.),
+    }
+}
+
+fn gain_descriptor() -> AudioParamDescriptor {
+    AudioParamDescriptor {
+        name: String::new(),
+        automation_rate: AutomationRate::A,
+        default_value: 1.,
+        min_value: f32::MIN,
+        max_value: f32::MAX,
     }
 }
 
@@ -174,6 +224,31 @@ impl Harness {
             .render(&mut [] as &mut [f32]);
     }
 
+    fn render_quantum(&mut self) {
+        let mut output = [0.; crate::RENDER_QUANTUM_SIZE * 2];
+        self.renderer.as_mut().unwrap().render(&mut output);
+    }
+
+    fn install_persistent_destination_for_recycle_test(&mut self) {
+        let mut destination = self.allocator.try_reserve(1).unwrap();
+        let id = destination.id(0);
+        assert_eq!(id, AudioNodeId(0));
+        let reclaim_id = destination.take_reclaim_node(0).unwrap();
+        destination.commit().unwrap();
+        self.producer
+            .try_commit_prevalidated_for_test(vec![ControlMessage::RegisterNode {
+                id,
+                reclaim_id,
+                node: Box::new(SilentProcessor),
+                inputs: 1,
+                outputs: 1,
+                channel_config: channel_config(),
+            }])
+            .unwrap();
+        self.callback();
+        self.wait_for_transport_idle();
+    }
+
     fn assert_slots_vacant(&self) {
         assert_eq!(
             self.lifetimes.slot_phase_counts_for_test(),
@@ -210,6 +285,27 @@ impl Harness {
                 .credit_activity_receiver()
                 .recv_timeout(remaining.min(Duration::from_millis(100)));
         }
+    }
+
+    fn drive_node_lifetimes_until_vacant(&mut self) {
+        for _ in 0..64 {
+            match self.lifetimes.try_drive_once() {
+                NodeLifetimeDriveOutcome::Idle
+                    if self.lifetimes.slot_phase_counts_for_test()
+                        == [SLOT_CAPACITY, 0, 0, 0, 0, 0] =>
+                {
+                    return;
+                }
+                NodeLifetimeDriveOutcome::Submitted { .. } => {
+                    self.render_quantum();
+                    self.wait_for_transport_idle();
+                }
+                NodeLifetimeDriveOutcome::Idle | NodeLifetimeDriveOutcome::Reconciled { .. } => {}
+                NodeLifetimeDriveOutcome::Retry { .. } => thread::yield_now(),
+                outcome => panic!("unexpected lifetime-drive outcome: {outcome:?}"),
+            }
+        }
+        panic!("node lifetimes did not reconcile within the bounded test drive");
     }
 }
 
@@ -305,6 +401,19 @@ fn event_only_injected_base_keeps_the_legacy_four_command_gain_path() {
         ControlMessage::ConnectNode { from, to, output: 0, input: usize::MAX }
             if *from == param_id && *to == gain_id
     ));
+
+    gain.gain().set_value(0.25);
+    assert_eq!(gain.gain().value(), 0.25);
+    assert!(matches!(
+        render_recv.recv().unwrap(),
+        ControlMessage::NodeMessage { id, .. } if id == param_id
+    ));
+    gain.gain().set_automation_rate(AutomationRate::K);
+    assert_eq!(gain.gain().automation_rate(), AutomationRate::K);
+    assert!(matches!(
+        render_recv.recv().unwrap(),
+        ControlMessage::NodeMessage { id, .. } if id == param_id
+    ));
 }
 
 #[test]
@@ -367,6 +476,712 @@ fn admitted_gain_is_one_real_four_command_batch_and_handles_request_lifetime_tea
 }
 
 #[test]
+fn exact_gain_value_is_one_fixed_command_and_survives_the_next_render_quantum() {
+    let mut harness = Harness::new(4);
+    let gain = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    assert_eq!(gain.gain().value(), 1.);
+
+    gain.gain().set_value(0.25);
+    assert_eq!(gain.gain().value(), 0.25);
+    assert_eq!(harness.producer.accounting(), (1, 1, 1, 0));
+    harness.render_quantum();
+    harness.wait_for_transport_idle();
+    assert_eq!(harness.base().applied_control_batch_sequence(), 2);
+    // The render processor republishes its intrinsic value each quantum, so this proves the fixed
+    // command reached the exact parameter instead of merely updating the host mirror.
+    assert_eq!(gain.gain().value(), 0.25);
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+}
+
+#[test]
+fn exact_value_preserves_legacy_host_and_renderer_clamping() {
+    let mut harness = Harness::new(4);
+    let descriptor = AudioParamDescriptor {
+        name: String::new(),
+        automation_rate: AutomationRate::A,
+        default_value: 0.5,
+        min_value: 0.,
+        max_value: 1.,
+    };
+    let (raw_parts, param_processor) = injected_audio_param_raw_parts(descriptor);
+    let initial_value = raw_parts.set_initial_value_for_injected(0.5);
+    let constructed = harness
+        .base()
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap()
+        .commit(InjectedGainPayload {
+            param_processor,
+            gain_processor: Box::new(SilentProcessor),
+            param_channel_config: channel_config(),
+            gain_channel_config: channel_config(),
+            initial_value,
+        })
+        .unwrap();
+    let registration = AudioContextRegistration::from_injected(
+        constructed.param_id,
+        harness.base().clone(),
+        constructed.param_registration,
+    );
+    let param =
+        AudioParam::from_injected_raw_parts(registration, raw_parts, constructed.param_mutation);
+    harness.callback();
+    harness.wait_for_transport_idle();
+
+    param.set_value(2.);
+    assert_eq!(param.value(), 1.);
+    harness.render_quantum();
+    harness.wait_for_transport_idle();
+    assert_eq!(param.value(), 1.);
+    drop(param);
+    drop(constructed.gain_registration);
+}
+
+#[test]
+fn more_than_timeline_capacity_fixed_values_coalesce_without_render_allocation() {
+    let mut harness = Harness::new(64);
+    let gain = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+
+    for value in 0..40 {
+        gain.gain().set_value(value as f32 / 10.);
+    }
+    assert_eq!(harness.producer.accounting(), (40, 40, 40, 0));
+    alloc_counter::deny_alloc(|| harness.render_quantum());
+    harness.wait_for_transport_idle();
+    assert_eq!(gain.gain().value(), 3.9);
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+}
+
+#[test]
+fn exact_processor_mirror_swap_rejects_before_acceptance_and_reuses_ids_slots() {
+    let harness = Harness::new(4);
+    let transaction = harness
+        .base()
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap();
+    let (_raw_a, mut param_a) = injected_audio_param_raw_parts(gain_descriptor());
+    let (_raw_b, mut param_b) = injected_audio_param_raw_parts(gain_descriptor());
+    param_a.swap_exact_processors_for_test(&mut param_b);
+
+    let error = transaction
+        .commit(payload_with_param(param_a, Box::new(SilentProcessor)))
+        .err()
+        .unwrap();
+    assert_eq!(error, InjectedGainConstructionError::ProtocolViolation);
+    harness.assert_slots_vacant();
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+    let ids = harness.allocator.try_reserve(2).unwrap();
+    assert_eq!(ids.id(0), AudioNodeId(0));
+    assert_eq!(ids.id(1), AudioNodeId(1));
+}
+
+#[test]
+fn mirror_mismatch_restores_ids_before_hostile_destructor_and_holds_close_admission() {
+    let mut harness = Harness::new(4);
+    let transaction = harness
+        .base()
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap();
+    let (_raw_a, mut param_a) = injected_audio_param_raw_parts(gain_descriptor());
+    let (_raw_b, mut param_b) = injected_audio_param_raw_parts(gain_descriptor());
+    param_a.swap_exact_processors_for_test(&mut param_b);
+    let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+    let (release_send, release_recv) = crossbeam_channel::bounded(1);
+    let commit_thread = thread::spawn(move || {
+        transaction.commit(payload_with_param(
+            param_a,
+            Box::new(BlockingPanicDropProcessor {
+                entered: entered_send,
+                release: release_recv,
+            }),
+        ))
+    });
+    entered_recv.recv().unwrap();
+
+    harness.assert_slots_vacant();
+    let ids = harness.allocator.try_reserve(2).unwrap();
+    assert_eq!(ids.id(0), AudioNodeId(0));
+    assert_eq!(ids.id(1), AudioNodeId(1));
+    drop(ids);
+    let retirement = harness
+        .lifecycle
+        .take()
+        .unwrap()
+        .try_begin_close()
+        .ok()
+        .unwrap();
+    let (close_send, close_recv) = crossbeam_channel::bounded(1);
+    let close_thread = thread::spawn(move || {
+        close_send.send(retirement.retire_and_wait()).unwrap();
+    });
+    assert!(close_recv.try_recv().is_err());
+    release_send.send(()).unwrap();
+    assert_eq!(
+        commit_thread.join().unwrap().err().unwrap(),
+        InjectedGainConstructionError::RejectedPayloadPanicked
+    );
+    let (snapshot, drained) = close_recv.recv().unwrap();
+    assert!(snapshot.is_drained());
+    drop(drained);
+    close_thread.join().unwrap();
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+}
+
+#[test]
+fn same_context_foreign_raw_mirror_attachment_fails_closed() {
+    let mut harness = Harness::new(4);
+    let transaction = harness
+        .base()
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap();
+    let (_raw_exact, param_exact) = injected_audio_param_raw_parts(gain_descriptor());
+    let (raw_foreign, _param_foreign) = injected_audio_param_raw_parts(gain_descriptor());
+    let constructed = transaction
+        .commit(payload_with_param(param_exact, Box::new(SilentProcessor)))
+        .unwrap();
+    let registration = AudioContextRegistration::from_injected(
+        constructed.param_id,
+        harness.base().clone(),
+        constructed.param_registration,
+    );
+    let attached = panic::catch_unwind(AssertUnwindSafe(|| {
+        AudioParam::from_injected_raw_parts(registration, raw_foreign, constructed.param_mutation)
+    }));
+    assert!(attached.is_err());
+    assert!(matches!(
+        harness
+            .base()
+            .injected_node_constructor()
+            .unwrap()
+            .try_begin_gain(),
+        Err(InjectedGainConstructionError::Control(
+            super::injected_control::InjectedControlError::ProtocolViolation
+        ))
+    ));
+    drop(constructed.gain_registration);
+    harness.callback();
+    harness.wait_for_transport_idle();
+}
+
+#[test]
+fn stale_param_cap_rejects_a_recycled_numeric_id_with_a_new_slot_generation() {
+    let mut harness = Harness::new(4);
+    // Keep destination 0 permanent so ordinary Gain teardown can render/reclaim without making
+    // the test graph itself structurally invalid. Production hosted output gets this from B4b.
+    harness.install_persistent_destination_for_recycle_test();
+    let first = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let stale_id = first.gain().registration().id();
+    let (stale_raw, stale_cap) = first.gain().clone_injected_parts_for_test();
+
+    drop(first);
+    harness.drive_node_lifetimes_until_vacant();
+
+    let second = harness
+        .base()
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap()
+        .commit(payload(
+            Box::new(SilentProcessor),
+            Box::new(SilentProcessor),
+        ))
+        .unwrap();
+    assert_eq!(second.param_id, stale_id);
+    let recycled = AudioContextRegistration::from_injected(
+        second.param_id,
+        harness.base().clone(),
+        second.param_registration,
+    );
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        AudioParam::from_injected_raw_parts(recycled, stale_raw, stale_cap)
+    }))
+    .is_err());
+    assert!(matches!(
+        harness
+            .base()
+            .injected_node_constructor()
+            .unwrap()
+            .try_begin_gain(),
+        Err(InjectedGainConstructionError::Control(
+            super::injected_control::InjectedControlError::ProtocolViolation
+        ))
+    ));
+    drop(second.gain_registration);
+}
+
+#[test]
+fn same_control_foreign_allocator_param_brand_fails_closed_before_attachment() {
+    let mut harness = Harness::new(4);
+    let (raw_parts, param_processor) = injected_audio_param_raw_parts(gain_descriptor());
+    let initial_value = raw_parts.set_initial_value_for_injected(1.);
+    let mut constructed = harness
+        .base()
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap()
+        .commit(InjectedGainPayload {
+            param_processor,
+            gain_processor: Box::new(SilentProcessor),
+            param_channel_config: channel_config(),
+            gain_channel_config: channel_config(),
+            initial_value,
+        })
+        .unwrap();
+    let (foreign_allocator, _foreign_owner, _foreign_graph) = injected_node_id_pair(0);
+    constructed
+        .param_mutation
+        .replace_node_id_identity_for_test(foreign_allocator.identity());
+    let registration = AudioContextRegistration::from_injected(
+        constructed.param_id,
+        harness.base().clone(),
+        constructed.param_registration,
+    );
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        AudioParam::from_injected_raw_parts(registration, raw_parts, constructed.param_mutation)
+    }))
+    .is_err());
+    assert!(matches!(
+        harness
+            .base()
+            .injected_node_constructor()
+            .unwrap()
+            .try_begin_gain(),
+        Err(InjectedGainConstructionError::Control(
+            super::injected_control::InjectedControlError::ProtocolViolation
+        ))
+    ));
+    drop(constructed.gain_registration);
+    harness.callback();
+    harness.wait_for_transport_idle();
+}
+
+#[test]
+fn foreign_control_param_cap_is_rejected_while_receiving_context_remains_operational() {
+    let mut first = Harness::new(4);
+    let mut second = Harness::new(4);
+    let (raw_first, processor_first) = injected_audio_param_raw_parts(gain_descriptor());
+    let initial_first = raw_first.set_initial_value_for_injected(1.);
+    let constructed_first = first
+        .base()
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap()
+        .commit(InjectedGainPayload {
+            param_processor: processor_first,
+            gain_processor: Box::new(SilentProcessor),
+            param_channel_config: channel_config(),
+            gain_channel_config: channel_config(),
+            initial_value: initial_first,
+        })
+        .unwrap();
+    let (raw_second, processor_second) = injected_audio_param_raw_parts(gain_descriptor());
+    let initial_second = raw_second.set_initial_value_for_injected(1.);
+    let constructed_second = second
+        .base()
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap()
+        .commit(InjectedGainPayload {
+            param_processor: processor_second,
+            gain_processor: Box::new(SilentProcessor),
+            param_channel_config: channel_config(),
+            gain_channel_config: channel_config(),
+            initial_value: initial_second,
+        })
+        .unwrap();
+    let registration = AudioContextRegistration::from_injected(
+        constructed_first.param_id,
+        first.base().clone(),
+        constructed_first.param_registration,
+    );
+    // The foreign cap's mirror is deliberately paired with raw_second, isolating the control
+    // identity mismatch from the already-covered mirror mismatch.
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        AudioParam::from_injected_raw_parts(
+            registration,
+            raw_second,
+            constructed_second.param_mutation,
+        )
+    }))
+    .is_err());
+    drop(
+        first
+            .base()
+            .injected_node_constructor()
+            .unwrap()
+            .try_begin_gain()
+            .unwrap(),
+    );
+    assert!(matches!(
+        second
+            .base()
+            .injected_node_constructor()
+            .unwrap()
+            .try_begin_gain(),
+        Err(InjectedGainConstructionError::Control(
+            super::injected_control::InjectedControlError::ProtocolViolation
+        ))
+    ));
+    drop((
+        raw_first,
+        constructed_first.param_mutation,
+        constructed_first.gain_registration,
+        constructed_second.param_registration,
+        constructed_second.gain_registration,
+    ));
+    first.callback();
+    second.callback();
+    first.wait_for_transport_idle();
+    second.wait_for_transport_idle();
+}
+
+#[test]
+fn invalid_and_deferred_exact_param_mutations_never_change_host_state_or_poison_rate() {
+    let mut harness = Harness::new(4);
+    let gain = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert!(panic::catch_unwind(AssertUnwindSafe(|| gain.gain().set_value(value))).is_err());
+        assert_eq!(gain.gain().value(), 1.);
+        assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+    }
+
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        gain.gain().set_automation_rate(AutomationRate::K)
+    }))
+    .is_err());
+    assert_eq!(gain.gain().automation_rate(), AutomationRate::A);
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        gain.gain().set_value_at_time(0.5, 0.)
+    }))
+    .is_err());
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        gain.gain().linear_ramp_to_value_at_time(0.5, 1.)
+    }))
+    .is_err());
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        gain.gain().exponential_ramp_to_value_at_time(0.5, 1.)
+    }))
+    .is_err());
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        gain.gain().set_target_at_time(0.5, 0., 1.)
+    }))
+    .is_err());
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        gain.gain().cancel_scheduled_values(0.)
+    }))
+    .is_err());
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        gain.gain().cancel_and_hold_at_time(0.)
+    }))
+    .is_err());
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        gain.gain().set_value_curve_at_time(&[0., 1., 0.], 0., 1.)
+    }))
+    .is_err());
+    assert_eq!(gain.gain().value(), 1.);
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+
+    // Expected public panics occur after the serializer is released, so the supported operation
+    // remains usable.
+    gain.gain().set_value(0.75);
+    harness.callback();
+    harness.wait_for_transport_idle();
+    assert_eq!(gain.gain().value(), 0.75);
+}
+
+#[test]
+fn surviving_param_clone_is_inert_after_seal() {
+    let mut harness = Harness::new(4);
+    let gain = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let param = gain.gain().clone();
+
+    let retirement = harness
+        .lifecycle
+        .take()
+        .unwrap()
+        .try_begin_close()
+        .ok()
+        .unwrap();
+    let (snapshot, drained) = retirement.retire_and_wait();
+    assert!(snapshot.is_drained());
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| param.set_value(0.5))).is_err());
+    assert_eq!(param.value(), 1.);
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+    drop(drained);
+    drop((gain, param));
+}
+
+#[test]
+fn concurrent_param_clones_serialize_commit_and_finalizer_order_without_idle_credits() {
+    let mut harness = Harness::new(4);
+    let gain = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let first = gain.gain().clone();
+    let second = gain.gain().clone();
+    let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+    let (release_send, release_recv) = crossbeam_channel::bounded(1);
+    first.hold_next_injected_value_finalizer_for_test(entered_send, release_recv, false);
+
+    let first_thread = thread::spawn(move || {
+        first.set_value(0.25);
+    });
+    entered_recv.recv().unwrap();
+    let (attempted_send, attempted_recv) = crossbeam_channel::bounded(1);
+    second.signal_next_injected_serializer_attempt_for_test(attempted_send);
+    let second_thread = thread::spawn(move || {
+        second.set_value(0.75);
+    });
+    attempted_recv.recv().unwrap();
+    // The second clone waits on the per-param serializer before reserving any transport credit.
+    assert_eq!(harness.producer.accounting(), (1, 1, 1, 0));
+    release_send.send(()).unwrap();
+    first_thread.join().unwrap();
+    second_thread.join().unwrap();
+    assert_eq!(gain.gain().value(), 0.75);
+    assert_eq!(harness.producer.accounting(), (2, 2, 2, 0));
+
+    harness.callback();
+    harness.wait_for_transport_idle();
+    assert_eq!(gain.gain().value(), 0.75);
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+}
+
+#[test]
+fn accepted_param_finalizer_holds_close_admission_and_panic_is_terminal() {
+    for panics in [false, true] {
+        let mut harness = Harness::new(4);
+        let gain = GainNode::new(harness.base(), GainOptions::default());
+        harness.callback();
+        harness.wait_for_transport_idle();
+        let param = gain.gain().clone();
+        let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+        let (release_send, release_recv) = crossbeam_channel::bounded(1);
+        param.hold_next_injected_value_finalizer_for_test(entered_send, release_recv, panics);
+        let set_thread = thread::spawn(move || {
+            panic::catch_unwind(AssertUnwindSafe(|| param.set_value(0.5))).is_ok()
+        });
+        entered_recv.recv().unwrap();
+
+        let mut pending_close = None;
+        if !panics {
+            let retirement = harness
+                .lifecycle
+                .take()
+                .unwrap()
+                .try_begin_close()
+                .ok()
+                .unwrap();
+            let (done_send, done_recv) = crossbeam_channel::bounded(1);
+            let close_thread = thread::spawn(move || {
+                let result = retirement.retire_and_wait();
+                done_send.send(result).unwrap();
+            });
+            assert!(done_recv.try_recv().is_err());
+            pending_close = Some((done_recv, close_thread));
+        }
+        release_send.send(()).unwrap();
+        assert_eq!(set_thread.join().unwrap(), !panics);
+        assert_eq!(gain.gain().value(), if panics { 1. } else { 0.5 });
+        // A real quantum both routes the accepted command and lets the exact processor consume
+        // its fixed pending scalar. A failed host finalizer must not suppress renderer ownership.
+        harness.render_quantum();
+        if panics {
+            let retirement = harness
+                .lifecycle
+                .take()
+                .unwrap()
+                .try_begin_close()
+                .ok()
+                .unwrap();
+            let (done_send, done_recv) = crossbeam_channel::bounded(1);
+            let close_thread = thread::spawn(move || {
+                done_send.send(retirement.retire_and_wait()).unwrap();
+            });
+            pending_close = Some((done_recv, close_thread));
+        }
+        assert_eq!(gain.gain().value(), 0.5);
+        let (done_recv, close_thread) = pending_close.unwrap();
+        let (snapshot, drained) = done_recv.recv().unwrap();
+        assert!(snapshot.is_drained());
+        let sealed = drained.finish().ok().unwrap();
+        assert_eq!(sealed.degradation.prior_transport_failure, panics);
+        drop(sealed);
+        close_thread.join().unwrap();
+    }
+}
+
+#[test]
+fn saturated_and_not_accepted_value_updates_leave_host_unchanged_and_recover_credits() {
+    // Capacity failure occurs before host publication and leaves the serializer reusable.
+    let mut harness = Harness::new(1);
+    let gain = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let filler = harness
+        .producer
+        .try_begin_operation(1)
+        .unwrap()
+        .prepare_with(|| vec![ControlMessage::TestNop])
+        .ok()
+        .unwrap();
+    harness.producer.try_commit(filler).ok().unwrap();
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| gain.gain().set_value(0.25))).is_err());
+    assert_eq!(gain.gain().value(), 1.);
+    harness.callback();
+    harness.wait_for_transport_idle();
+    gain.gain().set_value(0.25);
+    harness.callback();
+    harness.wait_for_transport_idle();
+    assert_eq!(gain.gain().value(), 0.25);
+
+    let (lock_entered_send, lock_entered_recv) = crossbeam_channel::bounded(1);
+    let (lock_release_send, lock_release_recv) = crossbeam_channel::bounded(1);
+    let lock_producer = harness.producer.clone();
+    let lock_thread = thread::spawn(move || {
+        lock_producer.hold_transport_state_for_test(lock_entered_send, lock_release_recv);
+    });
+    lock_entered_recv.recv().unwrap();
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| gain.gain().set_value(0.5))).is_err());
+    assert_eq!(gain.gain().value(), 0.25);
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+    lock_release_send.send(()).unwrap();
+    lock_thread.join().unwrap();
+
+    // Force a terminal NotAccepted commit only after its one-command reservation exists.
+    let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+    let (release_send, release_recv) = crossbeam_channel::bounded(1);
+    let (rollback_entered_send, rollback_entered_recv) = crossbeam_channel::bounded(1);
+    let (rollback_release_send, rollback_release_recv) = crossbeam_channel::bounded(1);
+    gain.gain().hold_next_injected_value_rollback_for_test(
+        rollback_entered_send,
+        rollback_release_recv,
+        false,
+    );
+    harness
+        .producer
+        .hold_next_audio_param_after_reservation_for_test(entered_send, release_recv);
+    let param = gain.gain().clone();
+    let update = thread::spawn(move || {
+        panic::catch_unwind(AssertUnwindSafe(|| param.set_value(0.75))).is_err()
+    });
+    entered_recv.recv().unwrap();
+    assert_eq!(harness.producer.accounting(), (1, 1, 1, 0));
+    harness.producer.fail_transport();
+    release_send.send(()).unwrap();
+    rollback_entered_recv.recv().unwrap();
+    let retirement = harness
+        .lifecycle
+        .take()
+        .unwrap()
+        .try_begin_close()
+        .ok()
+        .unwrap();
+    let (close_send, close_recv) = crossbeam_channel::bounded(1);
+    let close_thread = thread::spawn(move || {
+        close_send.send(retirement.retire_and_wait()).unwrap();
+    });
+    assert!(close_recv.try_recv().is_err());
+    rollback_release_send.send(()).unwrap();
+    assert!(update.join().unwrap());
+    let (snapshot, drained) = close_recv.recv().unwrap();
+    assert!(snapshot.is_drained());
+    assert!(drained.finish().is_ok());
+    close_thread.join().unwrap();
+    assert_eq!(gain.gain().value(), 0.25);
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+}
+
+#[test]
+fn not_accepted_rollback_panic_fails_closed_before_releasing_admission() {
+    let mut harness = Harness::new(4);
+    let gain = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+
+    let (reservation_entered_send, reservation_entered_recv) = crossbeam_channel::bounded(1);
+    let (reservation_release_send, reservation_release_recv) = crossbeam_channel::bounded(1);
+    harness
+        .producer
+        .hold_next_audio_param_after_reservation_for_test(
+            reservation_entered_send,
+            reservation_release_recv,
+        );
+    let (rollback_entered_send, rollback_entered_recv) = crossbeam_channel::bounded(1);
+    let (rollback_release_send, rollback_release_recv) = crossbeam_channel::bounded(1);
+    gain.gain().hold_next_injected_value_rollback_for_test(
+        rollback_entered_send,
+        rollback_release_recv,
+        true,
+    );
+    let param = gain.gain().clone();
+    let update = thread::spawn(move || {
+        panic::catch_unwind(AssertUnwindSafe(|| param.set_value(0.75))).is_err()
+    });
+    reservation_entered_recv.recv().unwrap();
+
+    // Contend only the commit after the typed reservation exists. This is an ordinary
+    // NotAccepted return whose exact command is recovered before the hostile rollback hook.
+    let (state_entered_send, state_entered_recv) = crossbeam_channel::bounded(1);
+    let (state_release_send, state_release_recv) = crossbeam_channel::bounded(1);
+    let producer = harness.producer.clone();
+    let state_thread = thread::spawn(move || {
+        producer.hold_transport_state_for_test(state_entered_send, state_release_recv);
+    });
+    state_entered_recv.recv().unwrap();
+    reservation_release_send.send(()).unwrap();
+    rollback_entered_recv.recv().unwrap();
+    state_release_send.send(()).unwrap();
+    state_thread.join().unwrap();
+
+    let retirement = harness
+        .lifecycle
+        .take()
+        .unwrap()
+        .try_begin_close()
+        .ok()
+        .unwrap();
+    let (close_send, close_recv) = crossbeam_channel::bounded(1);
+    let close_thread = thread::spawn(move || {
+        close_send.send(retirement.retire_and_wait()).unwrap();
+    });
+    assert!(close_recv.try_recv().is_err());
+    rollback_release_send.send(()).unwrap();
+    assert!(update.join().unwrap());
+
+    let (snapshot, drained) = close_recv.recv().unwrap();
+    assert!(snapshot.is_drained());
+    let sealed = drained.finish().ok().unwrap();
+    assert!(sealed.degradation.prior_transport_failure);
+    drop(sealed);
+    close_thread.join().unwrap();
+    assert_eq!(gain.gain().value(), 1.);
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+}
+
+#[test]
 fn last_gain_handles_request_teardown_before_their_final_base_arc_is_destroyed() {
     let mut harness = Harness::new(1);
     let gain = GainNode::new(harness.base(), GainOptions::default());
@@ -384,6 +1199,23 @@ fn last_gain_handles_request_teardown_before_their_final_base_arc_is_destroyed()
         .request_activity_receiver()
         .try_recv()
         .is_ok());
+}
+
+#[test]
+fn last_handle_drop_cannot_cancel_an_already_accepted_param_value() {
+    let mut harness = Harness::new(4);
+    let gain = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    gain.gain().set_value(0.125);
+    assert_eq!(harness.producer.accounting(), (1, 1, 1, 0));
+
+    drop(gain);
+    harness.assert_two_requested();
+    harness.callback();
+    harness.wait_for_transport_idle();
+    assert_eq!(harness.base().applied_control_batch_sequence(), 2);
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
 }
 
 #[test]

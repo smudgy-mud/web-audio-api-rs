@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::{panic, panic::AssertUnwindSafe};
 
 use super::injected_control::{
     injected_control_channel, AcceptedBatchFinalizeError, AcceptedBatchFinalizeFailure,
@@ -188,6 +189,25 @@ fn suspended_magic_envelope_is_flushed_and_applied_before_callback_publication()
     let initialized = initialize(harness(true));
     assert_eq!(initialized.base().state(), AudioContextState::Suspended);
     assert!(initialized.base().applied_control_batch_sequence() >= 1);
+    retire(initialized, true);
+}
+
+#[test]
+fn permanent_magic_listener_param_rejects_runtime_mutation_before_host_change() {
+    let initialized = initialize(harness(false));
+    let base = initialized.base().clone();
+    let listener = base.listener();
+    let position_x = listener.position_x();
+    assert_eq!(position_x.value(), 0.);
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| position_x.set_value(2.))).is_err());
+    assert_eq!(position_x.value(), 0.);
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        position_x.set_value_curve_at_time(&[0., 1., 0.], 0., 1.)
+    }))
+    .is_err());
+    assert_eq!(position_x.value(), 0.);
+    drop(listener);
+    drop(base);
     retire(initialized, true);
 }
 
