@@ -1,0 +1,549 @@
+//! Private rollback-capable node-id foundation for a future injected context.
+//!
+//! The cloneable allocator is weak. A unique lifecycle-side owner retains the graph's reclaim
+//! consumer and the sole strong allocation state, so surviving base/node handles cannot retain
+//! reclaim authority after context retirement. Returned graph nodes are not automatically made
+//! available: the future teardown registry must first reconcile the matching generation, mirrors,
+//! and represented-resource guards, then consume the owner's opaque pending reclaim. Fresh ids use
+//! checked arithmetic and never wrap their namespace.
+//!
+//! The later constructor transaction also needs an internal commit-finalizer seam: after the
+//! batch is accepted it must non-panickingly arm registrations and disarm this rollback guard
+//! before releasing its short graph admission. The current ordinary producer releases admission
+//! as `try_commit` returns, so this module is not directly wired until that seam exists.
+
+#![allow(dead_code)]
+
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, TryLockError, Weak};
+
+use super::AudioNodeId;
+
+pub(crate) const MAX_PROVISIONAL_NODE_IDS: usize = 11;
+
+struct AllocationState {
+    next: u64,
+    available: llq::Consumer<AudioNodeId>,
+}
+
+struct InjectedNodeIdInner {
+    allocation: Mutex<AllocationState>,
+    available_return: Mutex<llq::Producer<AudioNodeId>>,
+    lifecycle: AtomicU8,
+    #[cfg(test)]
+    release_hook: Mutex<
+        Option<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+    >,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AllocatorLifecycle {
+    OpenIdle = 0,
+    OpenActive = 1,
+    RetiredIdle = 2,
+    RetiredActive = 3,
+}
+
+impl AllocatorLifecycle {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::OpenIdle,
+            1 => Self::OpenActive,
+            2 => Self::RetiredIdle,
+            3 => Self::RetiredActive,
+            _ => unreachable!("private allocator lifecycle state"),
+        }
+    }
+}
+
+/// Weak construction capability. An admitted operation may temporarily upgrade it, but a stale
+/// base clone cannot keep allocator/reclaim queues alive after the unique owner retires.
+#[derive(Clone)]
+pub(crate) struct InjectedNodeIdAllocator {
+    inner: Weak<InjectedNodeIdInner>,
+}
+
+/// Unique lifecycle-side reclaim owner.
+pub(crate) struct InjectedNodeIdOwner {
+    inner: Arc<InjectedNodeIdInner>,
+    graph_reclaims: llq::Consumer<AudioNodeId>,
+    pending_reclaim: Option<llq::Node<AudioNodeId>>,
+}
+
+pub(crate) fn injected_node_id_pair(
+    first_id: u64,
+    graph_reclaims: llq::Consumer<AudioNodeId>,
+) -> (InjectedNodeIdAllocator, InjectedNodeIdOwner) {
+    let (available_return, available) = llq::Queue::new().split();
+    let inner = Arc::new(InjectedNodeIdInner {
+        allocation: Mutex::new(AllocationState {
+            next: first_id,
+            available,
+        }),
+        available_return: Mutex::new(available_return),
+        lifecycle: AtomicU8::new(AllocatorLifecycle::OpenIdle as u8),
+        #[cfg(test)]
+        release_hook: Mutex::new(None),
+    });
+    (
+        InjectedNodeIdAllocator {
+            inner: Arc::downgrade(&inner),
+        },
+        InjectedNodeIdOwner {
+            inner,
+            graph_reclaims,
+            pending_reclaim: None,
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProvisionalNodeIdError {
+    Empty,
+    TooMany,
+    Contended,
+    OwnerGone,
+    Poisoned,
+    Exhausted,
+    ProtocolViolation,
+}
+
+/// Exact provisional reclaim nodes for one serialized constructor transaction.
+///
+/// A fresh id allocates its reclaim node only after the caller has acquired all higher-level
+/// command/resource admission. Nodes may move into prepared `RegisterNode` commands, but a failed
+/// commit must restore each node to its original slot before this guard is dropped. Only an
+/// accepted atomic batch may call `commit` with every slot moved out.
+#[must_use]
+pub(crate) struct ProvisionalNodeIds {
+    inner: Arc<InjectedNodeIdInner>,
+    nodes: arrayvec::ArrayVec<Option<llq::Node<AudioNodeId>>, MAX_PROVISIONAL_NODE_IDS>,
+    committed: bool,
+}
+
+impl InjectedNodeIdAllocator {
+    pub(crate) fn try_reserve(
+        &self,
+        count: usize,
+    ) -> Result<ProvisionalNodeIds, ProvisionalNodeIdError> {
+        if count == 0 {
+            return Err(ProvisionalNodeIdError::Empty);
+        }
+        if count > MAX_PROVISIONAL_NODE_IDS {
+            return Err(ProvisionalNodeIdError::TooMany);
+        }
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or(ProvisionalNodeIdError::OwnerGone)?;
+        match inner.lifecycle.compare_exchange(
+            AllocatorLifecycle::OpenIdle as u8,
+            AllocatorLifecycle::OpenActive as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(state) => {
+                return Err(match AllocatorLifecycle::from_u8(state) {
+                    AllocatorLifecycle::OpenActive => ProvisionalNodeIdError::Contended,
+                    AllocatorLifecycle::RetiredIdle | AllocatorLifecycle::RetiredActive => {
+                        ProvisionalNodeIdError::OwnerGone
+                    }
+                    AllocatorLifecycle::OpenIdle => unreachable!("compare_exchange expected idle"),
+                });
+            }
+        }
+
+        let mut reservation = ProvisionalNodeIds {
+            inner: Arc::clone(&inner),
+            nodes: arrayvec::ArrayVec::new(),
+            committed: false,
+        };
+        let mut allocation = match inner.allocation.try_lock() {
+            Ok(allocation) => allocation,
+            Err(TryLockError::WouldBlock) => return Err(ProvisionalNodeIdError::Contended),
+            Err(TryLockError::Poisoned(_)) => return Err(ProvisionalNodeIdError::Poisoned),
+        };
+        for _ in 0..count {
+            let node = if let Some(node) = allocation.available.pop() {
+                node
+            } else {
+                let id = allocation.next;
+                allocation.next = allocation
+                    .next
+                    .checked_add(1)
+                    .ok_or(ProvisionalNodeIdError::Exhausted)?;
+                llq::Node::new(AudioNodeId(id))
+            };
+            reservation.nodes.push(Some(node));
+        }
+        drop(allocation);
+        Ok(reservation)
+    }
+}
+
+impl ProvisionalNodeIds {
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub(crate) fn id(&self, index: usize) -> AudioNodeId {
+        **self.nodes[index]
+            .as_ref()
+            .expect("provisional id node is present before payload construction")
+    }
+
+    pub(crate) fn take_reclaim_node(
+        &mut self,
+        index: usize,
+    ) -> Result<llq::Node<AudioNodeId>, ProvisionalNodeIdError> {
+        self.nodes
+            .get_mut(index)
+            .and_then(Option::take)
+            .ok_or(ProvisionalNodeIdError::ProtocolViolation)
+    }
+
+    pub(crate) fn restore_reclaim_node(
+        &mut self,
+        index: usize,
+        node: llq::Node<AudioNodeId>,
+    ) -> Result<(), ProvisionalNodeIdError> {
+        let Some(slot) = self.nodes.get_mut(index) else {
+            return Err(ProvisionalNodeIdError::ProtocolViolation);
+        };
+        if slot.is_some() {
+            return Err(ProvisionalNodeIdError::ProtocolViolation);
+        }
+        *slot = Some(node);
+        Ok(())
+    }
+
+    pub(crate) fn commit(mut self) -> Result<(), ProvisionalNodeIdError> {
+        if self.nodes.iter().any(Option::is_some) {
+            return Err(ProvisionalNodeIdError::ProtocolViolation);
+        }
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ProvisionalNodeIds {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut available = self
+                .inner
+                .available_return
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Preserve rollback order relative to this transaction. Reconciled graph returns may
+            // be interleaved ahead of or behind it by the unique lifecycle owner.
+            for node in &mut self.nodes {
+                if let Some(node) = node.take() {
+                    available.push(node);
+                }
+            }
+        }
+        self.inner
+            .lifecycle
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                Some(match AllocatorLifecycle::from_u8(state) {
+                    AllocatorLifecycle::OpenActive => AllocatorLifecycle::OpenIdle as u8,
+                    AllocatorLifecycle::RetiredActive => AllocatorLifecycle::RetiredIdle as u8,
+                    AllocatorLifecycle::OpenIdle | AllocatorLifecycle::RetiredIdle => {
+                        unreachable!("one provisional reservation owns the active state")
+                    }
+                })
+            })
+            .expect("active reservation lifecycle transition cannot fail");
+        #[cfg(test)]
+        if let Some((entered, release)) = self
+            .inner
+            .release_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+    }
+}
+
+impl InjectedNodeIdOwner {
+    /// Borrows one exact graph acknowledgement without exposing its `llq::Node`. If reconciliation
+    /// returns an error or panics and this value is dropped, the owner retains the exact pending
+    /// node in quarantine and the id cannot be reused. Slice B will match its id+generation and
+    /// consume it only after mirrors and represented-resource guards are retired.
+    pub(crate) fn try_pending_reclaim(&mut self) -> Option<PendingNodeReclaim<'_>> {
+        if self.pending_reclaim.is_none() {
+            self.pending_reclaim = self.graph_reclaims.pop();
+        }
+        self.pending_reclaim.as_ref()?;
+        Some(PendingNodeReclaim { owner: self })
+    }
+
+    #[cfg(test)]
+    fn set_next_for_test(&self, next: u64) {
+        self.inner
+            .allocation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next = next;
+    }
+
+    #[cfg(test)]
+    fn set_release_hook_for_test(
+        &self,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    ) {
+        *self
+            .inner
+            .release_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entered, release));
+    }
+}
+
+impl Drop for InjectedNodeIdOwner {
+    fn drop(&mut self) {
+        self.inner
+            .lifecycle
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                Some(match AllocatorLifecycle::from_u8(state) {
+                    AllocatorLifecycle::OpenIdle => AllocatorLifecycle::RetiredIdle as u8,
+                    AllocatorLifecycle::OpenActive => AllocatorLifecycle::RetiredActive as u8,
+                    AllocatorLifecycle::RetiredIdle | AllocatorLifecycle::RetiredActive => {
+                        unreachable!("the unique owner retires exactly once")
+                    }
+                })
+            })
+            .expect("unique owner retirement transition cannot fail");
+    }
+}
+
+/// Opaque, owner-borrowing graph acknowledgement. There is no raw-node constructor or extractor.
+#[must_use = "a pending reclaim must be reconciled or remains quarantined in its owner"]
+pub(crate) struct PendingNodeReclaim<'a> {
+    owner: &'a mut InjectedNodeIdOwner,
+}
+
+impl PendingNodeReclaim<'_> {
+    pub(crate) fn id(&self) -> AudioNodeId {
+        **self
+            .owner
+            .pending_reclaim
+            .as_ref()
+            .expect("pending reclaim borrow retains its exact node")
+    }
+
+    /// Marks reconciliation successful and makes this exact node available. Merely dropping the
+    /// opaque value deliberately does not do so.
+    pub(crate) fn make_available(self) {
+        let node = self
+            .owner
+            .pending_reclaim
+            .take()
+            .expect("pending reclaim is consumed exactly once");
+        self.owner
+            .inner
+            .available_return
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(node);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use super::*;
+
+    fn pair(
+        first: u64,
+    ) -> (
+        llq::Producer<AudioNodeId>,
+        InjectedNodeIdAllocator,
+        InjectedNodeIdOwner,
+    ) {
+        let (graph_return, graph_reclaims) = llq::Queue::new().split();
+        let (allocator, owner) = injected_node_id_pair(first, graph_reclaims);
+        (graph_return, allocator, owner)
+    }
+
+    #[test]
+    fn rollback_preserves_exact_nodes_and_relative_order_after_panic() {
+        let (_graph_return, allocator, _owner) = pair(11);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let ids = allocator.try_reserve(2).unwrap();
+            assert_eq!(ids.id(0), AudioNodeId(11));
+            assert_eq!(ids.id(1), AudioNodeId(12));
+            panic!("constructor panic");
+        }));
+        assert!(result.is_err());
+
+        let ids = allocator.try_reserve(2).unwrap();
+        assert_eq!(ids.id(0), AudioNodeId(11));
+        assert_eq!(ids.id(1), AudioNodeId(12));
+    }
+
+    #[test]
+    fn moved_node_must_be_restored_before_rollback_or_commit() {
+        let (_graph_return, allocator, _owner) = pair(20);
+        let mut ids = allocator.try_reserve(1).unwrap();
+        let node = ids.take_reclaim_node(0).unwrap();
+        ids.restore_reclaim_node(0, node).unwrap();
+        drop(ids);
+        let ids = allocator.try_reserve(1).unwrap();
+        assert_eq!(ids.id(0), AudioNodeId(20));
+    }
+
+    #[test]
+    fn graph_reclaim_requires_explicit_reconciliation_before_reuse() {
+        let (mut graph_return, allocator, mut owner) = pair(30);
+        graph_return.push(llq::Node::new(AudioNodeId(7)));
+
+        let fresh = allocator.try_reserve(1).unwrap();
+        assert_eq!(fresh.id(0), AudioNodeId(30));
+        drop(fresh);
+
+        let reclaimed = owner.try_pending_reclaim().unwrap();
+        assert_eq!(reclaimed.id(), AudioNodeId(7));
+        reclaimed.make_available();
+        let reused = allocator.try_reserve(1).unwrap();
+        assert_eq!(reused.id(0), AudioNodeId(30));
+        drop(reused);
+        let reused = allocator.try_reserve(1).unwrap();
+        assert_eq!(reused.id(0), AudioNodeId(7));
+    }
+
+    #[test]
+    fn owner_drop_makes_surviving_allocator_inert() {
+        let (_graph_return, allocator, owner) = pair(0);
+        drop(owner);
+        assert_eq!(
+            allocator.try_reserve(1).err(),
+            Some(ProvisionalNodeIdError::OwnerGone)
+        );
+    }
+
+    #[test]
+    fn owner_retirement_cannot_reopen_during_final_reservation_drop() {
+        let (_graph_return, allocator, owner) = pair(0);
+        let reservation = allocator.try_reserve(1).unwrap();
+        let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+        let (release_send, release_recv) = crossbeam_channel::bounded(1);
+        owner.set_release_hook_for_test(entered_send, release_recv);
+        drop(owner);
+
+        let dropper = std::thread::spawn(move || drop(reservation));
+        entered_recv.recv().unwrap();
+        // The reservation still owns the final strong Arc here, so Weak::upgrade succeeds. The
+        // combined lifecycle word must nevertheless preserve retirement and reject admission.
+        assert_eq!(
+            allocator.try_reserve(1).err(),
+            Some(ProvisionalNodeIdError::OwnerGone)
+        );
+        release_send.send(()).unwrap();
+        dropper.join().unwrap();
+        assert_eq!(
+            allocator.try_reserve(1).err(),
+            Some(ProvisionalNodeIdError::OwnerGone)
+        );
+    }
+
+    #[test]
+    fn allocator_reservation_and_unique_owner_have_worker_safe_traits() {
+        fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
+        fn assert_send<T: Send>() {}
+        assert_clone_send_sync::<InjectedNodeIdAllocator>();
+        assert_send::<InjectedNodeIdOwner>();
+        assert_send::<ProvisionalNodeIds>();
+    }
+
+    #[test]
+    fn reservation_is_serial_and_limits_and_exhaustion_are_typed() {
+        let (_graph_return, allocator, _owner) = pair(0);
+        assert_eq!(
+            allocator.try_reserve(0).err(),
+            Some(ProvisionalNodeIdError::Empty)
+        );
+        assert_eq!(
+            allocator.try_reserve(MAX_PROVISIONAL_NODE_IDS + 1).err(),
+            Some(ProvisionalNodeIdError::TooMany)
+        );
+        let held = allocator.try_reserve(1).unwrap();
+        assert_eq!(
+            allocator.try_reserve(1).err(),
+            Some(ProvisionalNodeIdError::Contended)
+        );
+        drop(held);
+        let (_graph_return, exhausted_allocator, exhausted_owner) = pair(u64::MAX);
+        assert_eq!(
+            exhausted_allocator.try_reserve(1).err(),
+            Some(ProvisionalNodeIdError::Exhausted)
+        );
+        exhausted_owner.set_next_for_test(50);
+        assert!(exhausted_allocator.try_reserve(1).is_ok());
+    }
+
+    #[test]
+    fn close_reconciliation_observes_each_exact_reclaim_before_returning_it() {
+        let (mut graph_return, allocator, mut owner) = pair(100);
+        graph_return.push(llq::Node::new(AudioNodeId(4)));
+        graph_return.push(llq::Node::new(AudioNodeId(9)));
+        let first = owner.try_pending_reclaim().unwrap();
+        assert_eq!(first.id(), AudioNodeId(4));
+        first.make_available();
+        let second = owner.try_pending_reclaim().unwrap();
+        assert_eq!(second.id(), AudioNodeId(9));
+        second.make_available();
+
+        let ids = allocator.try_reserve(2).unwrap();
+        assert_eq!(ids.id(0), AudioNodeId(4));
+        assert_eq!(ids.id(1), AudioNodeId(9));
+    }
+
+    #[test]
+    fn failed_or_panicking_reconciliation_quarantines_exact_node_until_success() {
+        let (mut graph_return, allocator, mut owner) = pair(40);
+        graph_return.push(llq::Node::new(AudioNodeId(6)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let pending = owner.try_pending_reclaim().unwrap();
+            assert_eq!(pending.id(), AudioNodeId(6));
+            panic!("reconciliation panic");
+        }));
+        assert!(result.is_err());
+
+        let fresh = allocator.try_reserve(1).unwrap();
+        assert_eq!(fresh.id(0), AudioNodeId(40));
+        drop(fresh);
+        let pending = owner.try_pending_reclaim().unwrap();
+        assert_eq!(pending.id(), AudioNodeId(6));
+        pending.make_available();
+    }
+
+    #[test]
+    fn reconciled_return_may_interleave_ahead_of_rollback_without_loss() {
+        let (mut graph_return, allocator, mut owner) = pair(11);
+        let provisional = allocator.try_reserve(2).unwrap();
+        assert_eq!(provisional.id(0), AudioNodeId(11));
+        assert_eq!(provisional.id(1), AudioNodeId(12));
+        graph_return.push(llq::Node::new(AudioNodeId(7)));
+        owner
+            .try_pending_reclaim()
+            .expect("graph return")
+            .make_available();
+        drop(provisional);
+
+        let ids = allocator.try_reserve(3).unwrap();
+        assert_eq!(ids.id(0), AudioNodeId(7));
+        assert_eq!(ids.id(1), AudioNodeId(11));
+        assert_eq!(ids.id(2), AudioNodeId(12));
+    }
+}

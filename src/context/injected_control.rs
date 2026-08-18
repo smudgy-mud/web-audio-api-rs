@@ -80,15 +80,24 @@ enum TransportPhase {
 }
 
 #[derive(Clone)]
-struct StagingSlotPool(Arc<AtomicUsize>);
+struct StagingSlotPool(Arc<StagingSlotState>);
+
+struct StagingSlotState {
+    in_flight: AtomicUsize,
+    activity: Sender<()>,
+}
 
 impl StagingSlotPool {
-    fn new() -> Self {
-        Self(Arc::new(AtomicUsize::new(0)))
+    fn new(activity: Sender<()>) -> Self {
+        Self(Arc::new(StagingSlotState {
+            in_flight: AtomicUsize::new(0),
+            activity,
+        }))
     }
 
     fn try_acquire(&self) -> Option<StagingSlot> {
         self.0
+            .in_flight
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < STAGED_ENVELOPE_LIMIT).then_some(count + 1)
             })
@@ -98,16 +107,17 @@ impl StagingSlotPool {
 
     #[cfg(test)]
     fn in_flight(&self) -> usize {
-        self.0.load(Ordering::Acquire)
+        self.0.in_flight.load(Ordering::Acquire)
     }
 }
 
-struct StagingSlot(Arc<AtomicUsize>);
+struct StagingSlot(Arc<StagingSlotState>);
 
 impl Drop for StagingSlot {
     fn drop(&mut self) {
-        let previous = self.0.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
+        let _ = self.0.activity.try_send(());
     }
 }
 
@@ -164,6 +174,7 @@ pub(crate) struct InjectedControlProducer {
 pub(crate) struct InjectedControlLifecycleOwner {
     inner: Arc<InjectedControlInner>,
     watcher: GraphLifecycleWatcher,
+    activity: crossbeam_channel::Receiver<()>,
 }
 
 /// Consuming initializer which binds receiver, physical lifetime owners, and lifecycle publisher.
@@ -255,8 +266,10 @@ pub(crate) fn injected_control_channel(
         .checked_add(1)
         .ok_or(InjectedControlError::InvalidOrdinaryCapacity)?;
     let (sender, receiver) = crossbeam_channel::bounded(channel_capacity);
-    let ordinary_physical = InjectedPhysicalCreditPool::new(ordinary_capacity);
-    let lifecycle_physical = InjectedPhysicalCreditPool::new(1);
+    let (activity_send, activity_recv) = crossbeam_channel::bounded(1);
+    let ordinary_physical =
+        InjectedPhysicalCreditPool::new(ordinary_capacity, activity_send.clone());
+    let lifecycle_physical = InjectedPhysicalCreditPool::new(1, activity_send.clone());
     let physical_owners = InjectedPhysicalCreditOwners {
         ordinary: ordinary_physical.clone(),
         lifecycle: lifecycle_physical.clone(),
@@ -273,11 +286,14 @@ pub(crate) fn injected_control_channel(
             next_batch_sequence: 1,
             staged: VecDeque::with_capacity(STAGED_ENVELOPE_LIMIT),
         }),
-        logical_commands: InjectedCommandCreditPool::new(LOGICAL_COMMAND_LIMIT),
-        batch_storage: ControlBatchStoragePool::new(),
+        logical_commands: InjectedCommandCreditPool::new(
+            LOGICAL_COMMAND_LIMIT,
+            activity_send.clone(),
+        ),
+        batch_storage: ControlBatchStoragePool::new_with_activity(activity_send.clone()),
         ordinary_physical,
         lifecycle_physical,
-        staging_slots: StagingSlotPool::new(),
+        staging_slots: StagingSlotPool::new(activity_send),
         batch_sequence_reservations: Arc::new(AtomicUsize::new(0)),
         close_in_flight: Arc::new(AtomicBool::new(false)),
         last_submitted_batch_sequence: AtomicU64::new(0),
@@ -290,6 +306,7 @@ pub(crate) fn injected_control_channel(
         InjectedControlLifecycleOwner {
             inner: Arc::clone(&inner),
             watcher,
+            activity: activity_recv,
         },
         InjectedControlRenderInit {
             receiver,
@@ -813,6 +830,14 @@ pub(crate) struct ControlCloseRetirement {
 }
 
 impl InjectedControlLifecycleOwner {
+    /// Best-effort credit-release hint for the future non-RT lifecycle driver. The receiver is
+    /// borrowed so no competing consumer can be retained through this API. Callers must retry
+    /// from authoritative teardown/transport state; a wake is never an acknowledgement.
+    #[allow(dead_code)] // selected by the future injected teardown/lifecycle driver
+    pub(crate) const fn credit_activity_receiver(&self) -> &crossbeam_channel::Receiver<()> {
+        &self.activity
+    }
+
     /// Seals the shared gate first, then recovers a poisoned local transport mutex if necessary.
     /// Gate poison cannot establish the irreversible boundary and therefore returns a quarantine
     /// failure retaining the unique owner.
@@ -1716,6 +1741,17 @@ mod tests {
         assert_send::<ControlBatchReservation>();
         assert_send::<PreparedControlBatch>();
         assert_send::<SubmittedControlClose>();
+    }
+
+    #[test]
+    fn staging_credit_release_emits_coalesced_activity_hint() {
+        let (activity, receiver) = crossbeam_channel::bounded(1);
+        let pool = StagingSlotPool::new(activity);
+        let slot = pool.try_acquire().unwrap();
+        assert_eq!(pool.in_flight(), 1);
+        drop(slot);
+        receiver.recv().unwrap();
+        assert_eq!(pool.in_flight(), 0);
     }
 
     #[test]

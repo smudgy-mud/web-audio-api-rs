@@ -17,6 +17,8 @@ pub(crate) use injected_admission::{
 
 mod injected_control;
 
+mod injected_ids;
+
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
 #[cfg(feature = "diagnostics")]
