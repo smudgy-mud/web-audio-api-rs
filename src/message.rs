@@ -23,6 +23,7 @@ pub(crate) const CONTROL_BATCH_CAPACITY: usize = 256;
 #[allow(dead_code)] // Private staging for the later additive bounded-control API.
 pub(crate) const CONTROL_BATCH_STORAGE_IN_FLIGHT_LIMIT: usize = 256;
 pub(crate) const CONTROL_COMMANDS_PER_CALLBACK: usize = 256;
+const _: () = assert!(CONTROL_BATCH_CAPACITY <= CONTROL_COMMANDS_PER_CALLBACK);
 
 pub(crate) type ControlBatchNode = llq::Node<Box<dyn Any + Send>>;
 
@@ -314,6 +315,11 @@ impl Drop for ControlBatchPermit {
 
 pub(crate) struct ControlBatchStorage {
     sequence: u64,
+    /// The first command not yet taken by the renderer.
+    ///
+    /// Render-side budget admission checks the full remaining length before advancing this field,
+    /// so a batch is never partially consumed merely because one callback exhausted its command
+    /// budget.
     next: usize,
     commands: Box<[Option<ControlMessage>]>,
     _permit: ControlBatchPermit,
@@ -349,6 +355,13 @@ impl ControlBatchStorage {
 
     pub(crate) fn is_complete(&self) -> bool {
         self.next == self.commands.len()
+    }
+
+    pub(crate) fn remaining_len(&self) -> usize {
+        self.commands
+            .len()
+            .checked_sub(self.next)
+            .expect("control batch cursor never exceeds its storage")
     }
 
     pub(crate) fn take_next(&mut self) -> Option<ControlMessage> {
@@ -533,7 +546,11 @@ impl ControlBatchSender {
 
 /// Commands from the control thread to the render thread
 pub(crate) enum ControlMessage {
-    /// Private, bounded multi-command envelope. The render thread never drops its storage.
+    /// Private, bounded multi-command envelope.
+    ///
+    /// Every currently admitted batch is atomic with respect to the per-callback command budget:
+    /// the renderer defers the whole envelope when its remaining budget cannot fit every command.
+    /// The render thread never drops its storage.
     #[allow(dead_code)]
     Batch(ControlBatchNode),
 

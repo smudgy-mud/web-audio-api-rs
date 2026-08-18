@@ -202,7 +202,20 @@ impl RenderThread {
                 }
             }
 
-            while *remaining > 0 {
+            let batch_commands = control_batch_storage(
+                self.pending_control_batch
+                    .as_ref()
+                    .expect("batch is pending"),
+            )
+            .remaining_len();
+            if batch_commands > *remaining {
+                // Keep both the storage cursor and every command untouched. The envelope remains
+                // ahead of later direct records and will be reconsidered with the next callback's
+                // fresh budget.
+                return;
+            }
+
+            for _ in 0..batch_commands {
                 let message = control_batch_storage_mut(
                     self.pending_control_batch
                         .as_mut()
@@ -217,24 +230,16 @@ impl RenderThread {
                     self.reclaim_control_batch(batch);
                     return;
                 }
-
-                if control_batch_storage(
-                    self.pending_control_batch
-                        .as_ref()
-                        .expect("batch is pending"),
-                )
-                .is_complete()
-                {
-                    let batch = self.pending_control_batch.take().unwrap();
-                    let sequence = control_batch_storage(&batch).sequence();
-                    self.control_batch_applied.publish(sequence);
-                    self.event_sender
-                        .try_send(EventDispatch::control_batch_activity())
-                        .ok();
-                    self.reclaim_control_batch(batch);
-                    break;
-                }
             }
+
+            let batch = self.pending_control_batch.take().unwrap();
+            debug_assert!(control_batch_storage(&batch).is_complete());
+            let sequence = control_batch_storage(&batch).sequence();
+            self.control_batch_applied.publish(sequence);
+            self.event_sender
+                .try_send(EventDispatch::control_batch_activity())
+                .ok();
+            self.reclaim_control_batch(batch);
         }
     }
 
@@ -1196,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_barrier_follows_partial_batch_fifo_across_callback_budgets() {
+    fn lifecycle_barrier_follows_deferred_atomic_batch_fifo_across_callback_budgets() {
         let mut test = harness(4, 4);
         let watcher = install_lifecycle_watcher(&mut test.renderer);
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -1210,7 +1215,7 @@ mod tests {
             .unwrap();
 
         run_callback(&mut test.renderer);
-        assert_eq!(&*log.lock().unwrap(), &(0..=255).collect::<Vec<_>>());
+        assert_eq!(&*log.lock().unwrap(), &[0]);
         assert_eq!(test.applied.load(), 0);
         assert_eq!(
             watcher.snapshot(NonZeroU64::new(1).unwrap()),
@@ -1220,6 +1225,13 @@ mod tests {
         run_callback(&mut test.renderer);
         assert_eq!(&*log.lock().unwrap(), &(0..=256).collect::<Vec<_>>());
         assert_eq!(test.applied.load(), 1);
+        assert!(!test.renderer.suspended);
+        assert_eq!(
+            watcher.snapshot(NonZeroU64::new(1).unwrap()),
+            GraphLifecycleSnapshot::Pending
+        );
+
+        run_callback(&mut test.renderer);
         assert!(test.renderer.suspended);
         assert_applied(&watcher, barrier, 1, GraphLifecycleOutcome::Applied);
     }
@@ -1489,18 +1501,31 @@ mod tests {
     }
 
     #[test]
-    fn partial_batch_preserves_fifo_and_publishes_only_when_complete() {
+    fn insufficient_budget_defers_atomic_batch_without_mutation_or_fifo_advance() {
         let mut test = harness(4, 4);
-        let log = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::with_capacity(258)));
         test.legacy.try_send(marker(0, &log)).unwrap();
         test.batches
             .try_send((1..=256).map(|value| marker(value, &log)).collect())
             .unwrap();
         test.legacy.try_send(marker(257, &log)).unwrap();
 
-        run_callback(&mut test.renderer);
-        assert_eq!(&*log.lock().unwrap(), &(0..=255).collect::<Vec<_>>());
+        alloc_counter::deny_alloc(|| run_callback(&mut test.renderer));
+        assert_eq!(&*log.lock().unwrap(), &[0]);
         assert_eq!(test.applied.load(), 0);
+        let pending = test
+            .renderer
+            .pending_control_batch
+            .as_ref()
+            .expect("the deferred batch remains renderer-owned");
+        assert_eq!(control_batch_storage(pending).remaining_len(), 256);
+        assert_eq!(test.retained_receiver.len(), 1);
+
+        alloc_counter::deny_alloc(|| run_callback(&mut test.renderer));
+        assert_eq!(&*log.lock().unwrap(), &(0..=256).collect::<Vec<_>>());
+        assert_eq!(test.applied.load(), 1);
+        assert!(test.renderer.pending_control_batch.is_none());
+        assert_eq!(test.retained_receiver.len(), 1);
 
         run_callback(&mut test.renderer);
         assert_eq!(&*log.lock().unwrap(), &(0..=257).collect::<Vec<_>>());
@@ -1508,7 +1533,28 @@ mod tests {
     }
 
     #[test]
-    fn sink_swap_replays_partial_and_cached_fifo_without_watermark_gap() {
+    fn atomic_batch_applies_when_it_exactly_fits_the_remaining_callback_budget() {
+        let mut test = harness(4, 4);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        test.legacy.try_send(marker(0, &log)).unwrap();
+        test.batches
+            .try_send((1..=255).map(|value| marker(value, &log)).collect())
+            .unwrap();
+        test.legacy.try_send(marker(256, &log)).unwrap();
+
+        run_callback(&mut test.renderer);
+        assert_eq!(&*log.lock().unwrap(), &(0..=255).collect::<Vec<_>>());
+        assert_eq!(test.applied.load(), 1);
+        assert!(test.renderer.pending_control_batch.is_none());
+        assert_eq!(test.retained_receiver.len(), 1);
+
+        run_callback(&mut test.renderer);
+        assert_eq!(&*log.lock().unwrap(), &(0..=256).collect::<Vec<_>>());
+        assert_eq!(test.applied.load(), 1);
+    }
+
+    #[test]
+    fn sink_swap_replays_deferred_and_cached_fifo_without_watermark_gap() {
         let mut old = harness(4, 8);
         let (id_producer, _id_consumer) = llq::Queue::new().split();
         old.renderer.graph = Some(Graph::new(id_producer));
@@ -1521,17 +1567,22 @@ mod tests {
         old.legacy.try_send(marker(258, &log)).unwrap();
 
         run_callback(&mut old.renderer);
-        assert_eq!(&*log.lock().unwrap(), &(0..=255).collect::<Vec<_>>());
+        assert_eq!(&*log.lock().unwrap(), &[0]);
         assert_eq!(old.applied.load(), 0);
 
         // Mirrors set_sink_id_sync: cache records not yet owned by the old renderer, then place
-        // CloseAndRecycle after its partially-applied batch.
+        // CloseAndRecycle after its deferred atomic batch.
         let cached: Vec<_> = old.retained_receiver.try_iter().collect();
         assert_eq!(cached.len(), 2);
         let (graph_send, graph_recv) = crossbeam_channel::bounded(1);
         old.legacy
             .send(ControlMessage::CloseAndRecycle { sender: graph_send })
             .unwrap();
+        run_callback(&mut old.renderer);
+        assert!(graph_recv.try_recv().is_err());
+        assert_eq!(&*log.lock().unwrap(), &(0..=256).collect::<Vec<_>>());
+        assert_eq!(old.applied.load(), 1);
+
         run_callback(&mut old.renderer);
         let graph = graph_recv.recv().unwrap();
         assert_eq!(&*log.lock().unwrap(), &(0..=256).collect::<Vec<_>>());
@@ -1667,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_partial_batch_does_not_advance_watermark() {
+    fn dropping_deferred_atomic_batch_does_not_advance_watermark() {
         let mut test = harness(2, 2);
         test.legacy.try_send(ControlMessage::TestNop).unwrap();
         test.batches
@@ -1680,7 +1731,8 @@ mod tests {
 
         run_callback(&mut test.renderer);
         assert_eq!(test.applied.load(), 0);
-        assert!(test.renderer.pending_control_batch.is_some());
+        let pending = test.renderer.pending_control_batch.as_ref().unwrap();
+        assert_eq!(control_batch_storage(pending).remaining_len(), 256);
         drop(test.renderer);
         assert_eq!(test.applied.load(), 0);
         drop(test.garbage.pop().unwrap());
