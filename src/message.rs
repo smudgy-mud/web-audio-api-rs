@@ -1,7 +1,8 @@
 //! Message passing from control to render node
 
 use std::any::Any;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "diagnostics")]
@@ -38,6 +39,231 @@ impl ControlBatchApplied {
     pub(super) fn publish(&self, sequence: u64) {
         self.sequence.store(sequence, Ordering::Release);
     }
+}
+
+/// Silent graph transition committed by an injected lifecycle barrier.
+#[allow(dead_code)] // Installed by the later injected-context integration; exercised in tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum GraphLifecycleTransition {
+    Suspend = 1,
+    Resume = 2,
+    Close = 3,
+}
+
+#[allow(dead_code)]
+impl GraphLifecycleTransition {
+    const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Suspend),
+            2 => Some(Self::Resume),
+            3 => Some(Self::Close),
+            _ => None,
+        }
+    }
+}
+
+/// Direct, non-batchable lifecycle fence in the controller sequence namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GraphLifecycleBarrier {
+    controller_sequence: u64,
+    required_batch_sequence: u64,
+    transition: GraphLifecycleTransition,
+}
+
+#[allow(dead_code)]
+impl GraphLifecycleBarrier {
+    pub(crate) const fn new(
+        controller_sequence: NonZeroU64,
+        required_batch_sequence: u64,
+        transition: GraphLifecycleTransition,
+    ) -> Self {
+        Self {
+            controller_sequence: controller_sequence.get(),
+            required_batch_sequence,
+            transition,
+        }
+    }
+
+    pub(crate) const fn controller_sequence(self) -> u64 {
+        self.controller_sequence
+    }
+
+    pub(crate) const fn required_batch_sequence(self) -> u64 {
+        self.required_batch_sequence
+    }
+
+    pub(crate) const fn transition(self) -> GraphLifecycleTransition {
+        self.transition
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_raw_parts_for_test(
+        controller_sequence: u64,
+        required_batch_sequence: u64,
+        transition: GraphLifecycleTransition,
+    ) -> Self {
+        Self {
+            controller_sequence,
+            required_batch_sequence,
+            transition,
+        }
+    }
+}
+
+/// Fixed result published for one controller lifecycle sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum GraphLifecycleOutcome {
+    Applied = 1,
+    ControllerSequenceGap = 2,
+    RequiredBatchPending = 3,
+    ProtocolViolation = 4,
+}
+
+#[allow(dead_code)]
+impl GraphLifecycleOutcome {
+    const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Applied),
+            2 => Some(Self::ControllerSequenceGap),
+            3 => Some(Self::RequiredBatchPending),
+            4 => Some(Self::ProtocolViolation),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct GraphLifecycleAckState {
+    /// Release-published commit word; every other field belongs to this sequence.
+    applied_sequence: AtomicU64,
+    required_batch_sequence: AtomicU64,
+    observed_batch_sequence: AtomicU64,
+    transition: AtomicU8,
+    outcome: AtomicU8,
+}
+
+/// Render-owned publisher for the persistent lifecycle acknowledgement slot.
+pub(crate) struct GraphLifecyclePublisher {
+    state: Arc<GraphLifecycleAckState>,
+    wake: crossbeam_channel::Sender<()>,
+}
+
+impl GraphLifecyclePublisher {
+    /// Publishes fixed-size data before the Release commit word, then emits a best-effort wake.
+    ///
+    /// The bounded `try_send` never waits for channel capacity. It is deliberately not described
+    /// as lock-free because the channel implementation may briefly use internal synchronization.
+    pub(crate) fn publish(
+        &self,
+        barrier: GraphLifecycleBarrier,
+        observed_batch_sequence: u64,
+        outcome: GraphLifecycleOutcome,
+    ) {
+        self.state
+            .required_batch_sequence
+            .store(barrier.required_batch_sequence(), Ordering::Relaxed);
+        self.state
+            .observed_batch_sequence
+            .store(observed_batch_sequence, Ordering::Relaxed);
+        self.state
+            .transition
+            .store(barrier.transition() as u8, Ordering::Relaxed);
+        self.state.outcome.store(outcome as u8, Ordering::Relaxed);
+        self.state
+            .applied_sequence
+            .store(barrier.controller_sequence(), Ordering::Release);
+        let _ = self.wake.try_send(());
+    }
+}
+
+/// Acquire snapshot for one expected in-flight lifecycle barrier.
+#[allow(dead_code)] // Read by the later injected lifecycle worker; exercised in tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GraphLifecycleSnapshot {
+    Pending,
+    Applied {
+        barrier: GraphLifecycleBarrier,
+        observed_batch_sequence: u64,
+        outcome: GraphLifecycleOutcome,
+    },
+    SequenceAdvanced {
+        applied_sequence: u64,
+    },
+}
+
+/// Control-owned watcher for the persistent lifecycle acknowledgement slot.
+///
+/// The controller must keep exactly one lifecycle barrier in flight: it must observe that
+/// barrier's authoritative snapshot before submitting the next sequence. This lets the single
+/// fixed-size slot remain allocation-free while preserving a coherent Release/Acquire snapshot.
+#[allow(dead_code)] // Owned by the later injected lifecycle worker; exercised in tests.
+pub(crate) struct GraphLifecycleWatcher {
+    state: Arc<GraphLifecycleAckState>,
+    receiver: crossbeam_channel::Receiver<()>,
+}
+
+#[allow(dead_code)]
+impl GraphLifecycleWatcher {
+    pub(crate) fn snapshot(&self, expected_sequence: NonZeroU64) -> GraphLifecycleSnapshot {
+        let expected_sequence = expected_sequence.get();
+        let applied_sequence = self.state.applied_sequence.load(Ordering::Acquire);
+        if applied_sequence < expected_sequence {
+            return GraphLifecycleSnapshot::Pending;
+        }
+        if applied_sequence > expected_sequence {
+            return GraphLifecycleSnapshot::SequenceAdvanced { applied_sequence };
+        }
+
+        let Some(transition) =
+            GraphLifecycleTransition::from_u8(self.state.transition.load(Ordering::Relaxed))
+        else {
+            return GraphLifecycleSnapshot::SequenceAdvanced { applied_sequence };
+        };
+        let Some(outcome) =
+            GraphLifecycleOutcome::from_u8(self.state.outcome.load(Ordering::Relaxed))
+        else {
+            return GraphLifecycleSnapshot::SequenceAdvanced { applied_sequence };
+        };
+        GraphLifecycleSnapshot::Applied {
+            barrier: GraphLifecycleBarrier {
+                controller_sequence: applied_sequence,
+                required_batch_sequence: self.state.required_batch_sequence.load(Ordering::Relaxed),
+                transition,
+            },
+            observed_batch_sequence: self.state.observed_batch_sequence.load(Ordering::Relaxed),
+            outcome,
+        }
+    }
+
+    /// Best-effort wake receiver; callers must always re-read the authoritative snapshot.
+    pub(crate) const fn receiver(&self) -> &crossbeam_channel::Receiver<()> {
+        &self.receiver
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnect_wake_for_test(self) -> Self {
+        let Self { state, receiver } = self;
+        drop(receiver);
+        Self {
+            state,
+            receiver: crossbeam_channel::never(),
+        }
+    }
+}
+
+#[allow(dead_code)] // Created by the later injected lifecycle setup; exercised in tests.
+pub(crate) fn graph_lifecycle_ack_pair() -> (GraphLifecyclePublisher, GraphLifecycleWatcher) {
+    let state = Arc::new(GraphLifecycleAckState::default());
+    let (wake, receiver) = crossbeam_channel::bounded(1);
+    (
+        GraphLifecyclePublisher {
+            state: Arc::clone(&state),
+            wake,
+        },
+        GraphLifecycleWatcher { state, receiver },
+    )
 }
 
 #[allow(dead_code)] // Constructed by the later additive bounded-control API; exercised in tests.
@@ -310,6 +536,10 @@ pub(crate) enum ControlMessage {
     /// Private, bounded multi-command envelope. The render thread never drops its storage.
     #[allow(dead_code)]
     Batch(ControlBatchNode),
+
+    /// Private injected-only lifecycle fence. It is deliberately never batchable.
+    #[allow(dead_code)]
+    GraphLifecycleBarrier(GraphLifecycleBarrier),
 
     /// Register a new node in the audio graph
     RegisterNode {
