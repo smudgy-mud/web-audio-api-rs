@@ -514,9 +514,17 @@ impl AudioOutputEventWatcher {
         self.receiver.try_recv().ok()
     }
 
-    #[allow(dead_code)]
+    /// Authoritative first endpoint-death reason, independent of lossy diagnostic wakes.
     pub(crate) fn death_reason(&self) -> Option<AudioOutputDeathReason> {
         AudioOutputDeathReason::from_u8(self.state.death_reason.load(Ordering::Acquire))
+    }
+
+    /// Diagnostic receiver used only by the private lifecycle worker to wake on endpoint death.
+    ///
+    /// Consumers must always re-read [`Self::death_reason`]; channel records are best effort and
+    /// are not themselves terminal authority.
+    pub(crate) fn receiver(&self) -> &Receiver<AudioOutputEvent> {
+        &self.receiver
     }
 }
 
@@ -761,6 +769,46 @@ fn audio_render_pair(
     (AudioRenderOwner { slot: Some(slot) }, callback)
 }
 
+#[cfg(test)]
+pub(crate) fn audio_render_test_pair<R, C>(
+    format: AudioRenderFormat,
+    events: AudioOutputEventSink,
+    render: R,
+    reclaim: C,
+) -> (AudioRenderOwner, AudioRenderCallback)
+where
+    R: FnMut(&mut [f32]) + Send + 'static,
+    C: FnOnce() -> Result<(), AudioOutputError> + Send + 'static,
+{
+    struct TestDriver<R, C> {
+        render: R,
+        reclaim: Option<C>,
+    }
+
+    impl<R, C> AudioRenderDriver for TestDriver<R, C>
+    where
+        R: FnMut(&mut [f32]) + Send + 'static,
+        C: FnOnce() -> Result<(), AudioOutputError> + Send + 'static,
+    {
+        fn render_interleaved_f32(&mut self, output: &mut [f32]) {
+            (self.render)(output);
+        }
+
+        fn reclaim_off_thread(mut self: Box<Self>) -> Result<(), AudioOutputError> {
+            self.reclaim.take().expect("test reclaimer is single-use")()
+        }
+    }
+
+    audio_render_pair(
+        format,
+        Box::new(TestDriver {
+            render,
+            reclaim: Some(reclaim),
+        }),
+        events,
+    )
+}
+
 #[allow(dead_code)] // invoked by the pending context lifecycle integration
 pub(crate) fn audio_render_thread_pair(
     format: AudioRenderFormat,
@@ -949,6 +997,7 @@ pub trait RunningAudioOutput: Send + 'static {
     /// Before returning, this method must prevent the endpoint from accepting or initiating new
     /// render work. The returned future only awaits already-committed endpoint retirement.
     /// Completion is not proof that the graph, reclaim queues, or context threads have retired.
+    /// This method must report failures through its returned future rather than panic.
     fn shutdown(self: Box<Self>) -> AudioOutputEndpointShutdown;
 }
 
@@ -1005,6 +1054,11 @@ impl Error for AudioOutputStartFailure {
 /// intentionally not cloneable and does not certify context shutdown. A later crate-owned
 /// lifecycle controller will retain and poll it, then create an authoritative context receipt
 /// only after render-state reclamation and context-thread joins are also confirmed.
+///
+/// Each poll must be nonblocking. `Ok(())` additionally confirms retirement of endpoint-owned
+/// logical threads and handles; resources shared by a factory-wide physical mixer are excluded.
+/// On `Err`, the future must continue owning any admission or host leases whose destruction would
+/// make an unconfirmed shutdown unsafe, because the lifecycle controller quarantines that future.
 #[must_use = "endpoint-local shutdown does not run to completion unless this future is polled"]
 pub struct AudioOutputEndpointShutdown {
     future: Pin<Box<dyn Future<Output = Result<(), AudioOutputError>> + Send + 'static>>,

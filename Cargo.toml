@@ -36,6 +36,7 @@ futures-channel = { version = "0.3.30", features = ["sink"] }
 futures-core = { version = "0.3.30", default-features = false }
 futures-util = { version = "0.3.30", default-features = false, features = [
     "sink",
+    "std",
 ] }
 hound = "3.5"
 hrtf = "0.9"
