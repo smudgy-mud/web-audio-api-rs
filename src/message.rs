@@ -287,6 +287,112 @@ struct ControlBatchStorageInFlight {
     count: AtomicUsize,
 }
 
+/// Clone-shared, atomically accounted logical command budget for injected control batches.
+#[derive(Clone, Debug)]
+pub(crate) struct InjectedCommandCreditPool {
+    in_flight: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+impl InjectedCommandCreditPool {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    pub(crate) fn try_acquire(&self, count: usize) -> Option<InjectedCommandCredit> {
+        self.in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(count)
+                    .filter(|next| *next <= self.limit)
+            })
+            .ok()
+            .map(|_| InjectedCommandCredit {
+                in_flight: Arc::clone(&self.in_flight),
+                count,
+            })
+    }
+
+    #[allow(dead_code)] // Observable by the private injected transport tests.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+}
+
+/// Logical command ownership. For an enqueued batch this remains inside batch storage until the
+/// storage is reclaimed off RT; it is deliberately unrelated to physical channel capacity.
+#[derive(Debug)]
+pub(crate) struct InjectedCommandCredit {
+    in_flight: Arc<AtomicUsize>,
+    count: usize,
+}
+
+impl Drop for InjectedCommandCredit {
+    fn drop(&mut self) {
+        let previous = self.in_flight.fetch_sub(self.count, Ordering::AcqRel);
+        debug_assert!(previous >= self.count);
+    }
+}
+
+/// Atomic credit pool for injected physical channel records.
+///
+/// The render thread retains a pool owner while callbacks can dequeue tokens. Therefore token
+/// Drop performs only atomic operations and cannot destroy the final allocation on RT.
+#[derive(Clone, Debug)]
+pub(crate) struct InjectedPhysicalCreditPool {
+    in_flight: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+impl InjectedPhysicalCreditPool {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    pub(crate) fn try_acquire(&self) -> Option<InjectedPhysicalCredit> {
+        self.in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.limit).then_some(current + 1)
+            })
+            .ok()
+            .map(|_| InjectedPhysicalCredit {
+                in_flight: Arc::clone(&self.in_flight),
+            })
+    }
+
+    #[allow(dead_code)] // Observable by the private injected transport tests.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct InjectedPhysicalCredit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for InjectedPhysicalCredit {
+    fn drop(&mut self) {
+        let previous = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
+/// Render-side owners that make physical-token Drop allocation-free even after every control-side
+/// sender clone has been sealed and destroyed.
+pub(crate) struct InjectedPhysicalCreditOwners {
+    #[allow(dead_code)] // Lifetime owner; deliberately retained rather than read.
+    pub(crate) ordinary: InjectedPhysicalCreditPool,
+    #[allow(dead_code)] // Lifetime owner; deliberately retained rather than read.
+    pub(crate) lifecycle: InjectedPhysicalCreditPool,
+}
+
 impl ControlBatchStorageInFlight {
     #[allow(dead_code)]
     fn try_acquire(self: &Arc<Self>) -> Option<ControlBatchPermit> {
@@ -304,7 +410,7 @@ impl ControlBatchStorageInFlight {
 }
 
 #[derive(Debug)]
-struct ControlBatchPermit(Arc<ControlBatchStorageInFlight>);
+pub(crate) struct ControlBatchPermit(Arc<ControlBatchStorageInFlight>);
 
 impl Drop for ControlBatchPermit {
     fn drop(&mut self) {
@@ -322,7 +428,8 @@ pub(crate) struct ControlBatchStorage {
     /// budget.
     next: usize,
     commands: Box<[Option<ControlMessage>]>,
-    _permit: ControlBatchPermit,
+    _permit: Option<ControlBatchPermit>,
+    _injected_command_credit: Option<InjectedCommandCredit>,
     #[cfg(test)]
     reclaim_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -333,13 +440,15 @@ impl ControlBatchStorage {
         sequence: u64,
         commands: Vec<ControlMessage>,
         permit: ControlBatchPermit,
+        injected_command_credit: Option<InjectedCommandCredit>,
         #[cfg(test)] reclaim_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         Self {
             sequence,
             next: 0,
             commands: commands.into_iter().map(Some).collect(),
-            _permit: permit,
+            _permit: Some(permit),
+            _injected_command_credit: injected_command_credit,
             #[cfg(test)]
             reclaim_probe,
         }
@@ -347,6 +456,25 @@ impl ControlBatchStorage {
 
     pub(crate) fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// Assigns the authoritative sequence immediately before a staged injected envelope is sent.
+    /// The storage must still be untouched and unsequenced.
+    pub(crate) fn assign_sequence_before_enqueue(&mut self, sequence: u64) -> bool {
+        if sequence == 0 || self.sequence != 0 || self.next != 0 {
+            return false;
+        }
+        self.sequence = sequence;
+        true
+    }
+
+    /// Clears a sequence after a nonblocking channel send returns the untouched envelope.
+    pub(crate) fn clear_unsubmitted_sequence(&mut self, sequence: u64) -> bool {
+        if self.sequence != sequence || self.next != 0 {
+            return false;
+        }
+        self.sequence = 0;
+        true
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -371,11 +499,84 @@ impl ControlBatchStorage {
     }
 }
 
+/// Clone-shared envelope-storage budget. This is distinct from logical command and physical
+/// channel credits and remains held through the off-RT GC backlog.
+#[derive(Clone, Debug)]
+pub(crate) struct ControlBatchStoragePool {
+    inner: Arc<ControlBatchStorageInFlight>,
+}
+
+impl ControlBatchStoragePool {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(ControlBatchStorageInFlight::default()),
+        }
+    }
+
+    pub(crate) fn try_acquire(&self) -> Option<ControlBatchPermit> {
+        self.inner.try_acquire()
+    }
+
+    pub(crate) fn in_flight(&self) -> usize {
+        self.inner.load()
+    }
+}
+
+pub(crate) fn injected_control_batch_node(
+    commands: Box<[ControlMessage]>,
+    storage: ControlBatchPermit,
+    command_credit: InjectedCommandCredit,
+) -> ControlBatchNode {
+    let storage = ControlBatchStorage::new(
+        0,
+        commands.into_vec(),
+        storage,
+        Some(command_credit),
+        #[cfg(test)]
+        None,
+    );
+    llq::Node::new(Box::new(storage) as Box<dyn Any + Send>)
+}
+
+/// Recovers an injected envelope that was never accepted by the physical channel.
+///
+/// This runs only on the control thread. It may allocate while rebuilding exact-capacity prepared
+/// storage; both logical and batch-storage credits are returned to their original owners.
+pub(crate) fn recover_unsubmitted_injected_batch(
+    node: ControlBatchNode,
+) -> (
+    Box<[ControlMessage]>,
+    ControlBatchPermit,
+    InjectedCommandCredit,
+) {
+    let value = llq::Node::into_inner(node);
+    let mut storage = value
+        .downcast::<ControlBatchStorage>()
+        .expect("injected batch node contains private storage");
+    assert_eq!(storage.next, 0, "submitted batch was never consumed");
+    let commands = storage
+        .commands
+        .iter_mut()
+        .map(|command| command.take().expect("unsubmitted command remains present"))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let command_credit = storage
+        ._injected_command_credit
+        .take()
+        .expect("injected batch retains its command credit");
+    let permit = storage
+        ._permit
+        .take()
+        .expect("injected batch retains its storage credit");
+    drop(storage);
+    (commands, permit, command_credit)
+}
+
 impl ControlMessage {
     /// Whether this command belongs to the user/graph mutation subset that a future bounded
     /// control API may batch. Lifecycle, diagnostics, and maintenance commands remain legacy-only
     /// so an internal misuse cannot terminate a batch midway and permanently gap its sequence.
-    fn is_batchable(&self) -> bool {
+    pub(crate) fn is_batchable(&self) -> bool {
         match self {
             Self::RegisterNode { .. }
             | Self::ConnectNode { .. }
@@ -386,7 +587,7 @@ impl ControlMessage {
             | Self::SetChannelCountMode { .. }
             | Self::SetChannelInterpretation { .. } => true,
             #[cfg(test)]
-            Self::TestMarker { .. } | Self::TestNop => true,
+            Self::TestMarker { .. } | Self::TestGarbage { .. } | Self::TestNop => true,
             _ => false,
         }
     }
@@ -427,7 +628,7 @@ struct ControlBatchSubmission {
 pub(crate) struct ControlBatchSender {
     #[allow(dead_code)]
     submission: Arc<Mutex<ControlBatchSubmission>>,
-    batch_storage_in_flight: Arc<ControlBatchStorageInFlight>,
+    batch_storage: ControlBatchStoragePool,
 }
 
 impl std::fmt::Debug for ControlBatchSender {
@@ -445,7 +646,7 @@ impl ControlBatchSender {
                 sender,
                 next_sequence: 1,
             })),
-            batch_storage_in_flight: Arc::new(ControlBatchStorageInFlight::default()),
+            batch_storage: ControlBatchStoragePool::new(),
         }
     }
 
@@ -458,7 +659,7 @@ impl ControlBatchSender {
     }
 
     pub(crate) fn batch_storage_in_flight(&self) -> usize {
-        self.batch_storage_in_flight.load()
+        self.batch_storage.in_flight()
     }
 
     #[allow(dead_code)]
@@ -494,7 +695,7 @@ impl ControlBatchSender {
             }
         };
         let permit = self
-            .batch_storage_in_flight
+            .batch_storage
             .try_acquire()
             .ok_or(ControlBatchSendError::BatchStorageLimit)?;
         let sequence = forced_sequence.unwrap_or(submission.next_sequence);
@@ -506,6 +707,7 @@ impl ControlBatchSender {
             sequence,
             commands,
             permit,
+            None,
             #[cfg(test)]
             reclaim_probe,
         );
@@ -554,9 +756,24 @@ pub(crate) enum ControlMessage {
     #[allow(dead_code)]
     Batch(ControlBatchNode),
 
+    /// Injected ordinary envelope. The physical token is released immediately when the renderer
+    /// dequeues this record; logical-command and storage credits remain inside `batch` through GC.
+    #[allow(dead_code)]
+    InjectedBatch {
+        batch: ControlBatchNode,
+        physical: InjectedPhysicalCredit,
+    },
+
     /// Private injected-only lifecycle fence. It is deliberately never batchable.
     #[allow(dead_code)]
     GraphLifecycleBarrier(GraphLifecycleBarrier),
+
+    /// Injected lifecycle fence using the channel's independently reserved physical slot.
+    #[allow(dead_code)]
+    InjectedGraphLifecycleBarrier {
+        barrier: GraphLifecycleBarrier,
+        physical: InjectedPhysicalCredit,
+    },
 
     /// Register a new node in the audio graph
     RegisterNode {
@@ -636,6 +853,11 @@ pub(crate) enum ControlMessage {
     TestMarker {
         value: u16,
         log: Arc<Mutex<Vec<u16>>>,
+    },
+
+    #[cfg(test)]
+    TestGarbage {
+        payload: llq::Node<Box<dyn Any + Send>>,
     },
 
     #[cfg(test)]

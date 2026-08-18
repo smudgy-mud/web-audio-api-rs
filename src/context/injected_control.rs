@@ -1,0 +1,1746 @@
+//! Private bounded graph-control transport for a future injected online context.
+//!
+//! This module is deliberately not wired to `ConcreteBaseAudioContext` yet. It separates a
+//! cloneable ordinary producer, a unique Close-only lifecycle owner, and a consuming render
+//! initializer. Suspend/Resume barrier wiring is explicitly deferred. No raw sender/receiver
+//! escapes, and this foundation does not claim full control quiescence.
+
+#![allow(dead_code)]
+
+use std::collections::VecDeque;
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
+
+use crossbeam_channel::{Sender, TrySendError};
+
+use super::injected_admission::{
+    AdmissionDrain, AdmissionError, AdmissionSnapshot, CapacityWorkerJoinError,
+    CapacityWorkerRetirement, GraphControlAdmission,
+};
+use super::InjectedContextAdmissionGate;
+use crate::events::EventDispatch;
+use crate::message::{
+    control_batch_storage_mut, graph_lifecycle_ack_pair, injected_control_batch_node,
+    recover_unsubmitted_injected_batch, ControlBatchApplied, ControlBatchNode, ControlBatchPermit,
+    ControlBatchStoragePool, ControlMessage, GraphLifecycleBarrier, GraphLifecycleOutcome,
+    GraphLifecyclePublisher, GraphLifecycleSnapshot, GraphLifecycleTransition,
+    GraphLifecycleWatcher, InjectedCommandCredit, InjectedCommandCreditPool,
+    InjectedPhysicalCredit, InjectedPhysicalCreditOwners, InjectedPhysicalCreditPool,
+    CONTROL_BATCH_CAPACITY,
+};
+use crate::output::{
+    audio_render_thread_pair, AudioOutputEventSink, AudioRenderCallback, AudioRenderFormat,
+    AudioRenderOwner,
+};
+use crate::render::RenderThread;
+use crate::stats::AudioStats;
+
+const LOGICAL_COMMAND_LIMIT: usize = CONTROL_BATCH_CAPACITY;
+const STAGED_ENVELOPE_LIMIT: usize = CONTROL_BATCH_CAPACITY;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedControlError {
+    InvalidOrdinaryCapacity,
+    Empty,
+    TooLarge,
+    UnsupportedCommand,
+    LogicalCommandCredits,
+    BatchStorageCredits,
+    OrdinaryPhysicalCredits,
+    StagingFull,
+    Contended,
+    Poisoned,
+    Sealed,
+    Disconnected,
+    SequenceExhausted,
+    ProtocolViolation,
+    GatePoisoned,
+}
+
+impl From<AdmissionError> for InjectedControlError {
+    fn from(error: AdmissionError) -> Self {
+        match error {
+            AdmissionError::Contended => Self::Contended,
+            AdmissionError::Poisoned => Self::GatePoisoned,
+            AdmissionError::Sealed => Self::Sealed,
+            AdmissionError::Exhausted | AdmissionError::CapacityWorkerActive => {
+                Self::ProtocolViolation
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransportPhase {
+    Open,
+    SealStarted,
+    Sealed,
+    Failed,
+}
+
+#[derive(Clone)]
+struct StagingSlotPool(Arc<AtomicUsize>);
+
+impl StagingSlotPool {
+    fn new() -> Self {
+        Self(Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn try_acquire(&self) -> Option<StagingSlot> {
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < STAGED_ENVELOPE_LIMIT).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| StagingSlot(Arc::clone(&self.0)))
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+struct StagingSlot(Arc<AtomicUsize>);
+
+impl Drop for StagingSlot {
+    fn drop(&mut self) {
+        let previous = self.0.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
+struct StagedControlBatch {
+    batch: ControlBatchNode,
+    _slot: StagingSlot,
+    _sequence: BatchSequenceReservation,
+}
+
+struct BatchSequenceReservation(Arc<AtomicUsize>);
+
+impl Drop for BatchSequenceReservation {
+    fn drop(&mut self) {
+        let previous = self.0.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+}
+
+enum ReservedPlacement {
+    Running(InjectedPhysicalCredit),
+    Staged(StagingSlot),
+}
+
+struct InjectedControlState {
+    sender: Sender<ControlMessage>,
+    phase: TransportPhase,
+    disconnected: bool,
+    initially_suspended: bool,
+    next_batch_sequence: u64,
+    staged: VecDeque<StagedControlBatch>,
+}
+
+struct InjectedControlInner {
+    gate: InjectedContextAdmissionGate,
+    state: Mutex<InjectedControlState>,
+    logical_commands: InjectedCommandCreditPool,
+    batch_storage: ControlBatchStoragePool,
+    ordinary_physical: InjectedPhysicalCreditPool,
+    lifecycle_physical: InjectedPhysicalCreditPool,
+    staging_slots: StagingSlotPool,
+    batch_sequence_reservations: Arc<AtomicUsize>,
+    close_in_flight: Arc<AtomicBool>,
+    last_submitted_batch_sequence: AtomicU64,
+    applied: ControlBatchApplied,
+}
+
+/// Cloneable ordinary graph producer. Private fields prevent raw sender or lifecycle extraction.
+#[derive(Clone)]
+pub(crate) struct InjectedControlProducer {
+    inner: Arc<InjectedControlInner>,
+}
+
+/// Unique, non-clone lifecycle and seal authority.
+pub(crate) struct InjectedControlLifecycleOwner {
+    inner: Arc<InjectedControlInner>,
+    watcher: GraphLifecycleWatcher,
+}
+
+/// Consuming initializer which binds receiver, physical lifetime owners, and lifecycle publisher.
+pub(crate) struct InjectedControlRenderInit {
+    receiver: crossbeam_channel::Receiver<ControlMessage>,
+    physical_owners: InjectedPhysicalCreditOwners,
+    lifecycle_publisher: GraphLifecyclePublisher,
+    applied: ControlBatchApplied,
+}
+
+/// Opaque renderer with receiver and owners already bound. The future injected constructor passes
+/// this renderer to `audio_render_thread_pair`, which remains the sole GC-spawn/join owner.
+#[must_use]
+pub(crate) struct BoundInjectedRenderer {
+    renderer: RenderThread,
+}
+
+impl BoundInjectedRenderer {
+    /// The only production extraction installs the mandatory joinable GC inside the sound
+    /// callback/owner pair. No crate caller can obtain an executable injected renderer without it.
+    pub(crate) fn into_audio_render_thread_pair(
+        self,
+        format: AudioRenderFormat,
+        events: AudioOutputEventSink,
+    ) -> (AudioRenderOwner, AudioRenderCallback) {
+        audio_render_thread_pair(format, self.renderer, events)
+    }
+
+    #[cfg(test)]
+    fn into_render_thread_for_test(self) -> RenderThread {
+        self.renderer
+    }
+}
+
+impl InjectedControlRenderInit {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_render_thread(
+        self,
+        sample_rate: f32,
+        number_of_channels: usize,
+        state: Arc<std::sync::atomic::AtomicU8>,
+        frames_played: Arc<AtomicU64>,
+        stats: AudioStats,
+        event_sender: Sender<EventDispatch>,
+    ) -> BoundInjectedRenderer {
+        let mut renderer = RenderThread::new(
+            sample_rate,
+            number_of_channels,
+            self.receiver,
+            state,
+            frames_played,
+            stats,
+            event_sender,
+            self.applied,
+        );
+        if renderer
+            .set_injected_physical_credit_owners(self.physical_owners)
+            .is_err()
+        {
+            unreachable!("new renderer has no injected physical owners");
+        }
+        if renderer
+            .set_graph_lifecycle_publisher(self.lifecycle_publisher)
+            .is_err()
+        {
+            unreachable!("new renderer has no lifecycle publisher");
+        }
+        BoundInjectedRenderer { renderer }
+    }
+}
+
+/// Constructs an exact `N + 1` channel: N ordinary envelopes plus one Close-only reservation.
+pub(crate) fn injected_control_channel(
+    gate: InjectedContextAdmissionGate,
+    ordinary_capacity: usize,
+    initially_suspended: bool,
+) -> Result<
+    (
+        InjectedControlProducer,
+        InjectedControlLifecycleOwner,
+        InjectedControlRenderInit,
+    ),
+    InjectedControlError,
+> {
+    if ordinary_capacity == 0 {
+        return Err(InjectedControlError::InvalidOrdinaryCapacity);
+    }
+    let channel_capacity = ordinary_capacity
+        .checked_add(1)
+        .ok_or(InjectedControlError::InvalidOrdinaryCapacity)?;
+    let (sender, receiver) = crossbeam_channel::bounded(channel_capacity);
+    let ordinary_physical = InjectedPhysicalCreditPool::new(ordinary_capacity);
+    let lifecycle_physical = InjectedPhysicalCreditPool::new(1);
+    let physical_owners = InjectedPhysicalCreditOwners {
+        ordinary: ordinary_physical.clone(),
+        lifecycle: lifecycle_physical.clone(),
+    };
+    let (lifecycle_publisher, watcher) = graph_lifecycle_ack_pair();
+    let applied = ControlBatchApplied::default();
+    let inner = Arc::new(InjectedControlInner {
+        gate,
+        state: Mutex::new(InjectedControlState {
+            sender,
+            phase: TransportPhase::Open,
+            disconnected: false,
+            initially_suspended,
+            next_batch_sequence: 1,
+            staged: VecDeque::with_capacity(STAGED_ENVELOPE_LIMIT),
+        }),
+        logical_commands: InjectedCommandCreditPool::new(LOGICAL_COMMAND_LIMIT),
+        batch_storage: ControlBatchStoragePool::new(),
+        ordinary_physical,
+        lifecycle_physical,
+        staging_slots: StagingSlotPool::new(),
+        batch_sequence_reservations: Arc::new(AtomicUsize::new(0)),
+        close_in_flight: Arc::new(AtomicBool::new(false)),
+        last_submitted_batch_sequence: AtomicU64::new(0),
+        applied: applied.clone(),
+    });
+    Ok((
+        InjectedControlProducer {
+            inner: Arc::clone(&inner),
+        },
+        InjectedControlLifecycleOwner {
+            inner: Arc::clone(&inner),
+            watcher,
+        },
+        InjectedControlRenderInit {
+            receiver,
+            physical_owners,
+            lifecycle_publisher,
+            applied,
+        },
+    ))
+}
+
+fn try_state(
+    inner: &InjectedControlInner,
+) -> Result<std::sync::MutexGuard<'_, InjectedControlState>, InjectedControlError> {
+    match inner.state.try_lock() {
+        Ok(state) => Ok(state),
+        Err(TryLockError::WouldBlock) => Err(InjectedControlError::Contended),
+        Err(TryLockError::Poisoned(_)) => Err(InjectedControlError::Poisoned),
+    }
+}
+
+/// Every capacity needed by one graph mutation, acquired before its payload factory or mirror
+/// mutation runs. The admission remains live through commit or rejected-payload destruction.
+#[must_use]
+pub(crate) struct ControlBatchReservation {
+    inner: Arc<InjectedControlInner>,
+    command_count: usize,
+    storage: ControlBatchPermit,
+    command_credit: InjectedCommandCredit,
+    sequence_reservation: BatchSequenceReservation,
+    placement: ReservedPlacement,
+    admission: GraphControlAdmission,
+}
+
+impl ControlBatchReservation {
+    pub(crate) fn prepare_with<F>(
+        self,
+        factory: F,
+    ) -> Result<PreparedControlBatch, PrepareControlFailure>
+    where
+        F: FnOnce() -> Vec<ControlMessage>,
+    {
+        let commands = factory();
+        let error = if commands.len() != self.command_count {
+            Some(if commands.is_empty() {
+                InjectedControlError::Empty
+            } else {
+                InjectedControlError::TooLarge
+            })
+        } else if commands.iter().any(|command| !command.is_batchable()) {
+            Some(InjectedControlError::UnsupportedCommand)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(PrepareControlFailure {
+                commands,
+                reservation: self,
+                error,
+            });
+        }
+        let Self {
+            inner,
+            storage,
+            command_credit,
+            sequence_reservation,
+            placement,
+            admission,
+            ..
+        } = self;
+        Ok(PreparedControlBatch {
+            commands: commands.into_boxed_slice(),
+            inner,
+            storage,
+            command_credit,
+            sequence_reservation,
+            placement,
+            admission,
+        })
+    }
+}
+
+/// Commands precede the reservation so their destructor runs while admission remains live.
+pub(crate) struct PrepareControlFailure {
+    commands: Vec<ControlMessage>,
+    reservation: ControlBatchReservation,
+    pub(crate) error: InjectedControlError,
+}
+
+impl PrepareControlFailure {
+    pub(crate) fn commands_len(&self) -> usize {
+        self.commands.len()
+    }
+}
+
+/// Exact-capacity payload with its original operation admission and all credits still attached.
+#[must_use]
+pub(crate) struct PreparedControlBatch {
+    commands: Box<[ControlMessage]>,
+    inner: Arc<InjectedControlInner>,
+    storage: ControlBatchPermit,
+    command_credit: InjectedCommandCredit,
+    sequence_reservation: BatchSequenceReservation,
+    placement: ReservedPlacement,
+    admission: GraphControlAdmission,
+}
+
+impl PreparedControlBatch {
+    pub(crate) fn len(&self) -> usize {
+        self.commands.len()
+    }
+}
+
+impl std::fmt::Debug for PreparedControlBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedControlBatch")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct CommitControlFailure {
+    pub(crate) error: InjectedControlError,
+    pub(crate) batch: PreparedControlBatch,
+}
+
+impl std::fmt::Debug for CommitControlFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitControlFailure")
+            .field("error", &self.error)
+            .field("batch_len", &self.batch.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommitControlOutcome {
+    Enqueued { sequence: u64 },
+    Staged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FlushControlOutcome {
+    pub(crate) enqueued: usize,
+    pub(crate) remaining_staged: usize,
+}
+
+impl InjectedControlProducer {
+    /// Reserves logical, storage, and state-specific placement capacity before caller mutation.
+    /// Physical FIFO and sequence order are commit order. A future mirror transaction must
+    /// serialize its mirror mutation plus commit if concurrent callers require mutation order.
+    pub(crate) fn try_begin_operation(
+        &self,
+        command_count: usize,
+    ) -> Result<ControlBatchReservation, InjectedControlError> {
+        if command_count == 0 {
+            return Err(InjectedControlError::Empty);
+        }
+        if command_count > CONTROL_BATCH_CAPACITY {
+            return Err(InjectedControlError::TooLarge);
+        }
+        let admission = self.inner.gate.try_graph_control()?;
+        let state = try_state(&self.inner)?;
+        if state.disconnected {
+            return Err(InjectedControlError::Disconnected);
+        }
+        if state.phase != TransportPhase::Open {
+            return Err(InjectedControlError::Sealed);
+        }
+        let command_credit = self
+            .inner
+            .logical_commands
+            .try_acquire(command_count)
+            .ok_or(InjectedControlError::LogicalCommandCredits)?;
+        let storage = self
+            .inner
+            .batch_storage
+            .try_acquire()
+            .ok_or(InjectedControlError::BatchStorageCredits)?;
+        let outstanding = self
+            .inner
+            .batch_sequence_reservations
+            .load(Ordering::Acquire);
+        let Some(reserved_sequence) = state.next_batch_sequence.checked_add(outstanding as u64)
+        else {
+            return Err(InjectedControlError::SequenceExhausted);
+        };
+        if reserved_sequence == u64::MAX {
+            return Err(InjectedControlError::SequenceExhausted);
+        }
+        self.inner
+            .batch_sequence_reservations
+            .fetch_add(1, Ordering::AcqRel);
+        let sequence_reservation =
+            BatchSequenceReservation(Arc::clone(&self.inner.batch_sequence_reservations));
+        let placement = if state.initially_suspended || !state.staged.is_empty() {
+            ReservedPlacement::Staged(
+                self.inner
+                    .staging_slots
+                    .try_acquire()
+                    .ok_or(InjectedControlError::StagingFull)?,
+            )
+        } else {
+            let physical = self
+                .inner
+                .ordinary_physical
+                .try_acquire()
+                .ok_or(InjectedControlError::OrdinaryPhysicalCredits)?;
+            ReservedPlacement::Running(physical)
+        };
+        drop(state);
+        Ok(ControlBatchReservation {
+            inner: Arc::clone(&self.inner),
+            command_count,
+            storage,
+            command_credit,
+            sequence_reservation,
+            placement,
+            admission,
+        })
+    }
+
+    pub(crate) fn try_commit(
+        &self,
+        batch: PreparedControlBatch,
+    ) -> Result<CommitControlOutcome, CommitControlFailure> {
+        if !Arc::ptr_eq(&self.inner, &batch.inner) {
+            return Err(CommitControlFailure {
+                error: InjectedControlError::ProtocolViolation,
+                batch,
+            });
+        }
+        let PreparedControlBatch {
+            commands,
+            inner,
+            storage,
+            command_credit,
+            sequence_reservation,
+            placement,
+            admission,
+        } = batch;
+        let mut state = match try_state(&inner) {
+            Ok(state) => state,
+            Err(error) => {
+                return Err(CommitControlFailure {
+                    error,
+                    batch: PreparedControlBatch {
+                        commands,
+                        inner: Arc::clone(&inner),
+                        storage,
+                        command_credit,
+                        sequence_reservation,
+                        placement,
+                        admission,
+                    },
+                });
+            }
+        };
+        if state.disconnected {
+            drop(state);
+            return Err(CommitControlFailure {
+                error: InjectedControlError::Disconnected,
+                batch: PreparedControlBatch {
+                    commands,
+                    inner,
+                    storage,
+                    command_credit,
+                    sequence_reservation,
+                    placement,
+                    admission,
+                },
+            });
+        }
+        if matches!(state.phase, TransportPhase::Sealed | TransportPhase::Failed) {
+            let error = if state.phase == TransportPhase::Sealed {
+                InjectedControlError::Sealed
+            } else {
+                InjectedControlError::ProtocolViolation
+            };
+            drop(state);
+            return Err(CommitControlFailure {
+                error,
+                batch: PreparedControlBatch {
+                    commands,
+                    inner,
+                    storage,
+                    command_credit,
+                    sequence_reservation,
+                    placement,
+                    admission,
+                },
+            });
+        }
+        let mut node = injected_control_batch_node(commands, storage, command_credit);
+        match placement {
+            ReservedPlacement::Staged(slot) => {
+                state.staged.push_back(StagedControlBatch {
+                    batch: node,
+                    _slot: slot,
+                    _sequence: sequence_reservation,
+                });
+                drop(state);
+                drop(admission);
+                Ok(CommitControlOutcome::Staged)
+            }
+            ReservedPlacement::Running(physical) => {
+                let sequence = state.next_batch_sequence;
+                if sequence == u64::MAX
+                    || !control_batch_storage_mut(&mut node)
+                        .assign_sequence_before_enqueue(sequence)
+                {
+                    state.phase = TransportPhase::Failed;
+                    drop(state);
+                    let (commands, storage, command_credit) =
+                        recover_unsubmitted_injected_batch(node);
+                    return Err(CommitControlFailure {
+                        error: InjectedControlError::ProtocolViolation,
+                        batch: PreparedControlBatch {
+                            commands,
+                            inner,
+                            storage,
+                            command_credit,
+                            sequence_reservation,
+                            placement: ReservedPlacement::Running(physical),
+                            admission,
+                        },
+                    });
+                }
+                match state.sender.try_send(ControlMessage::InjectedBatch {
+                    batch: node,
+                    physical,
+                }) {
+                    Ok(()) => {
+                        state.next_batch_sequence += 1;
+                        inner
+                            .last_submitted_batch_sequence
+                            .store(sequence, Ordering::Release);
+                        drop(state);
+                        drop(sequence_reservation);
+                        drop(admission);
+                        Ok(CommitControlOutcome::Enqueued { sequence })
+                    }
+                    Err(TrySendError::Full(ControlMessage::InjectedBatch {
+                        mut batch,
+                        physical,
+                    })) => {
+                        state.phase = TransportPhase::Failed;
+                        let _ = control_batch_storage_mut(&mut batch)
+                            .clear_unsubmitted_sequence(sequence);
+                        drop(state);
+                        let (commands, storage, command_credit) =
+                            recover_unsubmitted_injected_batch(batch);
+                        Err(CommitControlFailure {
+                            error: InjectedControlError::ProtocolViolation,
+                            batch: PreparedControlBatch {
+                                commands,
+                                inner,
+                                storage,
+                                command_credit,
+                                sequence_reservation,
+                                placement: ReservedPlacement::Running(physical),
+                                admission,
+                            },
+                        })
+                    }
+                    Err(TrySendError::Disconnected(ControlMessage::InjectedBatch {
+                        mut batch,
+                        physical,
+                    })) => {
+                        state.phase = TransportPhase::Failed;
+                        state.disconnected = true;
+                        let _ = control_batch_storage_mut(&mut batch)
+                            .clear_unsubmitted_sequence(sequence);
+                        drop(state);
+                        let (commands, storage, command_credit) =
+                            recover_unsubmitted_injected_batch(batch);
+                        Err(CommitControlFailure {
+                            error: InjectedControlError::Disconnected,
+                            batch: PreparedControlBatch {
+                                commands,
+                                inner,
+                                storage,
+                                command_credit,
+                                sequence_reservation,
+                                placement: ReservedPlacement::Running(physical),
+                                admission,
+                            },
+                        })
+                    }
+                    Err(_) => unreachable!("private sender returns its submitted variant"),
+                }
+            }
+        }
+    }
+
+    /// Flushes as many staged records as currently available ordinary credits permit.
+    pub(crate) fn try_flush(&self) -> Result<FlushControlOutcome, InjectedControlError> {
+        let _admission = self.inner.gate.try_graph_control()?;
+        let mut state = try_state(&self.inner)?;
+        if state.disconnected {
+            return Err(InjectedControlError::Disconnected);
+        }
+        if state.phase != TransportPhase::Open {
+            return Err(InjectedControlError::Sealed);
+        }
+        let mut enqueued = 0;
+        while !state.staged.is_empty() {
+            if state.next_batch_sequence == u64::MAX {
+                return Err(InjectedControlError::SequenceExhausted);
+            }
+            let Some(physical) = self.inner.ordinary_physical.try_acquire() else {
+                break;
+            };
+            let sequence = state.next_batch_sequence;
+            let mut staged = state.staged.pop_front().expect("staged front exists");
+            if !control_batch_storage_mut(&mut staged.batch)
+                .assign_sequence_before_enqueue(sequence)
+            {
+                state.phase = TransportPhase::Failed;
+                state.staged.push_front(staged);
+                return Err(InjectedControlError::ProtocolViolation);
+            }
+            match state.sender.try_send(ControlMessage::InjectedBatch {
+                batch: staged.batch,
+                physical,
+            }) {
+                Ok(()) => {
+                    drop(staged._slot);
+                    drop(staged._sequence);
+                    state.next_batch_sequence += 1;
+                    self.inner
+                        .last_submitted_batch_sequence
+                        .store(sequence, Ordering::Release);
+                    enqueued += 1;
+                }
+                Err(TrySendError::Full(ControlMessage::InjectedBatch { mut batch, .. })) => {
+                    state.phase = TransportPhase::Failed;
+                    let _ =
+                        control_batch_storage_mut(&mut batch).clear_unsubmitted_sequence(sequence);
+                    staged.batch = batch;
+                    state.staged.push_front(staged);
+                    return Err(InjectedControlError::ProtocolViolation);
+                }
+                Err(TrySendError::Disconnected(ControlMessage::InjectedBatch {
+                    mut batch,
+                    ..
+                })) => {
+                    state.phase = TransportPhase::Failed;
+                    state.disconnected = true;
+                    let _ =
+                        control_batch_storage_mut(&mut batch).clear_unsubmitted_sequence(sequence);
+                    staged.batch = batch;
+                    state.staged.push_front(staged);
+                    return Err(InjectedControlError::Disconnected);
+                }
+                Err(_) => unreachable!("private sender returns its submitted variant"),
+            }
+        }
+        Ok(FlushControlOutcome {
+            enqueued,
+            remaining_staged: state.staged.len(),
+        })
+    }
+
+    pub(crate) fn last_submitted_batch_sequence(&self) -> u64 {
+        self.inner
+            .last_submitted_batch_sequence
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn applied_batch_sequence(&self) -> u64 {
+        self.inner.applied.load()
+    }
+
+    #[cfg(test)]
+    fn accounting(&self) -> (usize, usize, usize, usize) {
+        (
+            self.inner.logical_commands.in_flight(),
+            self.inner.batch_storage.in_flight(),
+            self.inner.ordinary_physical.in_flight(),
+            self.inner.staging_slots.in_flight(),
+        )
+    }
+
+    #[cfg(test)]
+    fn poison_transport(&self) {
+        let _state = self.inner.state.lock().unwrap();
+        panic!("poison injected transport");
+    }
+
+    #[cfg(test)]
+    fn set_next_batch_sequence(&self, sequence: u64) {
+        self.inner.state.lock().unwrap().next_batch_sequence = sequence;
+    }
+
+    #[cfg(test)]
+    fn fail_transport(&self) {
+        self.inner.state.lock().unwrap().phase = TransportPhase::Failed;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ControlCloseDegradation {
+    pub(crate) transport_poison_recovered: bool,
+    pub(crate) capacity_worker_panicked: bool,
+    pub(crate) prior_transport_failure: bool,
+}
+
+pub(crate) struct BeginControlCloseFailure {
+    pub(crate) error: InjectedControlError,
+    pub(crate) owner: InjectedControlLifecycleOwner,
+}
+
+/// Admissions are irreversibly sealed. Retirement owns any registered capacity worker and the
+/// authoritative drain which includes every pre-seal prepared graph operation.
+pub(crate) struct ControlCloseRetirement {
+    inner: Arc<InjectedControlInner>,
+    watcher: GraphLifecycleWatcher,
+    capacity_worker: Option<CapacityWorkerRetirement>,
+    drain: AdmissionDrain,
+    degradation: ControlCloseDegradation,
+}
+
+impl InjectedControlLifecycleOwner {
+    /// Seals the shared gate first, then recovers a poisoned local transport mutex if necessary.
+    /// Gate poison cannot establish the irreversible boundary and therefore returns a quarantine
+    /// failure retaining the unique owner.
+    pub(crate) fn try_begin_close(
+        self,
+    ) -> Result<ControlCloseRetirement, BeginControlCloseFailure> {
+        let admissions = match self.inner.gate.try_seal() {
+            Ok(admissions) => admissions,
+            Err(error) => {
+                return Err(BeginControlCloseFailure {
+                    error: error.into(),
+                    owner: self,
+                });
+            }
+        };
+        let mut degradation = ControlCloseDegradation::default();
+        let mut state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                degradation.transport_poison_recovered = true;
+                poisoned.into_inner()
+            }
+        };
+        degradation.prior_transport_failure = state.phase == TransportPhase::Failed;
+        state.phase = TransportPhase::SealStarted;
+        let (capacity_worker, drain) = admissions.into_parts();
+        drop(state);
+        Ok(ControlCloseRetirement {
+            inner: self.inner,
+            watcher: self.watcher,
+            capacity_worker,
+            drain,
+            degradation,
+        })
+    }
+}
+
+/// Unforgeable post-drain authority. It can only be built after capacity retirement and all graph
+/// preparation admissions reach zero.
+pub(crate) struct DrainedControlClose {
+    inner: Arc<InjectedControlInner>,
+    watcher: GraphLifecycleWatcher,
+    degradation: ControlCloseDegradation,
+}
+
+impl ControlCloseRetirement {
+    /// Runs off RT. A panicking capacity worker is still authoritatively joined; its hostile panic
+    /// payload is forgotten before any later diagnostics and reported as degraded retirement.
+    pub(crate) fn retire_and_wait(mut self) -> (AdmissionSnapshot, DrainedControlClose) {
+        if let Some(worker) = self.capacity_worker.take() {
+            if let Err(CapacityWorkerJoinError::Panicked(payload)) = worker.stop_and_join() {
+                std::mem::forget(payload);
+                self.degradation.capacity_worker_panicked = true;
+            }
+        }
+        let snapshot = self.drain.wait();
+        debug_assert!(snapshot.is_drained());
+        (
+            snapshot,
+            DrainedControlClose {
+                inner: self.inner,
+                watcher: self.watcher,
+                degradation: self.degradation,
+            },
+        )
+    }
+}
+
+/// Staged graph payloads extracted only after the admission drain. Dropping this value runs their
+/// destructors on the caller's non-render thread.
+#[must_use]
+pub(crate) struct ExtractedControlPayloads {
+    staged: VecDeque<StagedControlBatch>,
+    last_submitted_batch_sequence: u64,
+}
+
+impl ExtractedControlPayloads {
+    pub(crate) fn staged_len(&self) -> usize {
+        self.staged.len()
+    }
+
+    pub(crate) fn last_submitted_batch_sequence(&self) -> u64 {
+        self.last_submitted_batch_sequence
+    }
+}
+
+struct CloseLifecycleLease {
+    state: Arc<AtomicBool>,
+}
+
+impl CloseLifecycleLease {
+    fn acquire(state: &Arc<AtomicBool>) -> Option<Self> {
+        state
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self {
+                state: Arc::clone(state),
+            })
+    }
+
+    fn acknowledge(self) {
+        self.state.store(false, Ordering::Release);
+    }
+}
+
+/// Sole Close observation token. It is non-clone and retains the lifecycle lease after physical
+/// dequeue until the exact acknowledgement commit word is acquired.
+#[must_use]
+pub(crate) struct SubmittedControlClose {
+    barrier: GraphLifecycleBarrier,
+    watcher: GraphLifecycleWatcher,
+    lease: CloseLifecycleLease,
+}
+
+impl SubmittedControlClose {
+    pub(crate) fn barrier(&self) -> GraphLifecycleBarrier {
+        self.barrier
+    }
+
+    pub(crate) fn snapshot(&self) -> GraphLifecycleSnapshot {
+        self.watcher
+            .snapshot(NonZeroU64::new(self.barrier.controller_sequence()).unwrap())
+    }
+
+    /// Borrowed, non-cloneable wake hint for lifecycle-worker selection. Wakes are lossy; callers
+    /// must always re-read `snapshot` with Acquire ordering. Disconnect is terminal
+    /// renderer/publisher retirement, never a successful Close acknowledgement.
+    pub(crate) fn wake_receiver(&self) -> &crossbeam_channel::Receiver<()> {
+        self.watcher.receiver()
+    }
+
+    pub(crate) fn try_observe_exact(
+        self,
+    ) -> Result<ObservedControlClose, ObserveControlCloseFailure> {
+        let snapshot = self.snapshot();
+        if matches!(snapshot, GraphLifecycleSnapshot::Pending) {
+            return Err(ObserveControlCloseFailure::Pending(self));
+        }
+        if !matches!(
+            &snapshot,
+            GraphLifecycleSnapshot::Applied {
+                barrier,
+                observed_batch_sequence,
+                outcome: GraphLifecycleOutcome::Applied,
+            } if *barrier == self.barrier
+                && *observed_batch_sequence == barrier.required_batch_sequence()
+        ) {
+            return Err(ObserveControlCloseFailure::Terminal {
+                snapshot,
+                close: self,
+            });
+        }
+        let Self {
+            barrier,
+            watcher: _,
+            lease,
+        } = self;
+        lease.acknowledge();
+        Ok(ObservedControlClose { barrier, snapshot })
+    }
+}
+
+/// Pending retains a usable wake/snapshot token. Terminal means the publisher authoritatively
+/// committed a non-success result or advanced past this Close; both retain/quarantine the lease.
+pub(crate) enum ObserveControlCloseFailure {
+    Pending(SubmittedControlClose),
+    Terminal {
+        snapshot: GraphLifecycleSnapshot,
+        close: SubmittedControlClose,
+    },
+}
+
+impl ObserveControlCloseFailure {
+    pub(crate) fn into_close(self) -> SubmittedControlClose {
+        match self {
+            Self::Pending(close) | Self::Terminal { close, .. } => close,
+        }
+    }
+}
+
+pub(crate) struct ObservedControlClose {
+    pub(crate) barrier: GraphLifecycleBarrier,
+    pub(crate) snapshot: GraphLifecycleSnapshot,
+}
+
+pub(crate) struct SealedControlTransport {
+    pub(crate) payloads: ExtractedControlPayloads,
+    pub(crate) close: SubmittedControlClose,
+    pub(crate) degradation: ControlCloseDegradation,
+}
+
+pub(crate) struct FinishControlCloseFailure {
+    pub(crate) error: InjectedControlError,
+    pub(crate) payloads: ExtractedControlPayloads,
+    pub(crate) degradation: ControlCloseDegradation,
+}
+
+impl DrainedControlClose {
+    /// Recovers local mutex poison again if needed, extracts all unflushed staging, snapshots only
+    /// physically submitted batch sequence, then consumes the unique Close-only lease and slot.
+    pub(crate) fn finish(mut self) -> Result<SealedControlTransport, FinishControlCloseFailure> {
+        let mut state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                self.degradation.transport_poison_recovered = true;
+                poisoned.into_inner()
+            }
+        };
+        let last_submitted_batch_sequence = self
+            .inner
+            .last_submitted_batch_sequence
+            .load(Ordering::Acquire);
+        let payloads = ExtractedControlPayloads {
+            staged: std::mem::take(&mut state.staged),
+            last_submitted_batch_sequence,
+        };
+        let Some(lease) = CloseLifecycleLease::acquire(&self.inner.close_in_flight) else {
+            state.phase = TransportPhase::Failed;
+            return Err(FinishControlCloseFailure {
+                error: InjectedControlError::ProtocolViolation,
+                payloads,
+                degradation: self.degradation,
+            });
+        };
+        let Some(physical) = self.inner.lifecycle_physical.try_acquire() else {
+            state.phase = TransportPhase::Failed;
+            return Err(FinishControlCloseFailure {
+                error: InjectedControlError::ProtocolViolation,
+                payloads,
+                degradation: self.degradation,
+            });
+        };
+        let barrier = GraphLifecycleBarrier::new(
+            NonZeroU64::new(1).expect("the sole Close uses controller sequence one"),
+            last_submitted_batch_sequence,
+            GraphLifecycleTransition::Close,
+        );
+        let send = state
+            .sender
+            .try_send(ControlMessage::InjectedGraphLifecycleBarrier { barrier, physical });
+        match send {
+            Ok(()) => {
+                state.phase = TransportPhase::Sealed;
+                drop(state);
+                Ok(SealedControlTransport {
+                    payloads,
+                    close: SubmittedControlClose {
+                        barrier,
+                        watcher: self.watcher,
+                        lease,
+                    },
+                    degradation: self.degradation,
+                })
+            }
+            Err(TrySendError::Full(_)) => {
+                state.phase = TransportPhase::Failed;
+                Err(FinishControlCloseFailure {
+                    error: InjectedControlError::ProtocolViolation,
+                    payloads,
+                    degradation: self.degradation,
+                })
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                state.phase = TransportPhase::Failed;
+                state.disconnected = true;
+                Err(FinishControlCloseFailure {
+                    error: InjectedControlError::Disconnected,
+                    payloads,
+                    degradation: self.degradation,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, ThreadId};
+
+    use super::*;
+    use crate::context::{AudioContextState, AudioNodeId};
+    use crate::message::GraphLifecycleOutcome;
+    use crate::output::EndpointShutdownConfirmed;
+
+    struct Harness {
+        gate: InjectedContextAdmissionGate,
+        producer: InjectedControlProducer,
+        owner: Option<InjectedControlLifecycleOwner>,
+        renderer: Option<RenderThread>,
+        gc: Option<std::thread::JoinHandle<()>>,
+        _event_receiver: crossbeam_channel::Receiver<EventDispatch>,
+    }
+
+    impl Harness {
+        fn new(ordinary_capacity: usize, suspended: bool) -> Self {
+            let gate = InjectedContextAdmissionGate::new();
+            let (producer, owner, init) =
+                injected_control_channel(gate.clone(), ordinary_capacity, suspended).unwrap();
+            let (event_sender, event_receiver) = crossbeam_channel::bounded(32);
+            let mut renderer = init
+                .build_render_thread(
+                    48_000.,
+                    2,
+                    Arc::new(AtomicU8::new(AudioContextState::Suspended as u8)),
+                    Arc::new(AtomicU64::new(0)),
+                    AudioStats::new(),
+                    event_sender,
+                )
+                .into_render_thread_for_test();
+            let gc = renderer.spawn_joinable_garbage_collector_thread().unwrap();
+            Self {
+                gate,
+                producer,
+                owner: Some(owner),
+                renderer: Some(renderer),
+                gc: Some(gc),
+                _event_receiver: event_receiver,
+            }
+        }
+
+        fn callback(&mut self) {
+            self.renderer
+                .as_mut()
+                .unwrap()
+                .render(&mut [] as &mut [f32]);
+        }
+
+        fn finish_close(&mut self) -> SealedControlTransport {
+            let retirement = self.owner.take().unwrap().try_begin_close().ok().unwrap();
+            let (snapshot, drained) = retirement.retire_and_wait();
+            assert!(snapshot.is_drained());
+            drained.finish().ok().unwrap()
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            drop(self.renderer.take());
+            if let Some(gc) = self.gc.take() {
+                gc.join().unwrap();
+            }
+        }
+    }
+
+    fn prepare_with(
+        producer: &InjectedControlProducer,
+        commands: Vec<ControlMessage>,
+    ) -> PreparedControlBatch {
+        producer
+            .try_begin_operation(commands.len())
+            .unwrap()
+            .prepare_with(|| commands)
+            .ok()
+            .unwrap()
+    }
+
+    #[test]
+    fn total_logical_budget_is_exactly_256_across_envelopes_and_mixes() {
+        let harness = Harness::new(256, false);
+        assert_eq!(harness.producer.applied_batch_sequence(), 0);
+        let one_each: Vec<_> = (0..256)
+            .map(|_| harness.producer.try_begin_operation(1).unwrap())
+            .collect();
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::LogicalCommandCredits)
+        );
+        assert_eq!(harness.producer.accounting(), (256, 256, 256, 0));
+        drop(one_each);
+
+        let first = harness.producer.try_begin_operation(128).unwrap();
+        let second = harness.producer.try_begin_operation(127).unwrap();
+        assert_eq!(
+            harness.producer.try_begin_operation(2).err(),
+            Some(InjectedControlError::LogicalCommandCredits)
+        );
+        let final_one = harness.producer.try_begin_operation(1).unwrap();
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::LogicalCommandCredits)
+        );
+        drop((first, second, final_one));
+
+        let exact = harness.producer.try_begin_operation(256).unwrap();
+        let exact = exact
+            .prepare_with(|| (0..256).map(|_| ControlMessage::TestNop).collect())
+            .ok()
+            .unwrap();
+        assert_eq!(exact.len(), 256);
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::LogicalCommandCredits)
+        );
+    }
+
+    #[test]
+    fn refusal_precedes_factory_and_classification_is_closed() {
+        let harness = Harness::new(1, false);
+        let held = harness.producer.try_begin_operation(256).unwrap();
+        let factory_ran = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::LogicalCommandCredits)
+        );
+        assert!(!factory_ran.load(Ordering::Acquire));
+        drop(held);
+
+        let factory_ran_clone = Arc::clone(&factory_ran);
+        let failure = harness
+            .producer
+            .try_begin_operation(1)
+            .unwrap()
+            .prepare_with(move || {
+                factory_ran_clone.store(true, Ordering::Release);
+                vec![ControlMessage::GraphLifecycleBarrier(
+                    GraphLifecycleBarrier::new(
+                        NonZeroU64::new(1).unwrap(),
+                        0,
+                        GraphLifecycleTransition::Suspend,
+                    ),
+                )]
+            })
+            .err()
+            .unwrap();
+        assert!(factory_ran.load(Ordering::Acquire));
+        assert_eq!(failure.error, InjectedControlError::UnsupportedCommand);
+        assert_eq!(failure.commands_len(), 1);
+    }
+
+    #[test]
+    fn running_capacity_is_reserved_before_factory_and_commit_has_no_capacity_failure() {
+        let harness = Harness::new(1, false);
+        let reservation = harness.producer.try_begin_operation(1).unwrap();
+        assert_eq!(harness.producer.accounting(), (1, 1, 1, 0));
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::OrdinaryPhysicalCredits)
+        );
+        let prepared = reservation
+            .prepare_with(|| vec![ControlMessage::TestNop])
+            .ok()
+            .unwrap();
+        assert_eq!(
+            harness.producer.try_commit(prepared).unwrap(),
+            CommitControlOutcome::Enqueued { sequence: 1 }
+        );
+    }
+
+    #[test]
+    fn suspended_fifo_is_bounded_unsequenced_and_incrementally_flushed() {
+        let mut harness = Harness::new(1, true);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        for value in 1..=3 {
+            let command = ControlMessage::TestMarker {
+                value,
+                log: Arc::clone(&log),
+            };
+            assert_eq!(
+                harness
+                    .producer
+                    .try_commit(prepare_with(&harness.producer, vec![command]))
+                    .unwrap(),
+                CommitControlOutcome::Staged
+            );
+        }
+        assert_eq!(harness.producer.last_submitted_batch_sequence(), 0);
+        assert_eq!(harness.producer.accounting(), (3, 3, 0, 3));
+        for expected in 1..=3 {
+            assert_eq!(
+                harness.producer.try_flush().unwrap(),
+                FlushControlOutcome {
+                    enqueued: 1,
+                    remaining_staged: 3 - expected
+                }
+            );
+            harness.callback();
+            assert_eq!(harness.producer.applied_batch_sequence(), expected as u64);
+        }
+        assert_eq!(*log.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn suspended_256_envelopes_exhaust_logical_budget_before_a_257th_factory() {
+        let harness = Harness::new(1, true);
+        let staged: Vec<_> = (0..256)
+            .map(|_| {
+                harness
+                    .producer
+                    .try_commit(prepare_with(
+                        &harness.producer,
+                        vec![ControlMessage::TestNop],
+                    ))
+                    .unwrap()
+            })
+            .collect();
+        assert!(staged
+            .iter()
+            .all(|outcome| *outcome == CommitControlOutcome::Staged));
+        assert_eq!(harness.producer.accounting(), (256, 256, 0, 256));
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::LogicalCommandCredits)
+        );
+    }
+
+    #[test]
+    fn full_ordinary_queue_still_accepts_reserved_close_and_ack_is_scoped() {
+        let mut harness = Harness::new(2, false);
+        for _ in 0..2 {
+            harness
+                .producer
+                .try_commit(prepare_with(
+                    &harness.producer,
+                    vec![ControlMessage::TestNop],
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::OrdinaryPhysicalCredits)
+        );
+        let sealed = harness.finish_close();
+        assert_eq!(sealed.close.barrier().required_batch_sequence(), 2);
+        assert!(harness
+            .producer
+            .inner
+            .close_in_flight
+            .load(Ordering::Acquire));
+        let pending = sealed.close.try_observe_exact().err().unwrap();
+        assert!(matches!(pending, ObserveControlCloseFailure::Pending(_)));
+        let close = pending.into_close();
+        assert!(matches!(close.snapshot(), GraphLifecycleSnapshot::Pending));
+        assert!(CloseLifecycleLease::acquire(&harness.producer.inner.close_in_flight).is_none());
+
+        harness.callback();
+        assert!(matches!(
+            close.snapshot(),
+            GraphLifecycleSnapshot::Applied {
+                outcome: GraphLifecycleOutcome::Applied,
+                ..
+            }
+        ));
+        let observed = close.try_observe_exact().ok().unwrap();
+        assert_eq!(observed.barrier.required_batch_sequence(), 2);
+        assert!(!harness
+            .producer
+            .inner
+            .close_in_flight
+            .load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn held_preseal_preparation_blocks_close_drain_then_commits_ahead_of_close() {
+        let mut harness = Harness::new(1, false);
+        let reservation = harness.producer.try_begin_operation(1).unwrap();
+        let retirement = harness
+            .owner
+            .take()
+            .unwrap()
+            .try_begin_close()
+            .ok()
+            .unwrap();
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::Sealed)
+        );
+        let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+        let (done_send, done_recv) = crossbeam_channel::bounded(1);
+        let waiter = thread::spawn(move || {
+            entered_send.send(()).unwrap();
+            done_send.send(retirement.retire_and_wait()).unwrap();
+        });
+        entered_recv.recv().unwrap();
+        assert!(done_recv.try_recv().is_err());
+        let prepared = reservation
+            .prepare_with(|| vec![ControlMessage::TestNop])
+            .ok()
+            .unwrap();
+        assert_eq!(
+            harness.producer.try_commit(prepared).unwrap(),
+            CommitControlOutcome::Enqueued { sequence: 1 }
+        );
+        let (_, drained) = done_recv.recv().unwrap();
+        waiter.join().unwrap();
+        let sealed = drained.finish().ok().unwrap();
+        assert_eq!(sealed.close.barrier().required_batch_sequence(), 1);
+        harness.callback();
+    }
+
+    #[test]
+    fn close_stops_and_joins_registered_capacity_worker_before_drain() {
+        let mut harness = Harness::new(1, false);
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_worker = Arc::clone(&exited);
+        let worker = harness
+            .gate
+            .try_begin_capacity_worker()
+            .unwrap()
+            .start(move |stop| {
+                let _ = stop.recv();
+                exited_worker.store(true, Ordering::Release);
+            })
+            .unwrap();
+        worker.try_commit().ok().unwrap();
+        let retirement = harness
+            .owner
+            .take()
+            .unwrap()
+            .try_begin_close()
+            .ok()
+            .unwrap();
+        let (snapshot, drained) = retirement.retire_and_wait();
+        assert!(snapshot.is_drained());
+        assert!(exited.load(Ordering::Acquire));
+        let sealed = drained.finish().ok().unwrap();
+        assert!(!sealed.degradation.capacity_worker_panicked);
+        harness.callback();
+    }
+
+    struct DropThreadProbe(crossbeam_channel::Sender<ThreadId>);
+
+    impl Drop for DropThreadProbe {
+        fn drop(&mut self) {
+            let _ = self.0.send(thread::current().id());
+        }
+    }
+
+    #[test]
+    fn suspended_extraction_drops_payload_on_explicit_non_rt_thread() {
+        let mut harness = Harness::new(1, true);
+        let (drop_send, drop_recv) = crossbeam_channel::bounded(1);
+        let command = ControlMessage::NodeMessage {
+            id: AudioNodeId(123),
+            msg: llq::Node::new(Box::new(DropThreadProbe(drop_send)) as Box<dyn Any + Send>),
+        };
+        harness
+            .producer
+            .try_commit(prepare_with(&harness.producer, vec![command]))
+            .unwrap();
+        let sealed = harness.finish_close();
+        assert_eq!(sealed.payloads.staged_len(), 1);
+        assert_eq!(sealed.payloads.last_submitted_batch_sequence(), 0);
+        let worker = thread::spawn(move || drop(sealed.payloads));
+        let worker_id = worker.thread().id();
+        worker.join().unwrap();
+        assert_eq!(drop_recv.recv().unwrap(), worker_id);
+        harness.callback();
+    }
+
+    #[test]
+    fn transport_poison_is_recovered_for_degraded_close() {
+        let mut harness = Harness::new(1, false);
+        let poison = harness.producer.clone();
+        assert!(thread::spawn(move || poison.poison_transport())
+            .join()
+            .is_err());
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::Poisoned)
+        );
+        let sealed = harness.finish_close();
+        assert!(sealed.degradation.transport_poison_recovered);
+        harness.callback();
+        assert!(sealed.close.try_observe_exact().is_ok());
+    }
+
+    #[test]
+    fn prior_transport_failure_survives_as_close_degradation() {
+        let mut harness = Harness::new(1, false);
+        harness.producer.fail_transport();
+        let sealed = harness.finish_close();
+        assert!(sealed.degradation.prior_transport_failure);
+        harness.callback();
+        assert!(sealed.close.try_observe_exact().is_ok());
+    }
+
+    #[test]
+    fn gate_poison_quarantines_unique_owner_and_all_producers() {
+        let mut harness = Harness::new(1, false);
+        let gate = harness.gate.clone();
+        assert!(thread::spawn(move || gate.poison_phase_lock_for_test())
+            .join()
+            .is_err());
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::GatePoisoned)
+        );
+        let failure = harness
+            .owner
+            .take()
+            .unwrap()
+            .try_begin_close()
+            .err()
+            .unwrap();
+        assert_eq!(failure.error, InjectedControlError::GatePoisoned);
+        drop(failure.owner);
+    }
+
+    #[test]
+    fn disconnected_receiver_returns_payload_and_terminal_error() {
+        let gate = InjectedContextAdmissionGate::new();
+        let (producer, owner, init) = injected_control_channel(gate, 1, false).unwrap();
+        drop(init);
+        let prepared = prepare_with(&producer, vec![ControlMessage::TestNop]);
+        let failure = producer.try_commit(prepared).unwrap_err();
+        assert_eq!(failure.error, InjectedControlError::Disconnected);
+        assert_eq!(failure.batch.len(), 1);
+        assert_eq!(producer.last_submitted_batch_sequence(), 0);
+        drop(owner);
+    }
+
+    #[test]
+    fn renderer_death_before_suspended_flush_latches_disconnect_and_preserves_staging() {
+        let gate = InjectedContextAdmissionGate::new();
+        let (producer, owner, init) = injected_control_channel(gate, 1, true).unwrap();
+        drop(init);
+        let (drop_send, drop_recv) = crossbeam_channel::bounded(1);
+        let command = ControlMessage::TestGarbage {
+            payload: llq::Node::new(Box::new(DropThreadProbe(drop_send)) as Box<dyn Any + Send>),
+        };
+        assert_eq!(
+            producer
+                .try_commit(prepare_with(&producer, vec![command]))
+                .unwrap(),
+            CommitControlOutcome::Staged
+        );
+        assert_eq!(
+            producer.try_flush(),
+            Err(InjectedControlError::Disconnected)
+        );
+        assert_eq!(
+            producer.try_flush(),
+            Err(InjectedControlError::Disconnected)
+        );
+
+        let retirement = owner.try_begin_close().ok().unwrap();
+        let (_, drained) = retirement.retire_and_wait();
+        let failure = drained.finish().err().unwrap();
+        assert_eq!(failure.error, InjectedControlError::Disconnected);
+        assert!(failure.degradation.prior_transport_failure);
+        assert_eq!(failure.payloads.staged_len(), 1);
+        let worker = thread::spawn(move || drop(failure.payloads));
+        let worker_id = worker.thread().id();
+        worker.join().unwrap();
+        assert_eq!(drop_recv.recv().unwrap(), worker_id);
+    }
+
+    #[test]
+    fn sequence_namespace_is_reserved_before_running_or_staged_factories() {
+        let running = Harness::new(2, false);
+        running.producer.set_next_batch_sequence(u64::MAX - 2);
+        let first = running.producer.try_begin_operation(1).unwrap();
+        let second = running.producer.try_begin_operation(1).unwrap();
+        assert_eq!(
+            running.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::SequenceExhausted)
+        );
+        let second = second
+            .prepare_with(|| vec![ControlMessage::TestNop])
+            .ok()
+            .unwrap();
+        assert_eq!(
+            running.producer.try_commit(second).unwrap(),
+            CommitControlOutcome::Enqueued {
+                sequence: u64::MAX - 2
+            }
+        );
+        let first = first
+            .prepare_with(|| vec![ControlMessage::TestNop])
+            .ok()
+            .unwrap();
+        assert_eq!(
+            running.producer.try_commit(first).unwrap(),
+            CommitControlOutcome::Enqueued {
+                sequence: u64::MAX - 1
+            }
+        );
+
+        let staged = Harness::new(1, true);
+        staged.producer.set_next_batch_sequence(u64::MAX - 2);
+        let first = staged.producer.try_begin_operation(1).unwrap();
+        let second = staged.producer.try_begin_operation(1).unwrap();
+        assert_eq!(
+            staged.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::SequenceExhausted)
+        );
+        drop((first, second));
+    }
+
+    struct AdmissionCleanupProbe {
+        gate: InjectedContextAdmissionGate,
+        observed: crossbeam_channel::Sender<(usize, AdmissionDrain)>,
+    }
+
+    impl Drop for AdmissionCleanupProbe {
+        fn drop(&mut self) {
+            let sealed = self.gate.try_seal().unwrap();
+            let (worker, drain) = sealed.into_parts();
+            assert!(worker.is_none());
+            let inside = drain.snapshot().graph_controls;
+            self.observed.send((inside, drain)).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejected_payload_cleanup_remains_inside_graph_admission() {
+        let gate = InjectedContextAdmissionGate::new();
+        let (producer, owner, init) = injected_control_channel(gate.clone(), 1, false).unwrap();
+        let (observed_send, observed_recv) = crossbeam_channel::bounded(1);
+        let failure = producer
+            .try_begin_operation(2)
+            .unwrap()
+            .prepare_with(|| {
+                vec![ControlMessage::TestGarbage {
+                    payload: llq::Node::new(Box::new(AdmissionCleanupProbe {
+                        gate,
+                        observed: observed_send,
+                    }) as Box<dyn Any + Send>),
+                }]
+            })
+            .err()
+            .unwrap();
+        assert_eq!(failure.error, InjectedControlError::TooLarge);
+        drop(failure);
+        let (inside, drain) = observed_recv.recv().unwrap();
+        assert_eq!(inside, 1);
+        assert_eq!(drain.snapshot().graph_controls, 0);
+        drop((drain, owner, init));
+    }
+
+    #[test]
+    fn non_applied_close_outcomes_do_not_release_lifecycle_lease() {
+        let state = Arc::new(AtomicBool::new(false));
+        let lease = CloseLifecycleLease::acquire(&state).unwrap();
+        let (publisher, watcher) = graph_lifecycle_ack_pair();
+        let barrier = GraphLifecycleBarrier::new(
+            NonZeroU64::new(1).unwrap(),
+            2,
+            GraphLifecycleTransition::Close,
+        );
+        let close = SubmittedControlClose {
+            barrier,
+            watcher,
+            lease,
+        };
+        publisher.publish(barrier, 1, GraphLifecycleOutcome::RequiredBatchPending);
+        let failure = close.try_observe_exact().err().unwrap();
+        assert!(matches!(
+            failure,
+            ObserveControlCloseFailure::Terminal { .. }
+        ));
+        let close = failure.into_close();
+        assert!(state.load(Ordering::Acquire));
+        drop(close);
+        assert!(state.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn renderer_death_disconnects_close_wake_and_quarantines_pending_lease() {
+        let mut harness = Harness::new(1, false);
+        let sealed = harness.finish_close();
+        let close_flag = Arc::clone(&harness.producer.inner.close_in_flight);
+        drop(harness.renderer.take());
+        harness.gc.take().unwrap().join().unwrap();
+        assert!(sealed.close.wake_receiver().recv().is_err());
+        assert!(matches!(
+            sealed.close.snapshot(),
+            GraphLifecycleSnapshot::Pending
+        ));
+        drop(sealed.close);
+        assert!(close_flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn injected_dequeue_and_reclaim_are_allocation_free_and_drop_off_rt() {
+        let mut harness = Harness::new(1, false);
+        let (drop_send, drop_recv) = crossbeam_channel::bounded(1);
+        let command = ControlMessage::TestGarbage {
+            payload: llq::Node::new(Box::new(DropThreadProbe(drop_send)) as Box<dyn Any + Send>),
+        };
+        harness
+            .producer
+            .try_commit(prepare_with(&harness.producer, vec![command]))
+            .unwrap();
+        let gc_id = harness.gc.as_ref().unwrap().thread().id();
+        alloc_counter::deny_alloc(|| harness.callback());
+        assert_eq!(drop_recv.recv().unwrap(), gc_id);
+        assert_eq!(harness.producer.applied_batch_sequence(), 1);
+    }
+
+    #[test]
+    fn capability_traits_keep_lifecycle_nonclone_and_sender_opaque() {
+        fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
+        fn assert_send<T: Send>() {}
+        assert_clone_send_sync::<InjectedControlProducer>();
+        assert_send::<InjectedControlLifecycleOwner>();
+        assert_send::<InjectedControlRenderInit>();
+        assert_send::<ControlBatchReservation>();
+        assert_send::<PreparedControlBatch>();
+        assert_send::<SubmittedControlClose>();
+    }
+
+    #[test]
+    fn production_bound_renderer_can_only_enter_the_owner_callback_gc_pair() {
+        let gate = InjectedContextAdmissionGate::new();
+        let (producer, owner, init) = injected_control_channel(gate, 1, false).unwrap();
+        let (event_sender, _event_receiver) = crossbeam_channel::bounded(1);
+        let bound = init.build_render_thread(
+            48_000.,
+            2,
+            Arc::new(AtomicU8::new(AudioContextState::Suspended as u8)),
+            Arc::new(AtomicU64::new(0)),
+            AudioStats::new(),
+            event_sender,
+        );
+        let (events, _watcher) = AudioOutputEventSink::bounded(1);
+        let format = AudioRenderFormat::new(48_000., 2, 128).unwrap();
+        let (render_owner, callback) = bound.into_audio_render_thread_pair(format, events);
+        render_owner.begin_shutdown();
+        drop(callback);
+        assert!(render_owner
+            .try_reclaim_after_shutdown(EndpointShutdownConfirmed::new())
+            .ok()
+            .unwrap()
+            .is_ok());
+        drop((producer, owner));
+    }
+}
