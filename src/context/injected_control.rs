@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
@@ -18,7 +19,9 @@ use super::injected_admission::{
     AdmissionDrain, AdmissionError, AdmissionSnapshot, CapacityWorkerJoinError,
     CapacityWorkerRetirement, GraphControlAdmission,
 };
-use super::InjectedContextAdmissionGate;
+#[cfg(test)]
+use super::{injected_node_id_pair, InjectedNodeIdOwner};
+use super::{InjectedContextAdmissionGate, InjectedGraphReclaimInit};
 use crate::events::EventDispatch;
 use crate::message::{
     control_batch_storage_mut, graph_lifecycle_ack_pair, injected_control_batch_node,
@@ -162,6 +165,10 @@ struct InjectedControlInner {
     close_in_flight: Arc<AtomicBool>,
     last_submitted_batch_sequence: AtomicU64,
     applied: ControlBatchApplied,
+    /// An accepted payload whose mandatory control-side finalizer failed is irrevocably terminal:
+    /// the render payload remains owned by the queue/staging, but its paired mirror/lifetime
+    /// transition cannot be reported as ordinary success.
+    accepted_finalizer_failed: AtomicBool,
 }
 
 /// Cloneable ordinary graph producer. Private fields prevent raw sender or lifecycle extraction.
@@ -213,6 +220,7 @@ impl InjectedControlRenderInit {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_render_thread(
         self,
+        graph: InjectedGraphReclaimInit,
         sample_rate: f32,
         number_of_channels: usize,
         state: Arc<std::sync::atomic::AtomicU8>,
@@ -230,6 +238,9 @@ impl InjectedControlRenderInit {
             event_sender,
             self.applied,
         );
+        if renderer.install_injected_graph(graph).is_err() {
+            unreachable!("new injected renderer has no graph");
+        }
         if renderer
             .set_injected_physical_credit_owners(self.physical_owners)
             .is_err()
@@ -298,6 +309,7 @@ pub(crate) fn injected_control_channel(
         close_in_flight: Arc::new(AtomicBool::new(false)),
         last_submitted_batch_sequence: AtomicU64::new(0),
         applied: applied.clone(),
+        accepted_finalizer_failed: AtomicBool::new(false),
     });
     Ok((
         InjectedControlProducer {
@@ -447,6 +459,71 @@ pub(crate) enum CommitControlOutcome {
     Staged,
 }
 
+/// Fixed error reported by a mandatory accepted-batch finalizer. The finalizer itself is a
+/// monomorphized, stack-owned control-side operation; this seam performs no allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AcceptedBatchFinalizeError {
+    Rejected,
+    Panicked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AcceptedBatchFinalizeFailure {
+    pub(crate) outcome: CommitControlOutcome,
+    pub(crate) error: AcceptedBatchFinalizeError,
+}
+
+pub(crate) enum CommitWithFinalizeFailure {
+    NotAccepted(CommitControlFailure),
+    AcceptedFinalizer(AcceptedBatchFinalizeFailure),
+}
+
+/// Accepted placement whose short operation authorities deliberately remain live until the
+/// mandatory finalizer (or ordinary no-op completion) finishes.
+struct AcceptedControlCommit {
+    inner: Arc<InjectedControlInner>,
+    outcome: CommitControlOutcome,
+    sequence_reservation: Option<BatchSequenceReservation>,
+    admission: GraphControlAdmission,
+}
+
+impl AcceptedControlCommit {
+    fn complete(self) -> CommitControlOutcome {
+        self.outcome
+    }
+
+    fn finalize<F>(self, finalizer: F) -> Result<CommitControlOutcome, CommitWithFinalizeFailure>
+    where
+        F: FnOnce(CommitControlOutcome) -> Result<(), AcceptedBatchFinalizeError> + Copy,
+    {
+        let finalized = panic::catch_unwind(AssertUnwindSafe(|| finalizer(self.outcome)));
+        let failure = match finalized {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(payload) => {
+                // A hostile panic payload may panic again from Drop. The accepted render payload
+                // and its accounting stay owned by transport; quarantine the payload itself.
+                std::mem::forget(payload);
+                Some(AcceptedBatchFinalizeError::Panicked)
+            }
+        };
+        if failure.is_some() {
+            self.inner
+                .accepted_finalizer_failed
+                .store(true, Ordering::Release);
+        }
+        let outcome = self.outcome;
+        drop(self.sequence_reservation);
+        drop(self.admission);
+        match failure {
+            None => Ok(outcome),
+            Some(error) => Err(CommitWithFinalizeFailure::AcceptedFinalizer(
+                AcceptedBatchFinalizeFailure { outcome, error },
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FlushControlOutcome {
     pub(crate) enqueued: usize,
@@ -471,6 +548,9 @@ impl InjectedControlProducer {
         let state = try_state(&self.inner)?;
         if state.disconnected {
             return Err(InjectedControlError::Disconnected);
+        }
+        if self.inner.accepted_finalizer_failed.load(Ordering::Acquire) {
+            return Err(InjectedControlError::ProtocolViolation);
         }
         if state.phase != TransportPhase::Open {
             return Err(InjectedControlError::Sealed);
@@ -532,6 +612,41 @@ impl InjectedControlProducer {
         &self,
         batch: PreparedControlBatch,
     ) -> Result<CommitControlOutcome, CommitControlFailure> {
+        self.try_commit_retained(batch)
+            .map(AcceptedControlCommit::complete)
+    }
+
+    /// Commits an ordinary batch and runs one mandatory finalizer only after its envelope is
+    /// physically enqueued or accepted into suspended staging. The operation's graph admission
+    /// and running sequence reservation remain live until the finalizer returns.
+    ///
+    /// The callback contract is fixed, bounded, nonblocking, and allocation-free. `Copy` only
+    /// prevents it from directly owning destructor-bearing rollback/registration guards; it does
+    /// not prove those runtime properties or prevent indirect mutation through copied references.
+    /// Finalizer side effects are not rolled back on failure. A future constructor therefore still
+    /// needs a concrete transaction wrapper to disarm provisional ids and arm registrations; this
+    /// ordering hook alone must not own those guards.
+    ///
+    /// A typed failure or panic is terminal: the accepted payload remains owned by
+    /// transport/renderer, the panic payload is deliberately forgotten, and this transport
+    /// rejects later ordinary work. Such a failure is never reported as ordinary commit success.
+    pub(crate) fn try_commit_with_finalize<F>(
+        &self,
+        batch: PreparedControlBatch,
+        finalizer: F,
+    ) -> Result<CommitControlOutcome, CommitWithFinalizeFailure>
+    where
+        F: FnOnce(CommitControlOutcome) -> Result<(), AcceptedBatchFinalizeError> + Copy,
+    {
+        self.try_commit_retained(batch)
+            .map_err(CommitWithFinalizeFailure::NotAccepted)?
+            .finalize(finalizer)
+    }
+
+    fn try_commit_retained(
+        &self,
+        batch: PreparedControlBatch,
+    ) -> Result<AcceptedControlCommit, CommitControlFailure> {
         if !Arc::ptr_eq(&self.inner, &batch.inner) {
             return Err(CommitControlFailure {
                 error: InjectedControlError::ProtocolViolation,
@@ -579,6 +694,21 @@ impl InjectedControlProducer {
                 },
             });
         }
+        if inner.accepted_finalizer_failed.load(Ordering::Acquire) {
+            drop(state);
+            return Err(CommitControlFailure {
+                error: InjectedControlError::ProtocolViolation,
+                batch: PreparedControlBatch {
+                    commands,
+                    inner,
+                    storage,
+                    command_credit,
+                    sequence_reservation,
+                    placement,
+                    admission,
+                },
+            });
+        }
         if matches!(state.phase, TransportPhase::Sealed | TransportPhase::Failed) {
             let error = if state.phase == TransportPhase::Sealed {
                 InjectedControlError::Sealed
@@ -608,8 +738,12 @@ impl InjectedControlProducer {
                     _sequence: sequence_reservation,
                 });
                 drop(state);
-                drop(admission);
-                Ok(CommitControlOutcome::Staged)
+                Ok(AcceptedControlCommit {
+                    inner,
+                    outcome: CommitControlOutcome::Staged,
+                    sequence_reservation: None,
+                    admission,
+                })
             }
             ReservedPlacement::Running(physical) => {
                 let sequence = state.next_batch_sequence;
@@ -644,9 +778,12 @@ impl InjectedControlProducer {
                             .last_submitted_batch_sequence
                             .store(sequence, Ordering::Release);
                         drop(state);
-                        drop(sequence_reservation);
-                        drop(admission);
-                        Ok(CommitControlOutcome::Enqueued { sequence })
+                        Ok(AcceptedControlCommit {
+                            inner,
+                            outcome: CommitControlOutcome::Enqueued { sequence },
+                            sequence_reservation: Some(sequence_reservation),
+                            admission,
+                        })
                     }
                     Err(TrySendError::Full(ControlMessage::InjectedBatch {
                         mut batch,
@@ -707,6 +844,9 @@ impl InjectedControlProducer {
         let mut state = try_state(&self.inner)?;
         if state.disconnected {
             return Err(InjectedControlError::Disconnected);
+        }
+        if self.inner.accepted_finalizer_failed.load(Ordering::Acquire) {
+            return Err(InjectedControlError::ProtocolViolation);
         }
         if state.phase != TransportPhase::Open {
             return Err(InjectedControlError::Sealed);
@@ -861,7 +1001,8 @@ impl InjectedControlLifecycleOwner {
                 poisoned.into_inner()
             }
         };
-        degradation.prior_transport_failure = state.phase == TransportPhase::Failed;
+        degradation.prior_transport_failure = state.phase == TransportPhase::Failed
+            || self.inner.accepted_finalizer_failed.load(Ordering::Acquire);
         state.phase = TransportPhase::SealStarted;
         let (capacity_worker, drain) = admissions.into_parts();
         drop(state);
@@ -895,6 +1036,10 @@ impl ControlCloseRetirement {
         }
         let snapshot = self.drain.wait();
         debug_assert!(snapshot.is_drained());
+        // A pre-seal operation may have been inside its accepted finalizer when sealing began.
+        // Refresh only after the admission drain proves that finalizer has returned.
+        self.degradation.prior_transport_failure |=
+            self.inner.accepted_finalizer_failed.load(Ordering::Acquire);
         (
             snapshot,
             DrainedControlClose {
@@ -1116,6 +1261,7 @@ impl DrainedControlClose {
 #[cfg(test)]
 mod tests {
     use std::any::Any;
+    use std::panic::panic_any;
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, ThreadId};
@@ -1131,6 +1277,7 @@ mod tests {
         owner: Option<InjectedControlLifecycleOwner>,
         renderer: Option<RenderThread>,
         gc: Option<std::thread::JoinHandle<()>>,
+        _node_ids: InjectedNodeIdOwner,
         _event_receiver: crossbeam_channel::Receiver<EventDispatch>,
     }
 
@@ -1140,8 +1287,10 @@ mod tests {
             let (producer, owner, init) =
                 injected_control_channel(gate.clone(), ordinary_capacity, suspended).unwrap();
             let (event_sender, event_receiver) = crossbeam_channel::bounded(32);
+            let (_allocator, node_ids, graph) = injected_node_id_pair(0);
             let mut renderer = init
                 .build_render_thread(
+                    graph,
                     48_000.,
                     2,
                     Arc::new(AtomicU8::new(AudioContextState::Suspended as u8)),
@@ -1157,6 +1306,7 @@ mod tests {
                 owner: Some(owner),
                 renderer: Some(renderer),
                 gc: Some(gc),
+                _node_ids: node_ids,
                 _event_receiver: event_receiver,
             }
         }
@@ -1195,6 +1345,162 @@ mod tests {
             .prepare_with(|| commands)
             .ok()
             .unwrap()
+    }
+
+    #[test]
+    fn accepted_finalizer_failure_holds_admission_and_reaches_close_degradation() {
+        let mut harness = Harness::new(1, false);
+        let batch = prepare_with(
+            &harness.producer,
+            vec![ControlMessage::MarkCycleBreaker { id: AudioNodeId(9) }],
+        );
+        let producer = harness.producer.clone();
+        let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+        let (release_send, release_recv) = crossbeam_channel::bounded(1);
+        thread::scope(|scope| {
+            let commit = scope.spawn(move || {
+                producer.try_commit_with_finalize(batch, |outcome| {
+                    entered_send.send(outcome).unwrap();
+                    release_recv.recv().unwrap();
+                    Err(AcceptedBatchFinalizeError::Rejected)
+                })
+            });
+            assert_eq!(
+                entered_recv.recv().unwrap(),
+                CommitControlOutcome::Enqueued { sequence: 1 }
+            );
+
+            let retirement = harness
+                .owner
+                .take()
+                .unwrap()
+                .try_begin_close()
+                .ok()
+                .unwrap();
+            assert_eq!(retirement.drain.snapshot().graph_controls, 1);
+            let (done_send, done_recv) = crossbeam_channel::bounded(1);
+            let waiter = scope.spawn(move || {
+                done_send.send(retirement.retire_and_wait()).unwrap();
+            });
+            assert!(done_recv.try_recv().is_err());
+            release_send.send(()).unwrap();
+            assert!(matches!(
+                commit.join().unwrap(),
+                Err(CommitWithFinalizeFailure::AcceptedFinalizer(_))
+            ));
+            let (snapshot, drained) = done_recv.recv().unwrap();
+            assert!(snapshot.is_drained());
+            assert!(drained.degradation.prior_transport_failure);
+            waiter.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn accepted_finalizer_failure_is_terminal_and_never_reports_commit_success() {
+        let mut harness = Harness::new(1, true);
+        let batch = prepare_with(
+            &harness.producer,
+            vec![ControlMessage::MarkCycleBreaker { id: AudioNodeId(9) }],
+        );
+        let sequence_reservations = &harness.producer.inner.batch_sequence_reservations;
+        let failure = harness
+            .producer
+            .try_commit_with_finalize(batch, |outcome| {
+                assert_eq!(outcome, CommitControlOutcome::Staged);
+                assert_eq!(sequence_reservations.load(Ordering::Acquire), 1);
+                Err(AcceptedBatchFinalizeError::Rejected)
+            })
+            .err()
+            .unwrap();
+        assert!(matches!(
+            failure,
+            CommitWithFinalizeFailure::AcceptedFinalizer(AcceptedBatchFinalizeFailure {
+                outcome: CommitControlOutcome::Staged,
+                error: AcceptedBatchFinalizeError::Rejected,
+            })
+        ));
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::ProtocolViolation)
+        );
+        // Staged placement retains the reservation in its queued record; Close extraction owns
+        // and later releases it rather than the finalizer path doing so.
+        assert_eq!(sequence_reservations.load(Ordering::Acquire), 1);
+        let retirement = harness
+            .owner
+            .take()
+            .unwrap()
+            .try_begin_close()
+            .ok()
+            .unwrap();
+        assert!(retirement.degradation.prior_transport_failure);
+    }
+
+    #[test]
+    fn not_accepted_batch_never_runs_finalizer_and_remains_recoverable() {
+        let first = Harness::new(1, false);
+        let second = Harness::new(1, false);
+        let batch = prepare_with(
+            &first.producer,
+            vec![ControlMessage::MarkCycleBreaker { id: AudioNodeId(9) }],
+        );
+        let calls = AtomicUsize::new(0);
+        let failure = second
+            .producer
+            .try_commit_with_finalize(batch, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .err()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let CommitWithFinalizeFailure::NotAccepted(failure) = failure else {
+            panic!("wrong producer must refuse before acceptance");
+        };
+        assert_eq!(
+            first.producer.try_commit(failure.batch).unwrap(),
+            CommitControlOutcome::Enqueued { sequence: 1 }
+        );
+    }
+
+    #[test]
+    fn accepted_finalizer_panic_forgets_hostile_payload_and_terminalizes_transport() {
+        struct HostilePayload;
+        impl Drop for HostilePayload {
+            fn drop(&mut self) {
+                panic!("hostile panic payload drop");
+            }
+        }
+
+        let harness = Harness::new(1, false);
+        let batch = prepare_with(
+            &harness.producer,
+            vec![ControlMessage::MarkCycleBreaker { id: AudioNodeId(9) }],
+        );
+        let calls = AtomicUsize::new(0);
+        let sequence_reservations = &harness.producer.inner.batch_sequence_reservations;
+        let failure = harness
+            .producer
+            .try_commit_with_finalize(batch, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(sequence_reservations.load(Ordering::Acquire), 1);
+                panic_any(HostilePayload)
+            })
+            .err()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sequence_reservations.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            failure,
+            CommitWithFinalizeFailure::AcceptedFinalizer(AcceptedBatchFinalizeFailure {
+                error: AcceptedBatchFinalizeError::Panicked,
+                ..
+            })
+        ));
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::ProtocolViolation)
+        );
     }
 
     #[test]
@@ -1759,7 +2065,9 @@ mod tests {
         let gate = InjectedContextAdmissionGate::new();
         let (producer, owner, init) = injected_control_channel(gate, 1, false).unwrap();
         let (event_sender, _event_receiver) = crossbeam_channel::bounded(1);
+        let (_allocator, node_ids, graph) = injected_node_id_pair(0);
         let bound = init.build_render_thread(
+            graph,
             48_000.,
             2,
             Arc::new(AtomicU8::new(AudioContextState::Suspended as u8)),
@@ -1767,6 +2075,7 @@ mod tests {
             AudioStats::new(),
             event_sender,
         );
+        assert!(bound.renderer.has_injected_reclaim_publisher());
         let (events, _watcher) = AudioOutputEventSink::bounded(1);
         let format = AudioRenderFormat::new(48_000., 2, 128).unwrap();
         let (render_owner, callback) = bound.into_audio_render_thread_pair(format, events);
@@ -1777,6 +2086,6 @@ mod tests {
             .ok()
             .unwrap()
             .is_ok());
-        drop((producer, owner));
+        drop((producer, owner, node_ids));
     }
 }

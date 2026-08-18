@@ -18,6 +18,9 @@ pub(crate) use injected_admission::{
 mod injected_control;
 
 mod injected_ids;
+#[cfg(test)]
+pub(crate) use injected_ids::{injected_node_id_pair, InjectedNodeIdOwner};
+pub(crate) use injected_ids::{InjectedGraphReclaimInit, InjectedGraphReclaimPublisher};
 
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
