@@ -5,7 +5,7 @@ use crate::context::{
     DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS,
 };
 use crate::events::{EventDispatch, EventHandler, EventLoop, EventType};
-use crate::message::ControlMessage;
+use crate::message::{ControlBatchApplied, ControlBatchSender, ControlMessage};
 use crate::node::{AudioDestinationNode, AudioNode, AudioNodeOptions, ChannelConfig};
 use crate::param::AudioParam;
 use crate::render::AudioProcessor;
@@ -94,6 +94,10 @@ struct ConcreteBaseAudioContextInner {
     destination_channel_config: ChannelConfig,
     /// message channel from control to render thread
     render_channel: RwLock<Sender<ControlMessage>>,
+    /// Private bounded-batch transport, retained for a later additive control API.
+    _control_batch_sender: ControlBatchSender,
+    /// Authoritative render-side acknowledgement for private control batches.
+    control_batch_applied: ControlBatchApplied,
     /// control messages staged while the render thread is suspended
     suspended_messages: Mutex<Option<Vec<ControlMessage>>>,
     /// control messages that cannot be sent immediately
@@ -131,6 +135,8 @@ impl ConcreteBaseAudioContext {
         state: Arc<AtomicU8>,
         frames_played: Arc<AtomicU64>,
         render_channel: Sender<ControlMessage>,
+        control_batch_sender: ControlBatchSender,
+        control_batch_applied: ControlBatchApplied,
         event_send: Sender<EventDispatch>,
         event_loop: EventLoop,
         offline: bool,
@@ -142,6 +148,8 @@ impl ConcreteBaseAudioContext {
             sample_rate,
             max_channel_count,
             render_channel: RwLock::new(render_channel),
+            _control_batch_sender: control_batch_sender,
+            control_batch_applied,
             suspended_messages: Mutex::new(None),
             queued_messages: Mutex::new(Vec::new()),
             audio_node_id_provider,
@@ -226,6 +234,11 @@ impl ConcreteBaseAudioContext {
 
     pub(crate) fn address(&self) -> usize {
         Arc::as_ptr(&self.inner) as usize
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn applied_control_batch_sequence(&self) -> u64 {
+        self.inner.control_batch_applied.load()
     }
 
     /// Construct a new pair of [`AudioNode`] and [`AudioProcessor`]
@@ -317,6 +330,19 @@ impl ConcreteBaseAudioContext {
         if sender.send(msg).is_err() {
             log::warn!("Discarding control message - render thread is closed");
         }
+    }
+
+    /// Put sink-replay records ahead of mutations already staged while the context is suspended.
+    /// The caller holds the render-channel write guard, so no producer can interleave here.
+    pub(crate) fn prepend_suspended_control_msgs(&self, mut messages: Vec<ControlMessage>) {
+        if messages.is_empty() {
+            return;
+        }
+
+        let mut suspended = self.inner.suspended_messages.lock().unwrap();
+        let existing = suspended.get_or_insert_with(Vec::new);
+        messages.append(existing);
+        *existing = messages;
     }
 
     pub(crate) fn send_event(&self, msg: EventDispatch) -> Result<(), SendError<EventDispatch>> {
@@ -568,6 +594,41 @@ impl ConcreteBaseAudioContext {
 mod tests {
     use super::*;
     use crate::context::OfflineAudioContext;
+
+    fn test_marker(value: u16) -> ControlMessage {
+        ControlMessage::TestMarker {
+            value,
+            log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[test]
+    fn sink_replay_is_prepended_to_existing_suspended_fifo() {
+        let context = OfflineAudioContext::new(1, 128, 48_000.);
+        *context.base().inner.suspended_messages.lock().unwrap() =
+            Some(vec![test_marker(3), test_marker(4)]);
+
+        context
+            .base()
+            .prepend_suspended_control_msgs(vec![test_marker(1), test_marker(2)]);
+
+        let messages = context
+            .base()
+            .inner
+            .suspended_messages
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        let values: Vec<_> = messages
+            .into_iter()
+            .map(|message| match message {
+                ControlMessage::TestMarker { value, .. } => value,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(values, [1, 2, 3, 4]);
+    }
 
     #[test]
     fn test_provide_node_id() {

@@ -311,6 +311,7 @@ impl AudioBackendManager for CubebBackend {
             frames_played,
             stats,
             ctrl_msg_recv,
+            control_batch_applied,
             event_send,
         } = render_thread_init;
 
@@ -348,6 +349,7 @@ impl AudioBackendManager for CubebBackend {
                 frames_played,
                 stats,
                 event_send,
+                control_batch_applied,
             );
             renderer.set_startup_pending(startup_pending);
             renderer.spawn_garbage_collector_thread();
