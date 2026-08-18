@@ -82,13 +82,24 @@ pub(crate) struct InjectedNodeIdOwner {
     _reclaim_activity_owner: crossbeam_channel::Sender<()>,
 }
 
+/// Opaque weak identity shared by one allocator owner, graph initializer, and every exact reclaim
+/// token emitted by that graph.
+#[derive(Clone)]
+pub(crate) struct InjectedNodeIdIdentity(Weak<InjectedNodeIdInner>);
+
+impl InjectedNodeIdIdentity {
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// Opaque, consuming graph initializer. It binds one internally matched reclaim producer and wake
-/// publisher, so publisher installation cannot be omitted. Until a later context wrapper brands
-/// the returned triple, crate code could still misassociate an owner from one call with the
-/// initializer from another.
+/// publisher. The injected node-lifetime bootstrap consumes and validates this initializer with
+/// its exact id owner before the render initializer can install it.
 pub(crate) struct InjectedGraphReclaimInit {
     graph_reclaims: llq::Producer<AudioNodeId>,
     publisher: InjectedGraphReclaimPublisher,
+    identity: InjectedNodeIdIdentity,
 }
 
 /// Render-side best-effort wake publisher. The authoritative record remains the exact LLQ node.
@@ -110,7 +121,7 @@ impl InjectedGraphReclaimInit {
     }
 
     #[cfg(test)]
-    fn push_for_test(&mut self, node: llq::Node<AudioNodeId>) {
+    pub(crate) fn push_for_test(&mut self, node: llq::Node<AudioNodeId>) {
         self.graph_reclaims.push(node);
         self.publisher.publish();
     }
@@ -136,6 +147,7 @@ pub(crate) fn injected_node_id_pair(
         #[cfg(test)]
         release_hook: Mutex::new(None),
     });
+    let identity = InjectedNodeIdIdentity(Arc::downgrade(&inner));
     (
         InjectedNodeIdAllocator {
             inner: Arc::downgrade(&inner),
@@ -152,6 +164,7 @@ pub(crate) fn injected_node_id_pair(
             publisher: InjectedGraphReclaimPublisher {
                 activity: reclaim_activity_owner,
             },
+            identity,
         },
     )
 }
@@ -329,6 +342,14 @@ impl Drop for ProvisionalNodeIds {
 }
 
 impl InjectedNodeIdOwner {
+    pub(crate) fn identity(&self) -> InjectedNodeIdIdentity {
+        InjectedNodeIdIdentity(Arc::downgrade(&self.inner))
+    }
+
+    pub(crate) fn matches_graph_init(&self, graph: &InjectedGraphReclaimInit) -> bool {
+        self.identity().ptr_eq(&graph.identity)
+    }
+
     /// Borrowed, lossy wake hint. The future lifecycle driver must always drain the authoritative
     /// exact-node queue through `try_pending_reclaim`; a wake is never an acknowledgement.
     pub(crate) const fn reclaim_activity_receiver(&self) -> &crossbeam_channel::Receiver<()> {
@@ -345,6 +366,41 @@ impl InjectedNodeIdOwner {
         }
         self.pending_reclaim.as_ref()?;
         Some(PendingNodeReclaim { owner: self })
+    }
+
+    /// Transfers one exact post-cleanup graph acknowledgement to the unique lifecycle driver.
+    ///
+    /// Unlike [`PendingNodeReclaim`], this token does not borrow the id owner, so a bounded
+    /// lifetime registry can retain an early acknowledgement in its matching generation slot and
+    /// continue draining later acknowledgements. The token exposes no raw node and deliberately
+    /// leaks it if dropped without an explicit successful reconciliation.
+    pub(crate) fn try_take_pending_reclaim(&mut self) -> Option<OwnedPendingNodeReclaim> {
+        let node = self
+            .pending_reclaim
+            .take()
+            .or_else(|| self.graph_reclaims.pop())?;
+        Some(OwnedPendingNodeReclaim {
+            node: Some(node),
+            identity: self.identity(),
+        })
+    }
+
+    /// Destroys an exact acknowledgement off RT after whole-graph retirement proves that this
+    /// context will never reuse the id.
+    pub(crate) fn discard_after_whole_graph(
+        &mut self,
+        mut pending: OwnedPendingNodeReclaim,
+    ) -> Result<(), OwnedPendingNodeReclaim> {
+        if !self.identity().ptr_eq(&pending.identity) {
+            return Err(pending);
+        }
+        drop(
+            pending
+                .node
+                .take()
+                .expect("owned pending reclaim is consumed exactly once"),
+        );
+        Ok(())
     }
 
     #[cfg(test)]
@@ -367,6 +423,34 @@ impl InjectedNodeIdOwner {
             .release_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entered, release));
+    }
+}
+
+/// Opaque owned post-cleanup graph acknowledgement.
+///
+/// Only the unique [`InjectedNodeIdOwner`] can construct one or make its exact intrusive node
+/// available. Dropping an unreconciled token intentionally leaks that node, preventing accidental
+/// id reuse after a registry mismatch, cleanup failure, or lifecycle quarantine.
+#[must_use = "an owned reclaim must be reconciled or explicitly retained in quarantine"]
+pub(crate) struct OwnedPendingNodeReclaim {
+    node: Option<llq::Node<AudioNodeId>>,
+    identity: InjectedNodeIdIdentity,
+}
+
+impl OwnedPendingNodeReclaim {
+    pub(crate) fn id(&self) -> AudioNodeId {
+        **self
+            .node
+            .as_ref()
+            .expect("owned pending reclaim retains its exact node")
+    }
+}
+
+impl Drop for OwnedPendingNodeReclaim {
+    fn drop(&mut self) {
+        if let Some(node) = self.node.take() {
+            std::mem::forget(node);
+        }
     }
 }
 
