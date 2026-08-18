@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use crossbeam_channel::Receiver;
 
@@ -104,6 +105,13 @@ pub(crate) struct EventDispatch {
 }
 
 impl EventDispatch {
+    fn is_closed_state_change(&self) -> bool {
+        matches!(
+            self.payload,
+            EventPayload::AudioContextState(AudioContextState::Closed)
+        )
+    }
+
     pub(crate) fn control_batch_activity() -> Self {
         EventDispatch {
             type_: EventType::ControlBatchActivity,
@@ -186,6 +194,123 @@ pub(crate) struct EventLoop {
     event_recv: Receiver<EventDispatch>,
     event_handlers: Arc<Mutex<HashMap<EventType, EventHandler>>>,
     event_activity_handler: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
+}
+
+#[derive(Clone, Copy)]
+enum EventLoopStop {
+    Graceful,
+    Silent,
+}
+
+/// Confirmed reason that a lifecycle-owned event-loop thread exited.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // consumed by the pending context lifecycle integration
+pub(crate) enum EventLoopExit {
+    /// Queued records were drained and one final `Closed` state change was dispatched.
+    Graceful,
+    /// The thread stopped without draining or dispatching another public event.
+    Silent,
+}
+
+/// Join failure for the lifecycle-owned event-loop thread.
+#[allow(dead_code)] // consumed by the pending context lifecycle integration
+pub(crate) enum EventLoopJoinError {
+    /// Joining the current thread would deadlock.
+    CurrentThread,
+    /// The dedicated stop authority disappeared without selecting a stop mode.
+    StopChannelDisconnected,
+    /// An event handler panicked. The original payload is retained for lifecycle diagnostics.
+    Panicked(Box<dyn Any + Send + 'static>),
+}
+
+impl std::fmt::Debug for EventLoopJoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CurrentThread => f.write_str("EventLoopJoinError::CurrentThread"),
+            Self::StopChannelDisconnected => {
+                f.write_str("EventLoopJoinError::StopChannelDisconnected")
+            }
+            Self::Panicked(_) => f.write_str("EventLoopJoinError::Panicked(..)"),
+        }
+    }
+}
+
+/// Lifecycle owner for a joinable event-loop thread.
+///
+/// Stop requests use a dedicated bounded channel, independent of the best-effort Web Audio event
+/// queue. Requesting stop is not an acknowledgement; only [`Self::join`] proves that no callback
+/// from this event thread remains or can begin. A successful join does not prove destruction of
+/// handlers or queued payloads retained by other [`EventLoop`] or receiver clones. This owner is
+/// `Send`, so a lifecycle worker may request stop and move it to a different thread for the join.
+#[allow(dead_code)] // consumed by the pending context lifecycle integration
+pub(crate) struct JoinableEventLoop {
+    stop_send: crossbeam_channel::Sender<EventLoopStop>,
+    join: Option<JoinHandle<Result<EventLoopExit, EventLoopJoinError>>>,
+    stop_requested: bool,
+}
+
+#[allow(dead_code)] // consumed by the pending context lifecycle integration
+impl JoinableEventLoop {
+    /// Requests an ordered graceful stop.
+    ///
+    /// Render and control producers must already be quiescent. The event thread drains records
+    /// already in the queue, coalescing any real `Closed` records, then dispatches exactly one
+    /// final `Closed` state change. Establishing producer quiescence belongs to the pending context
+    /// lifecycle integration. Call [`Self::join`] for retirement acknowledgement.
+    pub(crate) fn request_graceful_stop(&mut self) {
+        self.request_stop(EventLoopStop::Graceful);
+    }
+
+    /// Requests a silent stop without draining or dispatching another queued or synthetic event.
+    ///
+    /// Event producers should already be quiescent. Call [`Self::join`] for retirement
+    /// acknowledgement.
+    pub(crate) fn request_silent_stop(&mut self) {
+        self.request_stop(EventLoopStop::Silent);
+    }
+
+    fn request_stop(&mut self, mode: EventLoopStop) {
+        if self.stop_requested {
+            return;
+        }
+        self.stop_requested = true;
+
+        // There is one sender and at most one request, so a live receiver always has capacity.
+        // Disconnection means the thread already exited naturally or panicked; join remains the
+        // authoritative outcome in either case.
+        match self.stop_send.try_send(mode) {
+            Ok(())
+            | Err(crossbeam_channel::TrySendError::Disconnected(_))
+            | Err(crossbeam_channel::TrySendError::Full(_)) => {}
+        }
+    }
+
+    /// Waits for event-thread retirement and returns its confirmed stop mode.
+    pub(crate) fn join(mut self) -> Result<EventLoopExit, EventLoopJoinError> {
+        let join = self
+            .join
+            .take()
+            .expect("joinable event loop owns one thread handle");
+        if join.thread().id() == std::thread::current().id() {
+            self.join = Some(join);
+            return Err(EventLoopJoinError::CurrentThread);
+        }
+
+        match join.join() {
+            Ok(result) => result,
+            Err(payload) => Err(EventLoopJoinError::Panicked(payload)),
+        }
+    }
+}
+
+impl Drop for JoinableEventLoop {
+    fn drop(&mut self) {
+        if self.join.is_some() {
+            // This merely commits a best-effort silent retirement request. Dropping JoinHandle
+            // detaches the thread; no acknowledgement is claimed by this path.
+            self.request_stop(EventLoopStop::Silent);
+        }
+    }
 }
 
 impl EventLoop {
@@ -277,6 +402,23 @@ impl EventLoop {
         });
     }
 
+    /// Starts a lifecycle-owned event thread that can be stopped and explicitly joined.
+    ///
+    /// This is separate from [`Self::run_in_thread`], whose detached legacy behavior is preserved.
+    #[allow(dead_code)] // consumed by the pending context lifecycle integration
+    pub(crate) fn run_joinable(&self) -> std::io::Result<JoinableEventLoop> {
+        let (stop_send, stop_recv) = crossbeam_channel::bounded(1);
+        let event_loop = self.clone();
+        let join = std::thread::Builder::new()
+            .name("web-audio-event-loop".to_owned())
+            .spawn(move || event_loop.run_with_stop(stop_recv))?;
+        Ok(JoinableEventLoop {
+            stop_send,
+            join: Some(join),
+            stop_requested: false,
+        })
+    }
+
     fn run(&self) {
         // This thread is dedicated to event handling, so we can block.
         for event in self.event_recv.iter() {
@@ -287,6 +429,66 @@ impl EventLoop {
         }
 
         log::debug!("Event loop has terminated");
+    }
+
+    fn run_with_stop(
+        &self,
+        stop_recv: Receiver<EventLoopStop>,
+    ) -> Result<EventLoopExit, EventLoopJoinError> {
+        log::debug!("Entering joinable event thread");
+
+        let mut event_queue_connected = true;
+        loop {
+            if !event_queue_connected {
+                let stop = stop_recv
+                    .recv()
+                    .map_err(|_| EventLoopJoinError::StopChannelDisconnected)?;
+                return Ok(self.finish_stop(stop));
+            }
+
+            crossbeam_channel::select_biased! {
+                recv(stop_recv) -> stop => {
+                    let stop = stop
+                        .map_err(|_| EventLoopJoinError::StopChannelDisconnected)?;
+                    return Ok(self.finish_stop(stop));
+                }
+                recv(self.event_recv) -> event => {
+                    match event {
+                        Ok(event) => {
+                            // A lossy real Closed record is not lifecycle authority. Coalesce it
+                            // and keep draining until the reliable stop channel selects a mode.
+                            if !event.is_closed_state_change() {
+                                let result = self.handle_event(event);
+                                debug_assert!(result.is_continue());
+                            }
+                        }
+                        Err(_) => event_queue_connected = false,
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_stop(&self, stop: EventLoopStop) -> EventLoopExit {
+        match stop {
+            EventLoopStop::Silent => EventLoopExit::Silent,
+            EventLoopStop::Graceful => {
+                // The lifecycle caller promises that producers are quiescent before requesting
+                // graceful stop, so reaching an empty queue is an authoritative drain boundary.
+                // Handler-reentrant records are also observed by this repeated try_recv loop.
+                while let Ok(event) = self.event_recv.try_recv() {
+                    if !event.is_closed_state_change() {
+                        let result = self.handle_event(event);
+                        debug_assert!(result.is_continue());
+                    }
+                }
+
+                let final_close = EventDispatch::state_change(AudioContextState::Closed);
+                let result = self.handle_event(final_close);
+                debug_assert!(result.is_break());
+                EventLoopExit::Graceful
+            }
+        }
     }
 
     pub fn set_handler(&self, event: EventType, callback: EventHandler) {
@@ -535,5 +737,310 @@ mod tests {
         assert!(done_recv.recv_timeout(Duration::from_secs(1)).is_ok());
         assert_eq!(activity_count.load(Ordering::Relaxed), 1);
         assert_eq!(close_handler_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn joinable_graceful_stop_synthesizes_lost_closed_exactly_once() {
+        let (event_send, event_recv) = crossbeam_channel::bounded(1);
+        event_send.send(EventDispatch::sink_change()).unwrap();
+        assert!(matches!(
+            event_send.try_send(EventDispatch::state_change(AudioContextState::Closed)),
+            Err(crossbeam_channel::TrySendError::Full(_))
+        ));
+
+        let event_loop = EventLoop::new(event_recv);
+        let queued_count = Arc::new(AtomicUsize::new(0));
+        let queued_count_clone = Arc::clone(&queued_count);
+        event_loop.set_handler(
+            EventType::SinkChange,
+            EventHandler::Once(Box::new(move |_| {
+                queued_count_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+        let close_count = Arc::new(AtomicUsize::new(0));
+        let close_count_clone = Arc::clone(&close_count);
+        event_loop.set_handler(
+            EventType::StateChange,
+            EventHandler::Multiple(Box::new(move |_| {
+                close_count_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+
+        let mut running = event_loop.run_joinable().unwrap();
+        running.request_graceful_stop();
+        let outcome = std::thread::spawn(move || running.join())
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, EventLoopExit::Graceful);
+
+        assert_eq!(queued_count.load(Ordering::Relaxed), 1);
+        assert_eq!(close_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn joinable_graceful_stop_drains_queued_events_before_final_closed() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        event_send.send(EventDispatch::sink_change()).unwrap();
+        event_send.send(EventDispatch::sink_change()).unwrap();
+
+        let event_loop = EventLoop::new(event_recv);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let event_order = Arc::clone(&order);
+        event_loop.set_handler(
+            EventType::SinkChange,
+            EventHandler::Multiple(Box::new(move |_| {
+                event_order.lock().unwrap().push("event");
+            })),
+        );
+        let close_order = Arc::clone(&order);
+        event_loop.set_handler(
+            EventType::StateChange,
+            EventHandler::Once(Box::new(move |_| {
+                close_order.lock().unwrap().push("closed");
+            })),
+        );
+
+        let mut running = event_loop.run_joinable().unwrap();
+        running.request_graceful_stop();
+        assert_eq!(running.join().unwrap(), EventLoopExit::Graceful);
+
+        assert_eq!(*order.lock().unwrap(), ["event", "event", "closed"]);
+    }
+
+    #[test]
+    fn joinable_closed_is_deferred_until_queued_sentinel_is_dispatched() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        event_send
+            .send(EventDispatch::state_change(AudioContextState::Closed))
+            .unwrap();
+        event_send.send(EventDispatch::sink_change()).unwrap();
+
+        let event_loop = EventLoop::new(event_recv);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let sentinel_order = Arc::clone(&order);
+        event_loop.set_handler(
+            EventType::SinkChange,
+            EventHandler::Once(Box::new(move |_| {
+                sentinel_order.lock().unwrap().push("sentinel");
+            })),
+        );
+        let close_order = Arc::clone(&order);
+        event_loop.set_handler(
+            EventType::StateChange,
+            EventHandler::Once(Box::new(move |_| {
+                close_order.lock().unwrap().push("closed");
+            })),
+        );
+
+        let mut running = event_loop.run_joinable().unwrap();
+        running.request_graceful_stop();
+        assert_eq!(running.join().unwrap(), EventLoopExit::Graceful);
+
+        assert_eq!(*order.lock().unwrap(), ["sentinel", "closed"]);
+    }
+
+    #[test]
+    fn joinable_duplicate_closed_records_are_coalesced() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        event_send
+            .send(EventDispatch::state_change(AudioContextState::Closed))
+            .unwrap();
+        event_send
+            .send(EventDispatch::state_change(AudioContextState::Closed))
+            .unwrap();
+
+        let event_loop = EventLoop::new(event_recv);
+        let close_count = Arc::new(AtomicUsize::new(0));
+        let close_count_clone = Arc::clone(&close_count);
+        event_loop.set_handler(
+            EventType::StateChange,
+            EventHandler::Multiple(Box::new(move |_| {
+                close_count_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+
+        let mut running = event_loop.run_joinable().unwrap();
+        running.request_graceful_stop();
+        assert_eq!(running.join().unwrap(), EventLoopExit::Graceful);
+
+        assert_eq!(close_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn joinable_graceful_drain_includes_handler_reentrant_records() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        event_send.send(EventDispatch::sink_change()).unwrap();
+
+        let event_loop = EventLoop::new(event_recv);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let reentrant_send = event_send.clone();
+        let first_order = Arc::clone(&order);
+        event_loop.set_handler(
+            EventType::SinkChange,
+            EventHandler::Once(Box::new(move |_| {
+                first_order.lock().unwrap().push("first");
+                reentrant_send
+                    .send(EventDispatch::ended(AudioNodeId(42)))
+                    .unwrap();
+            })),
+        );
+        let reentrant_order = Arc::clone(&order);
+        event_loop.set_handler(
+            EventType::Ended(AudioNodeId(42)),
+            EventHandler::Once(Box::new(move |_| {
+                reentrant_order.lock().unwrap().push("reentrant");
+            })),
+        );
+        let close_order = Arc::clone(&order);
+        event_loop.set_handler(
+            EventType::StateChange,
+            EventHandler::Once(Box::new(move |_| {
+                close_order.lock().unwrap().push("closed");
+            })),
+        );
+
+        let mut running = event_loop.run_joinable().unwrap();
+        running.request_graceful_stop();
+        assert_eq!(running.join().unwrap(), EventLoopExit::Graceful);
+
+        assert_eq!(*order.lock().unwrap(), ["first", "reentrant", "closed"]);
+    }
+
+    #[test]
+    fn joinable_disconnected_queue_waits_for_explicit_stop_mode() {
+        for graceful in [true, false] {
+            let (event_send, event_recv) = crossbeam_channel::unbounded();
+            let event_loop = EventLoop::new(event_recv);
+            let close_count = Arc::new(AtomicUsize::new(0));
+            let close_count_clone = Arc::clone(&close_count);
+            event_loop.set_handler(
+                EventType::StateChange,
+                EventHandler::Once(Box::new(move |_| {
+                    close_count_clone.fetch_add(1, Ordering::Relaxed);
+                })),
+            );
+            drop(event_send);
+
+            let mut running = event_loop.run_joinable().unwrap();
+            let expected = if graceful {
+                running.request_graceful_stop();
+                EventLoopExit::Graceful
+            } else {
+                running.request_silent_stop();
+                EventLoopExit::Silent
+            };
+            assert_eq!(running.join().unwrap(), expected);
+            assert_eq!(close_count.load(Ordering::Relaxed), usize::from(graceful));
+        }
+    }
+
+    #[test]
+    fn joinable_silent_stop_dispatches_nothing_and_leaves_payload_queued() {
+        struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        let event_loop = EventLoop::new(event_recv);
+        let dispatch_count = Arc::new(AtomicUsize::new(0));
+        let dispatch_count_clone = Arc::clone(&dispatch_count);
+        event_loop.set_activity_handler(move || {
+            dispatch_count_clone.fetch_add(1, Ordering::Relaxed);
+        });
+        let payload_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut running = event_loop.run_joinable().unwrap();
+        running.request_silent_stop();
+        event_send
+            .send(EventDispatch::message(
+                AudioNodeId(42),
+                Box::new(DropProbe(Arc::clone(&payload_dropped))),
+            ))
+            .unwrap();
+        assert_eq!(running.join().unwrap(), EventLoopExit::Silent);
+
+        assert_eq!(dispatch_count.load(Ordering::Relaxed), 0);
+        assert!(!payload_dropped.load(Ordering::Acquire));
+        drop(event_send);
+        drop(event_loop);
+        assert!(payload_dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn joinable_join_surfaces_targeted_handler_panic() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        let event_loop = EventLoop::new(event_recv);
+        event_loop.set_handler(
+            EventType::SinkChange,
+            EventHandler::Once(Box::new(move |_| {
+                panic!("joinable event handler panic");
+            })),
+        );
+        event_send.send(EventDispatch::sink_change()).unwrap();
+
+        let error = event_loop.run_joinable().unwrap().join().unwrap_err();
+        let EventLoopJoinError::Panicked(payload) = error else {
+            panic!("event loop reported self-join instead of handler panic");
+        };
+        assert_eq!(
+            payload.downcast_ref::<&'static str>(),
+            Some(&"joinable event handler panic")
+        );
+    }
+
+    #[test]
+    fn joinable_self_join_is_rejected_without_deadlock() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        let event_loop = EventLoop::new(event_recv);
+        let owner = Arc::new(Mutex::new(None::<JoinableEventLoop>));
+        let owner_for_handler = Arc::clone(&owner);
+        let (result_send, result_recv) = crossbeam_channel::bounded(1);
+        event_loop.set_handler(
+            EventType::SinkChange,
+            EventHandler::Once(Box::new(move |_| {
+                let running = owner_for_handler.lock().unwrap().take().unwrap();
+                result_send
+                    .send(matches!(
+                        running.join(),
+                        Err(EventLoopJoinError::CurrentThread)
+                    ))
+                    .unwrap();
+            })),
+        );
+
+        *owner.lock().unwrap() = Some(event_loop.run_joinable().unwrap());
+        event_send.send(EventDispatch::sink_change()).unwrap();
+
+        assert_eq!(result_recv.recv_timeout(Duration::from_secs(1)), Ok(true));
+    }
+
+    #[test]
+    fn dropping_joinable_owner_requests_silent_stop_without_acknowledging_it() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        let event_loop = EventLoop::new(event_recv);
+        let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+        let (release_send, release_recv) = crossbeam_channel::bounded(1);
+        let (finished_send, finished_recv) = crossbeam_channel::bounded(1);
+        event_loop.set_handler(
+            EventType::SinkChange,
+            EventHandler::Once(Box::new(move |_| {
+                entered_send.send(()).unwrap();
+                release_recv.recv().unwrap();
+                finished_send.send(()).unwrap();
+            })),
+        );
+        event_send.send(EventDispatch::sink_change()).unwrap();
+
+        let running = event_loop.run_joinable().unwrap();
+        entered_recv.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(running);
+        assert!(finished_recv.try_recv().is_err());
+        release_send.send(()).unwrap();
+        finished_recv.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 }
