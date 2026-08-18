@@ -1,23 +1,29 @@
 //! Host-supplied audio output contracts.
 //!
 //! This module is an additive API foundation. [`AudioContext`](crate::context::AudioContext)
-//! does not invoke these traits yet, and this module does not expose render-thread storage or
-//! implement endpoint ownership. Context-level shutdown acknowledgment, callback retirement,
-//! reclamation, and thread joins belong to later lifecycle work.
+//! does not invoke these traits yet, and render-thread storage remains private. It includes the
+//! internal callback/owner retirement gate and joinable render-reclamation seam. The context-owned
+//! lifecycle controller, injected constructor, authoritative context receipt, and endpoint wiring
+//! belong to later lifecycle work.
 
-use std::cell::Cell;
+use std::any::Any;
+use std::cell::{Cell, UnsafeCell};
 use std::error::Error;
 use std::fmt;
 use std::future::{ready, Future};
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
+use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::context::{AudioContextLatencyCategory, AudioContextRenderSizeCategory};
+use crate::render::RenderThread;
 use crate::{is_valid_sample_rate, MAX_CHANNELS};
 
 /// Hard upper bound for frames supplied to one injected output callback invocation.
@@ -375,8 +381,8 @@ impl Error for AudioOutputError {}
 #[non_exhaustive]
 #[repr(u8)]
 pub enum AudioOutputDeathReason {
-    /// The render callback returned [`AudioRenderStatus::Stop`].
-    CallbackStopped = 1,
+    /// The endpoint dropped a still-open callback without controller-initiated shutdown.
+    CallbackRetiredUnexpectedly = 1,
     /// The callback panicked and was converted to silence.
     CallbackPanicked = 2,
     /// The physical or logical device became unavailable.
@@ -385,16 +391,19 @@ pub enum AudioOutputDeathReason {
     BackendFailure = 4,
     /// The factory or its shared endpoint was shut down.
     FactoryShutdown = 5,
+    /// The endpoint supplied a buffer that violated the negotiated render format.
+    CallbackProtocolViolation = 6,
 }
 
 impl AudioOutputDeathReason {
     fn from_u8(value: u8) -> Option<Self> {
         Some(match value {
-            1 => Self::CallbackStopped,
+            1 => Self::CallbackRetiredUnexpectedly,
             2 => Self::CallbackPanicked,
             3 => Self::DeviceUnavailable,
             4 => Self::BackendFailure,
             5 => Self::FactoryShutdown,
+            6 => Self::CallbackProtocolViolation,
             _ => return None,
         })
     }
@@ -521,6 +530,256 @@ pub enum AudioRenderStatus {
     Stop,
 }
 
+const RENDER_GATE_OPEN: u8 = 0;
+const RENDER_GATE_ACTIVE: u8 = 1;
+const RENDER_GATE_CLOSED: u8 = 2;
+const RENDER_GATE_CLOSED_ACTIVE: u8 = RENDER_GATE_CLOSED | RENDER_GATE_ACTIVE;
+
+#[allow(dead_code)] // exercised by tests; production use begins with injected lifecycle wiring
+trait AudioRenderDriver: Send + 'static {
+    fn render_interleaved_f32(&mut self, output: &mut [f32]);
+
+    fn reclaim_off_thread(self: Box<Self>) -> Result<(), AudioOutputError>;
+}
+
+#[allow(dead_code)] // constructed by audio_render_thread_pair in the pending lifecycle slice
+struct RenderThreadDriver {
+    renderer: Option<RenderThread>,
+    garbage_collector_join: JoinHandle<()>,
+}
+
+impl AudioRenderDriver for RenderThreadDriver {
+    fn render_interleaved_f32(&mut self, output: &mut [f32]) {
+        self.renderer
+            .as_mut()
+            .expect("render thread driver retains its renderer until reclamation")
+            .render(output);
+    }
+
+    fn reclaim_off_thread(self: Box<Self>) -> Result<(), AudioOutputError> {
+        let Self {
+            mut renderer,
+            garbage_collector_join,
+        } = *self;
+        let mut failed = false;
+        if let Some(mut renderer) = renderer.take() {
+            failed |=
+                panic::catch_unwind(AssertUnwindSafe(|| renderer.prepare_for_reclaim())).is_err();
+            failed |= panic::catch_unwind(AssertUnwindSafe(|| drop(renderer))).is_err();
+        }
+        failed |= garbage_collector_join.join().is_err();
+
+        if failed {
+            Err(AudioOutputError::new(
+                AudioOutputErrorKind::Shutdown,
+                "audio renderer or garbage collector panicked during reclamation",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The render driver and a panic payload are manually retired by [`AudioRenderOwner`].
+///
+/// # Safety invariant
+///
+/// The callback is the only code allowed to enter `renderer`. The owner may take either
+/// `UnsafeCell` only after endpoint shutdown, `Arc::try_unwrap` proves that the callback object was
+/// destroyed, and the combined gate is closed with no in-flight callback.
+struct RenderSlot {
+    gate: AtomicU8,
+    renderer: UnsafeCell<ManuallyDrop<Option<Box<dyn AudioRenderDriver>>>>,
+    panic_payload: UnsafeCell<ManuallyDrop<Option<Box<dyn Any + Send>>>>,
+    events: AudioOutputEventSink,
+}
+
+// SAFETY: `renderer` has exactly one callback-side accessor, protected by the combined gate.
+// Owner-side access is allowed only after endpoint shutdown, Arc uniqueness, and CLOSED/zero.
+// `panic_payload` is written by that same callback before its in-flight Release and is read only
+// by the uniquely owning reclaimer after an Acquire load observes CLOSED/zero.
+unsafe impl Sync for RenderSlot {}
+
+impl RenderSlot {
+    fn close(&self) -> u8 {
+        self.gate.fetch_or(RENDER_GATE_CLOSED, Ordering::AcqRel)
+    }
+
+    fn try_enter(&self) -> Option<RenderInFlight<'_>> {
+        self.gate
+            .compare_exchange(
+                RENDER_GATE_OPEN,
+                RENDER_GATE_ACTIVE,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .ok()
+            .map(|_| RenderInFlight { gate: &self.gate })
+    }
+
+    fn store_panic_payload(&self, payload: Box<dyn Any + Send>) {
+        // SAFETY: only the unique, non-Sync callback can write this slot. It closes the gate on
+        // the first panic, so the payload is written at most once. The owner reads it only after
+        // callback retirement and Arc uniqueness.
+        unsafe {
+            *self.panic_payload.get() = ManuallyDrop::new(Some(payload));
+        }
+    }
+}
+
+struct RenderInFlight<'a> {
+    gate: &'a AtomicU8,
+}
+
+impl Drop for RenderInFlight<'_> {
+    fn drop(&mut self) {
+        let previous = self.gate.fetch_and(!RENDER_GATE_ACTIVE, Ordering::Release);
+        debug_assert!(matches!(
+            previous,
+            RENDER_GATE_ACTIVE | RENDER_GATE_CLOSED_ACTIVE
+        ));
+    }
+}
+
+/// Crate-owned lifetime authority for an [`AudioRenderCallback`].
+///
+/// Dropping this value without confirmed reclamation intentionally leaks its slot. That
+/// fail-closed behavior prevents a retained or concurrently executing callback from observing
+/// freed render state.
+pub(crate) struct AudioRenderOwner {
+    slot: Option<Arc<RenderSlot>>,
+}
+
+impl fmt::Debug for AudioRenderOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let slot = self.slot.as_ref();
+        f.debug_struct("AudioRenderOwner")
+            .field("gate", &slot.map(|slot| slot.gate.load(Ordering::Acquire)))
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code)] // exercised by tests; production use begins with injected lifecycle wiring
+impl AudioRenderOwner {
+    pub(crate) fn begin_shutdown(&self) {
+        if let Some(slot) = &self.slot {
+            slot.close();
+        }
+    }
+
+    /// Reclaims render resources after endpoint-local shutdown has confirmed.
+    ///
+    /// `EndpointShutdownConfirmed` promises that the endpoint destroyed the callback object. The
+    /// subsequent `Arc::try_unwrap` is the unforgeable local proof of that promise. On any
+    /// ambiguous callback state, ownership is returned for explicit quarantine. Dropping that
+    /// returned owner is also safe because its Drop implementation leaks the render slot.
+    pub(crate) fn try_reclaim_after_shutdown(
+        mut self,
+        _confirmed: EndpointShutdownConfirmed,
+    ) -> Result<Result<(), AudioOutputError>, Self> {
+        let slot = self.slot.take().expect("render owner is single-use");
+        let slot = match Arc::try_unwrap(slot) {
+            Ok(slot) => slot,
+            Err(slot) => {
+                self.slot = Some(slot);
+                return Err(self);
+            }
+        };
+        if slot.gate.load(Ordering::Acquire) != RENDER_GATE_CLOSED {
+            self.slot = Some(Arc::new(slot));
+            return Err(self);
+        }
+
+        // SAFETY: endpoint confirmation, Arc uniqueness, and CLOSED/zero jointly prove that no
+        // callback exists, can enter, or retains access to these manually managed values.
+        let renderer = unsafe { ManuallyDrop::take(&mut *slot.renderer.get()) };
+        // SAFETY: the panic payload uses the same callback-to-owner handoff as `renderer`.
+        let panic_payload = unsafe { ManuallyDrop::take(&mut *slot.panic_payload.get()) };
+        drop(slot);
+
+        let renderer_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            renderer.map_or(Ok(()), |renderer| renderer.reclaim_off_thread())
+        }))
+        .unwrap_or_else(|_| {
+            Err(AudioOutputError::new(
+                AudioOutputErrorKind::Shutdown,
+                "audio renderer panicked during off-thread reclamation",
+            ))
+        });
+        let panic_drop_result = panic::catch_unwind(AssertUnwindSafe(|| drop(panic_payload)))
+            .map_err(|_| {
+                AudioOutputError::new(
+                    AudioOutputErrorKind::Shutdown,
+                    "audio callback panic payload panicked while being reclaimed",
+                )
+            });
+
+        Ok(renderer_result.and(panic_drop_result))
+    }
+}
+
+impl Drop for AudioRenderOwner {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            // A missing endpoint acknowledgement, retained callback, lifecycle cancellation, or
+            // controller panic is ambiguous. Leaking is the only generally safe fallback.
+            std::mem::forget(slot);
+        }
+    }
+}
+
+/// Proof that endpoint-local shutdown completed successfully.
+///
+/// Only the future lifecycle controller may construct this marker from an `Ok` endpoint receipt.
+/// Such a receipt must guarantee no future or in-flight calls and destruction of the callback
+/// object that was passed to the endpoint.
+pub(crate) struct EndpointShutdownConfirmed(());
+
+impl EndpointShutdownConfirmed {
+    #[allow(dead_code)] // constructed by the pending lifecycle controller
+    pub(crate) const fn new() -> Self {
+        Self(())
+    }
+}
+
+fn audio_render_pair(
+    format: AudioRenderFormat,
+    renderer: Box<dyn AudioRenderDriver>,
+    events: AudioOutputEventSink,
+) -> (AudioRenderOwner, AudioRenderCallback) {
+    let slot = Arc::new(RenderSlot {
+        gate: AtomicU8::new(RENDER_GATE_OPEN),
+        renderer: UnsafeCell::new(ManuallyDrop::new(Some(renderer))),
+        panic_payload: UnsafeCell::new(ManuallyDrop::new(None)),
+        events,
+    });
+    let callback = AudioRenderCallback {
+        format,
+        slot: Arc::clone(&slot),
+        not_sync: PhantomData,
+    };
+    (AudioRenderOwner { slot: Some(slot) }, callback)
+}
+
+#[allow(dead_code)] // invoked by the pending context lifecycle integration
+pub(crate) fn audio_render_thread_pair(
+    format: AudioRenderFormat,
+    mut renderer: RenderThread,
+    events: AudioOutputEventSink,
+) -> (AudioRenderOwner, AudioRenderCallback) {
+    let garbage_collector_join = renderer
+        .spawn_joinable_garbage_collector_thread()
+        .expect("injected renderer must not already own a garbage collector");
+    audio_render_pair(
+        format,
+        Box::new(RenderThreadDriver {
+            renderer: Some(renderer),
+            garbage_collector_join,
+        }),
+        events,
+    )
+}
+
 /// Opaque, single-owner callback for one independent context.
 ///
 /// It is `Send`, but deliberately neither `Sync` nor `Clone`:
@@ -537,11 +796,12 @@ pub enum AudioRenderStatus {
 /// assert_clone::<AudioRenderCallback>();
 /// ```
 ///
-/// This foundation deliberately exposes no callback invocation. A later lifecycle slice will
-/// replace this format-only placeholder with bounded render storage and a `RenderSlot`; panic
-/// payloads and retired renderer ownership must then move to off-real-time reclamation.
+/// Dropping the callback only closes its atomic gate and drops its memory lease. The renderer and
+/// any captured panic payload are reclaimed exclusively by the crate-owned lifecycle authority
+/// after endpoint shutdown is confirmed and `Arc::try_unwrap` proves callback destruction.
 pub struct AudioRenderCallback {
     format: AudioRenderFormat,
+    slot: Arc<RenderSlot>,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -549,6 +809,10 @@ impl fmt::Debug for AudioRenderCallback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AudioRenderCallback")
             .field("format", &self.format)
+            .field(
+                "closed",
+                &(self.slot.gate.load(Ordering::Acquire) & RENDER_GATE_CLOSED != 0),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -560,11 +824,74 @@ impl AudioRenderCallback {
         self.format
     }
 
-    #[allow(dead_code)] // constructed by the pending RenderSlot integration
-    pub(crate) const fn new(format: AudioRenderFormat) -> Self {
-        Self {
-            format,
-            not_sync: PhantomData,
+    /// Renders interleaved `f32` samples in the negotiated logical format.
+    ///
+    /// An empty, non-frame-aligned, or oversized buffer is a terminal protocol violation. Any
+    /// terminal call fills the entire supplied buffer with silence. Panics from the renderer are
+    /// contained, converted to silence, and retained for off-real-time reclamation.
+    #[must_use]
+    pub fn render_interleaved_f32(&mut self, output: &mut [f32]) -> AudioRenderStatus {
+        let channels = self.format.number_of_channels();
+        let valid = !output.is_empty()
+            && output.len() % channels == 0
+            && (output.len() / channels) <= self.format.max_frames_per_callback();
+        if !valid {
+            self.slot.close();
+            output.fill(0.);
+            let _ = self
+                .slot
+                .events
+                .report_endpoint_death(AudioOutputDeathReason::CallbackProtocolViolation);
+            return AudioRenderStatus::Stop;
+        }
+
+        let Some(_in_flight) = self.slot.try_enter() else {
+            output.fill(0.);
+            return AudioRenderStatus::Stop;
+        };
+
+        // SAFETY: `AudioRenderCallback` is non-Clone and non-Sync, and the combined gate grants
+        // this invocation exclusive callback-side access. Owner access is forbidden until the
+        // callback retires and the gate reaches CLOSED/zero.
+        let renderer = unsafe { &mut *self.slot.renderer.get() };
+        let Some(renderer) = renderer.as_mut() else {
+            self.slot.close();
+            output.fill(0.);
+            let _ = self
+                .slot
+                .events
+                .report_endpoint_death(AudioOutputDeathReason::BackendFailure);
+            return AudioRenderStatus::Stop;
+        };
+        match panic::catch_unwind(AssertUnwindSafe(|| {
+            renderer.render_interleaved_f32(output);
+        })) {
+            Ok(()) => AudioRenderStatus::Continue,
+            Err(payload) => {
+                self.slot.store_panic_payload(payload);
+                self.slot.close();
+                output.fill(0.);
+                let _ = self
+                    .slot
+                    .events
+                    .report_endpoint_death(AudioOutputDeathReason::CallbackPanicked);
+                AudioRenderStatus::Stop
+            }
+        }
+    }
+}
+
+impl Drop for AudioRenderCallback {
+    fn drop(&mut self) {
+        let was_open = self.slot.close() & RENDER_GATE_CLOSED == 0;
+        if was_open {
+            // This is an unexpected endpoint-side callback retirement. The owner owns (or has
+            // deliberately leaked) the other Arc, so normal field destruction below cannot
+            // final-drop callback resources.
+            let _ = self
+                .slot
+                .events
+                .report_endpoint_death(AudioOutputDeathReason::CallbackRetiredUnexpectedly);
         }
     }
 }
@@ -672,9 +999,12 @@ impl Error for AudioOutputStartFailure {
 
 /// Single-owner future awaiting already-committed endpoint-local shutdown work.
 ///
-/// This future is intentionally not cloneable and does not certify context shutdown. A later
-/// crate-owned lifecycle controller will retain and poll it, then create an authoritative context
-/// receipt only after callback retirement, reclamation gates, and thread joins are confirmed.
+/// `Ok(())` certifies that the endpoint destroyed the [`AudioRenderCallback`] passed to `start`,
+/// no callback invocation remains in flight, and no future callback invocation can begin. (For a
+/// prepared endpoint that never received a callback, this condition is vacuous.) The future is
+/// intentionally not cloneable and does not certify context shutdown. A later crate-owned
+/// lifecycle controller will retain and poll it, then create an authoritative context receipt
+/// only after render-state reclamation and context-thread joins are also confirmed.
 #[must_use = "endpoint-local shutdown does not run to completion unless this future is polled"]
 pub struct AudioOutputEndpointShutdown {
     future: Pin<Box<dyn Future<Output = Result<(), AudioOutputError>> + Send + 'static>>,
@@ -696,7 +1026,9 @@ impl AudioOutputEndpointShutdown {
     /// Wraps endpoint-local asynchronous retirement work.
     ///
     /// Endpoint implementations must synchronously commit to accepting no new work before
-    /// constructing or returning this future.
+    /// constructing or returning this future. The future may resolve to `Ok(())` only after any
+    /// installed [`AudioRenderCallback`] object has been destroyed and no invocation remains in
+    /// flight.
     pub fn from_future<F>(future: F) -> Self
     where
         F: Future<Output = Result<(), AudioOutputError>> + Send + 'static,
@@ -717,7 +1049,12 @@ impl Future for AudioOutputEndpointShutdown {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::panic_any;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, SyncSender};
+    use std::sync::Arc;
     use std::task::Poll;
+    use std::thread::{self, ThreadId};
 
     use futures_util::task::noop_waker;
 
@@ -748,6 +1085,71 @@ mod tests {
             AudioContextRenderSizeCategory::Default,
             Some("output test".to_string()),
         )
+    }
+
+    type InstrumentedRender = Box<dyn FnMut(&mut [f32]) + Send>;
+
+    struct InstrumentedDriver {
+        render: InstrumentedRender,
+        dropped: Option<SyncSender<ThreadId>>,
+    }
+
+    impl AudioRenderDriver for InstrumentedDriver {
+        fn render_interleaved_f32(&mut self, output: &mut [f32]) {
+            (self.render)(output);
+        }
+
+        fn reclaim_off_thread(self: Box<Self>) -> Result<(), AudioOutputError> {
+            drop(self);
+            Ok(())
+        }
+    }
+
+    impl Drop for InstrumentedDriver {
+        fn drop(&mut self) {
+            if let Some(sender) = self.dropped.take() {
+                let _ = sender.send(thread::current().id());
+            }
+        }
+    }
+
+    struct DropThreadProbe(SyncSender<ThreadId>);
+
+    impl Drop for DropThreadProbe {
+        fn drop(&mut self) {
+            let _ = self.0.send(thread::current().id());
+        }
+    }
+
+    fn instrumented_pair<F>(
+        render: F,
+        dropped: Option<SyncSender<ThreadId>>,
+    ) -> (
+        AudioRenderOwner,
+        AudioRenderCallback,
+        AudioOutputEventWatcher,
+    )
+    where
+        F: FnMut(&mut [f32]) + Send + 'static,
+    {
+        let (events, watcher) = AudioOutputEventSink::bounded(1);
+        let (owner, callback) = audio_render_pair(
+            format(),
+            Box::new(InstrumentedDriver {
+                render: Box::new(render),
+                dropped,
+            }),
+            events,
+        );
+        (owner, callback, watcher)
+    }
+
+    fn confirmed_reclaim(owner: AudioRenderOwner) -> Result<(), AudioOutputError> {
+        owner.begin_shutdown();
+        match owner.try_reclaim_after_shutdown(EndpointShutdownConfirmed::new()) {
+            Ok(result) => result,
+            Err(_) => panic!("confirmed endpoint did not retire its callback"),
+        }
     }
 
     #[test]
@@ -843,10 +1245,210 @@ mod tests {
     }
 
     #[test]
-    fn callback_placeholder_is_send_and_exposes_only_its_format() {
+    fn callback_is_send_and_exposes_its_format() {
         fn assert_send<T: Send>() {}
         assert_send::<AudioRenderCallback>();
-        assert_eq!(AudioRenderCallback::new(format()).format(), format());
+
+        let (owner, callback, _) = instrumented_pair(|_| {}, None);
+        assert_eq!(callback.format(), format());
+        owner.begin_shutdown();
+        drop(callback);
+        confirmed_reclaim(owner).unwrap();
+    }
+
+    #[test]
+    fn successful_callback_is_allocation_free() {
+        let (owner, mut callback, _) = instrumented_pair(|output| output.fill(0.25), None);
+        let mut output = [0.; 16];
+        let mut status = AudioRenderStatus::Stop;
+        alloc_counter::deny_alloc(|| {
+            status = callback.render_interleaved_f32(&mut output);
+        });
+        assert_eq!(status, AudioRenderStatus::Continue);
+        assert_eq!(output, [0.25; 16]);
+
+        owner.begin_shutdown();
+        drop(callback);
+        confirmed_reclaim(owner).unwrap();
+    }
+
+    #[test]
+    fn protocol_violations_silence_the_entire_buffer_and_close() {
+        for length in [0, 3, 258] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_for_render = Arc::clone(&calls);
+            let (owner, mut callback, watcher) = instrumented_pair(
+                move |_| {
+                    calls_for_render.fetch_add(1, Ordering::Relaxed);
+                },
+                None,
+            );
+            let mut output = vec![1.; length];
+            assert_eq!(
+                callback.render_interleaved_f32(&mut output),
+                AudioRenderStatus::Stop
+            );
+            assert!(output.iter().all(|&sample| sample == 0.));
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                watcher.death_reason(),
+                Some(AudioOutputDeathReason::CallbackProtocolViolation)
+            );
+
+            let mut valid_output = [1.; 4];
+            assert_eq!(
+                callback.render_interleaved_f32(&mut valid_output),
+                AudioRenderStatus::Stop
+            );
+            assert_eq!(valid_output, [0.; 4]);
+            drop(callback);
+            confirmed_reclaim(owner).unwrap();
+        }
+    }
+
+    #[test]
+    fn close_during_entry_waits_for_the_active_callback() {
+        let (entered_send, entered_recv) = mpsc::sync_channel(0);
+        let (release_send, release_recv) = mpsc::sync_channel(0);
+        let (owner, mut callback, _) = instrumented_pair(
+            move |output| {
+                entered_send.send(()).unwrap();
+                release_recv.recv().unwrap();
+                output.fill(0.5);
+            },
+            None,
+        );
+
+        let callback_thread = thread::spawn(move || {
+            let mut output = [0.; 4];
+            let status = callback.render_interleaved_f32(&mut output);
+            drop(callback);
+            (status, output)
+        });
+        entered_recv.recv().unwrap();
+        owner.begin_shutdown();
+        assert_eq!(
+            owner.slot.as_ref().unwrap().gate.load(Ordering::Acquire),
+            RENDER_GATE_CLOSED_ACTIVE
+        );
+        release_send.send(()).unwrap();
+        let (status, output) = callback_thread.join().unwrap();
+        assert_eq!(status, AudioRenderStatus::Continue);
+        assert_eq!(output, [0.5; 4]);
+        assert_eq!(
+            owner.slot.as_ref().unwrap().gate.load(Ordering::Acquire),
+            RENDER_GATE_CLOSED
+        );
+        confirmed_reclaim(owner).unwrap();
+    }
+
+    #[test]
+    fn arc_uniqueness_is_the_callback_retirement_proof() {
+        let (owner, callback, _) = instrumented_pair(|_| {}, None);
+        owner.begin_shutdown();
+        let owner = owner
+            .try_reclaim_after_shutdown(EndpointShutdownConfirmed::new())
+            .expect_err("a live callback lease must prevent reclamation");
+        drop(callback);
+        confirmed_reclaim(owner).unwrap();
+    }
+
+    #[test]
+    fn dropping_an_open_callback_latches_unexpected_retirement() {
+        let (owner, callback, watcher) = instrumented_pair(|_| {}, None);
+        drop(callback);
+        assert_eq!(
+            watcher.death_reason(),
+            Some(AudioOutputDeathReason::CallbackRetiredUnexpectedly)
+        );
+        confirmed_reclaim(owner).unwrap();
+    }
+
+    #[test]
+    fn panic_payload_and_renderer_are_reclaimed_off_callback_thread() {
+        let (payload_drop_send, payload_drop_recv) = mpsc::sync_channel(1);
+        let (renderer_drop_send, renderer_drop_recv) = mpsc::sync_channel(1);
+        let mut payload = Some(DropThreadProbe(payload_drop_send));
+        let (owner, mut callback, watcher) = instrumented_pair(
+            move |_| panic_any(payload.take().unwrap()),
+            Some(renderer_drop_send),
+        );
+
+        let callback_thread = thread::spawn(move || {
+            let callback_thread = thread::current().id();
+            let mut output = [1.; 4];
+            let status = callback.render_interleaved_f32(&mut output);
+            drop(callback);
+            (callback_thread, status, output)
+        });
+        let (callback_thread, status, output) = callback_thread.join().unwrap();
+        assert_eq!(status, AudioRenderStatus::Stop);
+        assert_eq!(output, [0.; 4]);
+        assert_eq!(
+            watcher.death_reason(),
+            Some(AudioOutputDeathReason::CallbackPanicked)
+        );
+
+        let reclaimer = thread::spawn(move || {
+            let reclaimer_thread = thread::current().id();
+            confirmed_reclaim(owner).unwrap();
+            reclaimer_thread
+        });
+        let reclaimer_thread = reclaimer.join().unwrap();
+        assert_ne!(reclaimer_thread, callback_thread);
+        assert_eq!(renderer_drop_recv.recv().unwrap(), reclaimer_thread);
+        assert_eq!(payload_drop_recv.recv().unwrap(), reclaimer_thread);
+    }
+
+    #[test]
+    fn lying_or_missing_confirmation_quarantines_render_state() {
+        let (lying_drop_send, lying_drop_recv) = mpsc::sync_channel(1);
+        let (owner, callback, _) = instrumented_pair(|_| {}, Some(lying_drop_send));
+        owner.begin_shutdown();
+        let quarantined = owner
+            .try_reclaim_after_shutdown(EndpointShutdownConfirmed::new())
+            .expect_err("confirmation cannot override a live callback Arc");
+        drop(quarantined);
+        drop(callback);
+        assert_eq!(lying_drop_recv.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        let (missing_drop_send, missing_drop_recv) = mpsc::sync_channel(1);
+        let (owner, callback, _) = instrumented_pair(|_| {}, Some(missing_drop_send));
+        owner.begin_shutdown();
+        drop(callback);
+        drop(owner);
+        assert_eq!(missing_drop_recv.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn callback_death_remains_authoritative_when_event_queue_is_saturated() {
+        let (events, watcher) = AudioOutputEventSink::bounded(1);
+        assert!(events.try_send(AudioOutputEvent::Underrun { frames: 7 }));
+        let (owner, mut callback) = audio_render_pair(
+            format(),
+            Box::new(InstrumentedDriver {
+                render: Box::new(|_| panic!("render failure")),
+                dropped: None,
+            }),
+            events,
+        );
+        let mut output = [1.; 4];
+        assert_eq!(
+            callback.render_interleaved_f32(&mut output),
+            AudioRenderStatus::Stop
+        );
+        assert_eq!(output, [0.; 4]);
+        assert_eq!(
+            watcher.death_reason(),
+            Some(AudioOutputDeathReason::CallbackPanicked)
+        );
+        assert_eq!(
+            watcher.try_recv(),
+            Some(AudioOutputEvent::Underrun { frames: 7 })
+        );
+        assert_eq!(watcher.try_recv(), None);
+        drop(callback);
+        confirmed_reclaim(owner).unwrap();
     }
 
     #[test]
