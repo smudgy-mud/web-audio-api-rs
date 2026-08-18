@@ -2,9 +2,10 @@
 //!
 //! This module is an additive API foundation. [`AudioContext`](crate::context::AudioContext)
 //! does not invoke these traits yet, and render-thread storage remains private. It includes the
-//! internal callback/owner retirement gate and joinable render-reclamation seam. The context-owned
-//! lifecycle controller, injected constructor, authoritative context receipt, and endpoint wiring
-//! belong to later lifecycle work.
+//! internal callback/owner retirement gate and joinable render-reclamation seam. The private B3b
+//! lifecycle controller now owns exact injected callback/endpoint retirement. A public
+//! `AudioContext` constructor, output-factory selection, and authoritative context receipt remain
+//! later integration work.
 
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
@@ -69,7 +70,7 @@ pub struct AudioOutputRequest {
 }
 
 impl AudioOutputRequest {
-    #[allow(dead_code)] // constructed by the pending context lifecycle integration
+    #[allow(dead_code)] // public AudioContext output-factory wiring remains pending
     pub(crate) fn new(
         context_id: AudioOutputContextId,
         sink_id: impl Into<String>,
@@ -114,7 +115,7 @@ impl AudioOutputRequest {
         })
     }
 
-    #[allow(dead_code)] // enforced by the pending context lifecycle integration
+    #[allow(dead_code)] // public AudioContext output-factory wiring remains pending
     pub(crate) fn validate_config(
         &self,
         config: &AudioOutputConfig,
@@ -452,6 +453,10 @@ impl fmt::Debug for AudioOutputEventSink {
 }
 
 impl AudioOutputEventSink {
+    pub(crate) fn matches_watcher(&self, watcher: &AudioOutputEventWatcher) -> bool {
+        Arc::ptr_eq(&self.state, &watcher.state)
+    }
+
     /// Attempts to deliver a diagnostic without waiting.
     ///
     /// [`AudioOutputEvent::EndpointDied`] is routed through the authoritative death latch.
@@ -487,7 +492,7 @@ impl AudioOutputEventSink {
         AudioOutputDeathReason::from_u8(self.state.death_reason.load(Ordering::Acquire))
     }
 
-    #[allow(dead_code)] // constructed by the pending context lifecycle integration
+    #[allow(dead_code)] // private lifecycle/test seam; public AudioContext wiring remains pending
     pub(crate) fn bounded(capacity: usize) -> (Self, AudioOutputEventWatcher) {
         let (sender, receiver) = crossbeam_channel::bounded(capacity);
         let state = Arc::new(AudioOutputEventState::default());
@@ -543,14 +548,14 @@ const RENDER_GATE_ACTIVE: u8 = 1;
 const RENDER_GATE_CLOSED: u8 = 2;
 const RENDER_GATE_CLOSED_ACTIVE: u8 = RENDER_GATE_CLOSED | RENDER_GATE_ACTIVE;
 
-#[allow(dead_code)] // exercised by tests; production use begins with injected lifecycle wiring
+#[allow(dead_code)] // used by private B3b lifecycle; public AudioContext wiring is pending
 trait AudioRenderDriver: Send + 'static {
     fn render_interleaved_f32(&mut self, output: &mut [f32]);
 
     fn reclaim_off_thread(self: Box<Self>) -> Result<(), AudioOutputError>;
 }
 
-#[allow(dead_code)] // constructed by audio_render_thread_pair in the pending lifecycle slice
+#[allow(dead_code)] // constructed by the private B3b injected lifecycle path
 struct RenderThreadDriver {
     renderer: Option<RenderThread>,
     garbage_collector_join: JoinHandle<()>,
@@ -667,12 +672,24 @@ impl fmt::Debug for AudioRenderOwner {
     }
 }
 
-#[allow(dead_code)] // exercised by tests; production use begins with injected lifecycle wiring
+#[allow(dead_code)] // used by private B3b lifecycle; public AudioContext wiring is pending
 impl AudioRenderOwner {
     pub(crate) fn begin_shutdown(&self) {
         if let Some(slot) = &self.slot {
             slot.close();
         }
+    }
+
+    /// Returns whether the closed callback gate has no invocation in flight.
+    ///
+    /// This does not prove that the endpoint destroyed its callback or authorize renderer
+    /// reclamation. It is the narrower authority needed by fail-closed lifecycle paths before
+    /// they stop the event consumer: a retained callback can subsequently produce only silence
+    /// and its eventual Drop observes an already-closed gate without reporting another event.
+    pub(crate) fn callback_producer_quiescent(&self) -> bool {
+        self.slot
+            .as_ref()
+            .is_none_or(|slot| slot.gate.load(Ordering::Acquire) == RENDER_GATE_CLOSED)
     }
 
     /// Reclaims render resources after endpoint-local shutdown has confirmed.
@@ -738,13 +755,13 @@ impl Drop for AudioRenderOwner {
 
 /// Proof that endpoint-local shutdown completed successfully.
 ///
-/// Only the future lifecycle controller may construct this marker from an `Ok` endpoint receipt.
+/// Only the private B3b lifecycle controller constructs this marker from an `Ok` endpoint receipt.
 /// Such a receipt must guarantee no future or in-flight calls and destruction of the callback
 /// object that was passed to the endpoint.
 pub(crate) struct EndpointShutdownConfirmed(());
 
 impl EndpointShutdownConfirmed {
-    #[allow(dead_code)] // constructed by the pending lifecycle controller
+    #[allow(dead_code)] // constructed by private B3b; public AudioContext wiring is pending
     pub(crate) const fn new() -> Self {
         Self(())
     }

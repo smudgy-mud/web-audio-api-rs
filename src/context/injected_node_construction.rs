@@ -131,6 +131,7 @@ impl InjectedNodeConstructor {
         self.control.applied_batch_sequence()
     }
 
+    #[cfg(test)]
     pub(crate) fn admission_gate(&self) -> super::InjectedContextAdmissionGate {
         self.control.admission_gate()
     }
