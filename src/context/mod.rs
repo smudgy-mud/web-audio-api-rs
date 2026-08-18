@@ -15,6 +15,8 @@ pub(crate) use injected_admission::{
     AdmissionError, CapacityWorkerId, CapacityWorkerJoinError, InjectedContextAdmissionGate,
 };
 
+mod injected_control;
+
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
 #[cfg(feature = "diagnostics")]

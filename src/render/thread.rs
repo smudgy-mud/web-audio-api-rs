@@ -23,7 +23,7 @@ use crate::events::{EventDispatch, EventLoop};
 use crate::message::{
     control_batch_storage, control_batch_storage_mut, ControlBatchApplied, ControlBatchNode,
     ControlMessage, GraphLifecycleBarrier, GraphLifecycleOutcome, GraphLifecyclePublisher,
-    GraphLifecycleTransition, CONTROL_COMMANDS_PER_CALLBACK,
+    GraphLifecycleTransition, InjectedPhysicalCreditOwners, CONTROL_COMMANDS_PER_CALLBACK,
 };
 use crate::node::ChannelInterpretation;
 use crate::render::AudioWorkletGlobalScope;
@@ -55,6 +55,10 @@ pub(crate) struct RenderThread {
     garbage_collector_termination: Option<llq::Node<Box<dyn Any + Send>>>,
     control_batch_applied: ControlBatchApplied,
     pending_control_batch: Option<ControlBatchNode>,
+    /// Keeps both injected physical-credit allocations alive while an injected record can be
+    /// dequeued. Consequently releasing a credit on RT is an atomic decrement plus a non-final
+    /// `Arc` decrement; allocation destruction remains off RT with this renderer.
+    injected_physical_credit_owners: Option<InjectedPhysicalCreditOwners>,
     graph_lifecycle_publisher: Option<GraphLifecyclePublisher>,
     graph_lifecycle_next_sequence: u64,
 }
@@ -126,6 +130,7 @@ impl RenderThread {
             ))),
             control_batch_applied,
             pending_control_batch: None,
+            injected_physical_credit_owners: None,
             graph_lifecycle_publisher: None,
             graph_lifecycle_next_sequence: 1,
         }
@@ -145,6 +150,19 @@ impl RenderThread {
             return Err(publisher);
         }
         self.graph_lifecycle_publisher = Some(publisher);
+        Ok(())
+    }
+
+    /// Installs the render-side lifetime owners required before injected records can be received.
+    #[allow(dead_code)] // Used by the private injected control transport; exercised in tests.
+    pub(crate) fn set_injected_physical_credit_owners(
+        &mut self,
+        owners: InjectedPhysicalCreditOwners,
+    ) -> Result<(), InjectedPhysicalCreditOwners> {
+        if self.injected_physical_credit_owners.is_some() {
+            return Err(owners);
+        }
+        self.injected_physical_credit_owners = Some(owners);
         Ok(())
     }
 
@@ -183,6 +201,20 @@ impl RenderThread {
             if self.pending_control_batch.is_none() {
                 let Ok(message) = self.receiver.as_ref().unwrap().try_recv() else {
                     return;
+                };
+
+                let message = match message {
+                    ControlMessage::InjectedBatch { batch, physical } => {
+                        debug_assert!(self.injected_physical_credit_owners.is_some());
+                        drop(physical);
+                        ControlMessage::Batch(batch)
+                    }
+                    ControlMessage::InjectedGraphLifecycleBarrier { barrier, physical } => {
+                        debug_assert!(self.injected_physical_credit_owners.is_some());
+                        drop(physical);
+                        ControlMessage::GraphLifecycleBarrier(barrier)
+                    }
+                    message => message,
                 };
 
                 if let ControlMessage::Batch(batch) = message {
@@ -373,7 +405,12 @@ impl RenderThread {
         use ControlMessage::*;
 
         match msg {
-            Batch(_) => unreachable!("batch envelopes are handled before individual commands"),
+            Batch(_) | InjectedBatch { .. } => {
+                unreachable!("batch envelopes are handled before individual commands")
+            }
+            InjectedGraphLifecycleBarrier { .. } => {
+                unreachable!("injected barriers are normalized at dequeue")
+            }
             GraphLifecycleBarrier(barrier) => {
                 return self.handle_graph_lifecycle_barrier(barrier);
             }
@@ -491,6 +528,13 @@ impl RenderThread {
 
             #[cfg(test)]
             TestMarker { value, log } => log.lock().unwrap().push(value),
+
+            #[cfg(test)]
+            TestGarbage { payload } => {
+                if let Some(gc) = self.garbage_collector.as_mut() {
+                    gc.push(payload);
+                }
+            }
 
             #[cfg(test)]
             TestNop => {}
