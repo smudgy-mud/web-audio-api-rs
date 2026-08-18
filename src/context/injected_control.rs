@@ -1,9 +1,9 @@
 //! Private bounded graph-control transport for the injected online-context path.
 //!
 //! The exact private base and output lifecycle consume this transport. It separates a cloneable
-//! ordinary producer, a unique Close-only lifecycle owner, and a consuming render initializer.
-//! Public builder selection, broader node mutations, and Suspend/Resume barrier wiring remain
-//! deferred. No raw sender/receiver escapes.
+//! ordinary producer, a unique lifecycle owner for exact state/Close barriers, and a consuming
+//! render initializer. Public builder selection and broader node mutations remain deferred. No
+//! raw sender/receiver escapes.
 
 #![allow(dead_code)]
 
@@ -89,9 +89,16 @@ impl From<AdmissionError> for InjectedControlError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransportPhase {
     Open,
+    Transitioning,
     SealStarted,
     Sealed,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransportPlacement {
+    Running,
+    Staged,
 }
 
 #[derive(Clone)]
@@ -160,8 +167,9 @@ struct InjectedControlState {
     sender: Sender<ControlMessage>,
     phase: TransportPhase,
     disconnected: bool,
-    initially_suspended: bool,
+    placement: TransportPlacement,
     next_batch_sequence: u64,
+    next_lifecycle_sequence: u64,
     staged: VecDeque<StagedControlBatch>,
 }
 
@@ -736,7 +744,8 @@ pub(crate) struct BuildInjectedOutputRenderFailure {
     pub(crate) events: InjectedEventDispatchSetup,
 }
 
-/// Constructs an exact `N + 1` channel: N ordinary envelopes plus one Close-only reservation.
+/// Constructs an exact `N + 2` channel: N ordinary envelopes, one live-state barrier, and one
+/// Close reservation which remains available while the state barrier is pending.
 pub(crate) fn injected_control_channel(
     gate: InjectedContextAdmissionGate,
     ordinary_capacity: usize,
@@ -753,13 +762,13 @@ pub(crate) fn injected_control_channel(
         return Err(InjectedControlError::InvalidOrdinaryCapacity);
     }
     let channel_capacity = ordinary_capacity
-        .checked_add(1)
+        .checked_add(2)
         .ok_or(InjectedControlError::InvalidOrdinaryCapacity)?;
     let (sender, receiver) = crossbeam_channel::bounded(channel_capacity);
     let (activity_send, activity_recv) = crossbeam_channel::bounded(1);
     let ordinary_physical =
         InjectedPhysicalCreditPool::new(ordinary_capacity, activity_send.clone());
-    let lifecycle_physical = InjectedPhysicalCreditPool::new(1, activity_send.clone());
+    let lifecycle_physical = InjectedPhysicalCreditPool::new(2, activity_send.clone());
     let physical_owners = InjectedPhysicalCreditOwners {
         ordinary: ordinary_physical.clone(),
         lifecycle: lifecycle_physical.clone(),
@@ -773,8 +782,13 @@ pub(crate) fn injected_control_channel(
             sender,
             phase: TransportPhase::Open,
             disconnected: false,
-            initially_suspended,
+            placement: if initially_suspended {
+                TransportPlacement::Staged
+            } else {
+                TransportPlacement::Running
+            },
             next_batch_sequence: 1,
+            next_lifecycle_sequence: 1,
             staged: VecDeque::with_capacity(STAGED_ENVELOPE_LIMIT),
         }),
         logical_commands: InjectedCommandCreditPool::new(
@@ -1084,6 +1098,64 @@ pub(crate) struct FlushControlOutcome {
     pub(crate) remaining_staged: usize,
 }
 
+fn flush_staged_locked(
+    inner: &InjectedControlInner,
+    state: &mut InjectedControlState,
+) -> Result<FlushControlOutcome, InjectedControlError> {
+    let mut enqueued = 0;
+    while !state.staged.is_empty() {
+        if state.next_batch_sequence == u64::MAX {
+            return Err(InjectedControlError::SequenceExhausted);
+        }
+        let Some(physical) = inner.ordinary_physical.try_acquire() else {
+            break;
+        };
+        let sequence = state.next_batch_sequence;
+        let mut staged = state.staged.pop_front().expect("staged front exists");
+        if !control_batch_storage_mut(&mut staged.batch).assign_sequence_before_enqueue(sequence) {
+            state.phase = TransportPhase::Failed;
+            state.staged.push_front(staged);
+            return Err(InjectedControlError::ProtocolViolation);
+        }
+        match state.sender.try_send(ControlMessage::InjectedBatch {
+            batch: staged.batch,
+            physical,
+        }) {
+            Ok(()) => {
+                drop(staged._slot);
+                drop(staged._sequence);
+                state.next_batch_sequence += 1;
+                inner
+                    .last_submitted_batch_sequence
+                    .store(sequence, Ordering::Release);
+                enqueued += 1;
+            }
+            Err(TrySendError::Full(ControlMessage::InjectedBatch { mut batch, .. })) => {
+                state.phase = TransportPhase::Failed;
+                let _ = control_batch_storage_mut(&mut batch).clear_unsubmitted_sequence(sequence);
+                staged.batch = batch;
+                state.staged.push_front(staged);
+                return Err(InjectedControlError::ProtocolViolation);
+            }
+            Err(TrySendError::Disconnected(ControlMessage::InjectedBatch {
+                mut batch, ..
+            })) => {
+                state.phase = TransportPhase::Failed;
+                state.disconnected = true;
+                let _ = control_batch_storage_mut(&mut batch).clear_unsubmitted_sequence(sequence);
+                staged.batch = batch;
+                state.staged.push_front(staged);
+                return Err(InjectedControlError::Disconnected);
+            }
+            Err(_) => unreachable!("private sender returns its submitted variant"),
+        }
+    }
+    Ok(FlushControlOutcome {
+        enqueued,
+        remaining_staged: state.staged.len(),
+    })
+}
+
 impl InjectedControlProducer {
     #[cfg(test)]
     pub(crate) fn try_commit_prevalidated_for_test(
@@ -1126,6 +1198,7 @@ impl InjectedControlProducer {
         }
         match state.phase {
             TransportPhase::Open => {}
+            TransportPhase::Transitioning => return Err(InjectedControlError::Contended),
             TransportPhase::SealStarted | TransportPhase::Sealed => {
                 return Err(InjectedControlError::Sealed)
             }
@@ -1157,7 +1230,7 @@ impl InjectedControlProducer {
             .fetch_add(1, Ordering::AcqRel);
         let sequence_reservation =
             BatchSequenceReservation(Arc::clone(&self.inner.batch_sequence_reservations));
-        let placement = if state.initially_suspended || !state.staged.is_empty() {
+        let placement = if state.placement == TransportPlacement::Staged {
             ReservedPlacement::Staged(
                 self.inner
                     .staging_slots
@@ -1434,63 +1507,7 @@ impl InjectedControlProducer {
         if state.phase != TransportPhase::Open {
             return Err(InjectedControlError::Sealed);
         }
-        let mut enqueued = 0;
-        while !state.staged.is_empty() {
-            if state.next_batch_sequence == u64::MAX {
-                return Err(InjectedControlError::SequenceExhausted);
-            }
-            let Some(physical) = self.inner.ordinary_physical.try_acquire() else {
-                break;
-            };
-            let sequence = state.next_batch_sequence;
-            let mut staged = state.staged.pop_front().expect("staged front exists");
-            if !control_batch_storage_mut(&mut staged.batch)
-                .assign_sequence_before_enqueue(sequence)
-            {
-                state.phase = TransportPhase::Failed;
-                state.staged.push_front(staged);
-                return Err(InjectedControlError::ProtocolViolation);
-            }
-            match state.sender.try_send(ControlMessage::InjectedBatch {
-                batch: staged.batch,
-                physical,
-            }) {
-                Ok(()) => {
-                    drop(staged._slot);
-                    drop(staged._sequence);
-                    state.next_batch_sequence += 1;
-                    self.inner
-                        .last_submitted_batch_sequence
-                        .store(sequence, Ordering::Release);
-                    enqueued += 1;
-                }
-                Err(TrySendError::Full(ControlMessage::InjectedBatch { mut batch, .. })) => {
-                    state.phase = TransportPhase::Failed;
-                    let _ =
-                        control_batch_storage_mut(&mut batch).clear_unsubmitted_sequence(sequence);
-                    staged.batch = batch;
-                    state.staged.push_front(staged);
-                    return Err(InjectedControlError::ProtocolViolation);
-                }
-                Err(TrySendError::Disconnected(ControlMessage::InjectedBatch {
-                    mut batch,
-                    ..
-                })) => {
-                    state.phase = TransportPhase::Failed;
-                    state.disconnected = true;
-                    let _ =
-                        control_batch_storage_mut(&mut batch).clear_unsubmitted_sequence(sequence);
-                    staged.batch = batch;
-                    state.staged.push_front(staged);
-                    return Err(InjectedControlError::Disconnected);
-                }
-                Err(_) => unreachable!("private sender returns its submitted variant"),
-            }
-        }
-        Ok(FlushControlOutcome {
-            enqueued,
-            remaining_staged: state.staged.len(),
-        })
+        flush_staged_locked(&self.inner, &mut state)
     }
 
     pub(crate) fn last_submitted_batch_sequence(&self) -> u64 {
@@ -1553,6 +1570,43 @@ pub(crate) struct BeginControlCloseFailure {
     pub(crate) owner: InjectedControlLifecycleOwner,
 }
 
+/// Short owner-side fence used only while a live Suspend/Resume boundary is being established.
+/// It owns no renderer or endpoint authority and cannot outlive the unique lifecycle worker by
+/// construction. Ordinary producers are blocked only while this token exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ControlStateBoundary {
+    transition: GraphLifecycleTransition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BeginControlStateTransition {
+    /// The graph transport is already in the requested stable placement. The native endpoint may
+    /// still require reconciliation, which is tracked independently by the lifecycle worker.
+    AlreadyPlaced,
+    Boundary(ControlStateBoundary),
+}
+
+/// Exact submitted live-state barrier. The unique lifecycle owner retains the sole watcher, so
+/// this token cannot be substituted across transports and Close may consume the watcher while a
+/// state barrier remains queued ahead of it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SubmittedControlStateTransition {
+    barrier: GraphLifecycleBarrier,
+}
+
+impl SubmittedControlStateTransition {
+    pub(crate) const fn barrier(self) -> GraphLifecycleBarrier {
+        self.barrier
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControlStateObservation {
+    Pending,
+    Applied,
+    Terminal(GraphLifecycleSnapshot),
+}
+
 /// Admissions are irreversibly sealed. Retirement owns any registered capacity worker and the
 /// authoritative drain which includes every pre-seal prepared graph operation.
 pub(crate) struct ControlCloseRetirement {
@@ -1579,6 +1633,211 @@ impl InjectedControlLifecycleOwner {
         &self.activity
     }
 
+    /// Begins the short reservation fence for one serialized live-state transition. Suspend
+    /// switches to staging only after every pre-boundary reservation commits or retires. Resume
+    /// remains staged while the endpoint resumes and enters this fence only for FIFO flush and
+    /// barrier publication.
+    pub(crate) fn try_begin_state_transition(
+        &mut self,
+        transition: GraphLifecycleTransition,
+    ) -> Result<BeginControlStateTransition, InjectedControlError> {
+        if !matches!(
+            transition,
+            GraphLifecycleTransition::Suspend | GraphLifecycleTransition::Resume
+        ) {
+            return Err(InjectedControlError::ProtocolViolation);
+        }
+        let mut state = try_state(&self.inner)?;
+        if state.disconnected {
+            return Err(InjectedControlError::Disconnected);
+        }
+        if self.inner.accepted_finalizer_failed.load(Ordering::Acquire) {
+            return Err(InjectedControlError::ProtocolViolation);
+        }
+        match state.phase {
+            TransportPhase::Open => {}
+            TransportPhase::Transitioning => return Err(InjectedControlError::Contended),
+            TransportPhase::SealStarted | TransportPhase::Sealed => {
+                return Err(InjectedControlError::Sealed)
+            }
+            TransportPhase::Failed => return Err(InjectedControlError::ProtocolViolation),
+        }
+        let target = match transition {
+            GraphLifecycleTransition::Suspend => TransportPlacement::Staged,
+            GraphLifecycleTransition::Resume => TransportPlacement::Running,
+            GraphLifecycleTransition::Close => unreachable!(),
+        };
+        if state.placement == target {
+            return Ok(BeginControlStateTransition::AlreadyPlaced);
+        }
+        state.phase = TransportPhase::Transitioning;
+        Ok(BeginControlStateTransition::Boundary(
+            ControlStateBoundary { transition },
+        ))
+    }
+
+    /// Authoritative drain predicate. Staged accepted envelopes retain one sequence reservation;
+    /// equality therefore proves that no prepared-but-uncommitted batch can still cross the
+    /// boundary, while preserving every already accepted staged record for Resume.
+    pub(crate) fn state_boundary_ready(
+        &self,
+        boundary: ControlStateBoundary,
+    ) -> Result<bool, InjectedControlError> {
+        let state = try_state(&self.inner)?;
+        if state.phase != TransportPhase::Transitioning {
+            return Err(InjectedControlError::ProtocolViolation);
+        }
+        let expected_placement = match boundary.transition {
+            GraphLifecycleTransition::Suspend => TransportPlacement::Running,
+            GraphLifecycleTransition::Resume => TransportPlacement::Staged,
+            GraphLifecycleTransition::Close => return Err(InjectedControlError::ProtocolViolation),
+        };
+        if state.placement != expected_placement {
+            return Err(InjectedControlError::ProtocolViolation);
+        }
+        Ok(self
+            .inner
+            .batch_sequence_reservations
+            .load(Ordering::Acquire)
+            == state.staged.len())
+    }
+
+    /// Flushes accepted staging during Resume after the reservation fence is authoritative.
+    /// Physical-credit exhaustion is retryable; no admission credit is retained between calls.
+    pub(crate) fn try_flush_state_transition(
+        &mut self,
+        boundary: ControlStateBoundary,
+    ) -> Result<FlushControlOutcome, InjectedControlError> {
+        if boundary.transition != GraphLifecycleTransition::Resume {
+            return Err(InjectedControlError::ProtocolViolation);
+        }
+        let mut state = try_state(&self.inner)?;
+        if state.phase != TransportPhase::Transitioning
+            || state.placement != TransportPlacement::Staged
+            || self
+                .inner
+                .batch_sequence_reservations
+                .load(Ordering::Acquire)
+                != state.staged.len()
+        {
+            return Err(InjectedControlError::Contended);
+        }
+        flush_staged_locked(&self.inner, &mut state)
+    }
+
+    /// Publishes one exact barrier and opens the target placement in the same transport critical
+    /// section. For Resume, later ordinary sends therefore enter FIFO strictly after the barrier
+    /// even before its renderer acknowledgement arrives.
+    pub(crate) fn try_submit_state_transition(
+        &mut self,
+        boundary: ControlStateBoundary,
+    ) -> Result<SubmittedControlStateTransition, InjectedControlError> {
+        let mut state = try_state(&self.inner)?;
+        if state.phase != TransportPhase::Transitioning {
+            return Err(InjectedControlError::ProtocolViolation);
+        }
+        let (source, target) = match boundary.transition {
+            GraphLifecycleTransition::Suspend => {
+                (TransportPlacement::Running, TransportPlacement::Staged)
+            }
+            GraphLifecycleTransition::Resume => {
+                (TransportPlacement::Staged, TransportPlacement::Running)
+            }
+            GraphLifecycleTransition::Close => return Err(InjectedControlError::ProtocolViolation),
+        };
+        if state.placement != source
+            || self
+                .inner
+                .batch_sequence_reservations
+                .load(Ordering::Acquire)
+                != state.staged.len()
+            || (boundary.transition == GraphLifecycleTransition::Resume && !state.staged.is_empty())
+        {
+            return Err(InjectedControlError::Contended);
+        }
+        let controller_sequence = NonZeroU64::new(state.next_lifecycle_sequence)
+            .ok_or(InjectedControlError::SequenceExhausted)?;
+        if state.next_lifecycle_sequence == u64::MAX {
+            return Err(InjectedControlError::SequenceExhausted);
+        }
+        let Some(physical) = self.inner.lifecycle_physical.try_acquire() else {
+            return Err(InjectedControlError::LogicalCommandCredits);
+        };
+        let barrier = GraphLifecycleBarrier::new(
+            controller_sequence,
+            self.inner
+                .last_submitted_batch_sequence
+                .load(Ordering::Acquire),
+            boundary.transition,
+        );
+        match state
+            .sender
+            .try_send(ControlMessage::InjectedGraphLifecycleBarrier { barrier, physical })
+        {
+            Ok(()) => {
+                state.next_lifecycle_sequence += 1;
+                state.placement = target;
+                state.phase = TransportPhase::Open;
+                Ok(SubmittedControlStateTransition { barrier })
+            }
+            Err(TrySendError::Full(_)) => {
+                state.phase = TransportPhase::Failed;
+                Err(InjectedControlError::ProtocolViolation)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                state.phase = TransportPhase::Failed;
+                state.disconnected = true;
+                Err(InjectedControlError::Disconnected)
+            }
+        }
+    }
+
+    /// Restores the pre-boundary stable placement when shutdown/death supersedes before barrier
+    /// submission. No accepted graph record is discarded.
+    pub(crate) fn cancel_state_transition(
+        &mut self,
+        boundary: ControlStateBoundary,
+    ) -> Result<(), InjectedControlError> {
+        let mut state = try_state(&self.inner)?;
+        let source = match boundary.transition {
+            GraphLifecycleTransition::Suspend => TransportPlacement::Running,
+            GraphLifecycleTransition::Resume => TransportPlacement::Staged,
+            GraphLifecycleTransition::Close => return Err(InjectedControlError::ProtocolViolation),
+        };
+        if state.phase != TransportPhase::Transitioning || state.placement != source {
+            return Err(InjectedControlError::ProtocolViolation);
+        }
+        state.phase = TransportPhase::Open;
+        Ok(())
+    }
+
+    pub(crate) fn observe_state_transition(
+        &self,
+        submitted: SubmittedControlStateTransition,
+    ) -> ControlStateObservation {
+        let barrier = submitted.barrier;
+        let snapshot = self
+            .watcher
+            .snapshot(NonZeroU64::new(barrier.controller_sequence()).unwrap());
+        match snapshot {
+            GraphLifecycleSnapshot::Pending => ControlStateObservation::Pending,
+            GraphLifecycleSnapshot::Applied {
+                barrier: observed,
+                observed_batch_sequence,
+                outcome: GraphLifecycleOutcome::Applied,
+            } if observed == barrier
+                && observed_batch_sequence == barrier.required_batch_sequence() =>
+            {
+                ControlStateObservation::Applied
+            }
+            other => ControlStateObservation::Terminal(other),
+        }
+    }
+
+    pub(crate) const fn state_transition_wake_receiver(&self) -> &crossbeam_channel::Receiver<()> {
+        self.watcher.receiver()
+    }
+
     /// Seals the shared gate first, then recovers a poisoned local transport mutex if necessary.
     /// Gate poison cannot establish the irreversible boundary and therefore returns a quarantine
     /// failure retaining the unique owner.
@@ -1602,8 +1861,11 @@ impl InjectedControlLifecycleOwner {
                 poisoned.into_inner()
             }
         };
-        degradation.prior_transport_failure = state.phase == TransportPhase::Failed
-            || self.inner.accepted_finalizer_failed.load(Ordering::Acquire);
+        degradation.prior_transport_failure =
+            matches!(
+                state.phase,
+                TransportPhase::Transitioning | TransportPhase::Failed
+            ) || self.inner.accepted_finalizer_failed.load(Ordering::Acquire);
         state.phase = TransportPhase::SealStarted;
         let (capacity_worker, drain) = admissions.into_parts();
         drop(state);
@@ -1835,8 +2097,24 @@ impl DrainedControlClose {
                 degradation: self.degradation,
             });
         };
+        let Some(controller_sequence) = NonZeroU64::new(state.next_lifecycle_sequence) else {
+            state.phase = TransportPhase::Failed;
+            return Err(FinishControlCloseFailure {
+                error: InjectedControlError::SequenceExhausted,
+                payloads,
+                degradation: self.degradation,
+            });
+        };
+        if state.next_lifecycle_sequence == u64::MAX {
+            state.phase = TransportPhase::Failed;
+            return Err(FinishControlCloseFailure {
+                error: InjectedControlError::SequenceExhausted,
+                payloads,
+                degradation: self.degradation,
+            });
+        }
         let barrier = GraphLifecycleBarrier::new(
-            NonZeroU64::new(1).expect("the sole Close uses controller sequence one"),
+            controller_sequence,
             last_submitted_batch_sequence,
             GraphLifecycleTransition::Close,
         );
@@ -1845,6 +2123,7 @@ impl DrainedControlClose {
             .try_send(ControlMessage::InjectedGraphLifecycleBarrier { barrier, physical });
         match send {
             Ok(()) => {
+                state.next_lifecycle_sequence += 1;
                 state.phase = TransportPhase::Sealed;
                 drop(state);
                 Ok(SealedControlTransport {
@@ -2688,6 +2967,29 @@ mod tests {
         drop(slot);
         receiver.recv().unwrap();
         assert_eq!(pool.in_flight(), 0);
+    }
+
+    #[test]
+    fn submitted_state_barrier_reserves_sequence_one_and_close_uses_sequence_two() {
+        let gate = InjectedContextAdmissionGate::new();
+        let (_producer, mut owner, _render) = injected_control_channel(gate, 1, false).unwrap();
+        let boundary = match owner
+            .try_begin_state_transition(GraphLifecycleTransition::Suspend)
+            .unwrap()
+        {
+            BeginControlStateTransition::Boundary(boundary) => boundary,
+            BeginControlStateTransition::AlreadyPlaced => panic!("running transport must fence"),
+        };
+        assert!(owner.state_boundary_ready(boundary).unwrap());
+        let state = owner.try_submit_state_transition(boundary).unwrap();
+        assert_eq!(state.barrier().controller_sequence(), 1);
+
+        let drained = owner.try_begin_close().ok().unwrap().retire_and_wait().1;
+        let sealed = match drained.finish() {
+            Ok(sealed) => sealed,
+            Err(_) => panic!("second lifecycle slot must accept exact Close"),
+        };
+        assert_eq!(sealed.close.barrier().controller_sequence(), 2);
     }
 
     #[test]

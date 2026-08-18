@@ -276,6 +276,7 @@ impl RenderThread {
         event_sender: InjectedEventDispatchSender,
         control_batch_applied: ControlBatchApplied,
     ) -> Self {
+        let initially_suspended = state.load() == AudioContextState::Suspended;
         let shared_state = state.atomic_for_render();
         let mut renderer = Self::new(
             sample_rate,
@@ -287,6 +288,7 @@ impl RenderThread {
             EventDispatchSender::from_injected(event_sender),
             control_batch_applied,
         );
+        renderer.suspended = initially_suspended;
         renderer.injected_state = Some(state);
         renderer
     }
@@ -587,12 +589,21 @@ impl RenderThread {
         let close = match barrier.transition() {
             GraphLifecycleTransition::Suspend => {
                 self.suspended = true;
-                self.store_state_without_event(AudioContextState::Suspended);
+                let outcome =
+                    self.transition_injected_state_with_event(AudioContextState::Suspended);
+                if outcome != GraphLifecycleOutcome::Applied {
+                    self.publish_graph_lifecycle_ack(barrier, observed_batch_sequence, outcome);
+                    return ControlFlow::Continue(());
+                }
                 false
             }
             GraphLifecycleTransition::Resume => {
                 self.suspended = false;
-                self.store_state_without_event(AudioContextState::Running);
+                let outcome = self.transition_injected_state_with_event(AudioContextState::Running);
+                if outcome != GraphLifecycleOutcome::Applied {
+                    self.publish_graph_lifecycle_ack(barrier, observed_batch_sequence, outcome);
+                    return ControlFlow::Continue(());
+                }
                 false
             }
             GraphLifecycleTransition::Close => {
@@ -1181,6 +1192,28 @@ impl RenderThread {
         }
     }
 
+    /// Injected Suspend/Resume barriers acknowledge only after both the exact shared-state CAS
+    /// and the corresponding event record are accepted by the exact event transport. Close is
+    /// deliberately excluded: its terminal event remains proof-gated on the lifecycle thread.
+    fn transition_injected_state_with_event(
+        &self,
+        state: AudioContextState,
+    ) -> GraphLifecycleOutcome {
+        let Some(injected) = self.injected_state.as_ref() else {
+            return GraphLifecycleOutcome::ProtocolViolation;
+        };
+        if injected.transition_render(state) != InjectedStateTransition::Changed {
+            return GraphLifecycleOutcome::ProtocolViolation;
+        }
+        match self
+            .event_sender
+            .try_send(EventDispatch::state_change(state))
+        {
+            Ok(()) => GraphLifecycleOutcome::Applied,
+            Err(_) => GraphLifecycleOutcome::EventDeliveryFailed,
+        }
+    }
+
     fn store_state_without_event(&self, state: AudioContextState) {
         if let Some(injected) = &self.injected_state {
             let _ = injected.transition_render(state);
@@ -1320,14 +1353,14 @@ mod tests {
         let applied = ControlBatchApplied::default();
         let (event_sender, event_receiver) = crossbeam_channel::bounded(event_capacity);
         let (garbage_producer, garbage) = llq::Queue::new().split();
-        let mut renderer = RenderThread::new(
+        let mut renderer = RenderThread::new_injected(
             48_000.,
             2,
             receiver,
-            Arc::new(AtomicU8::new(AudioContextState::Suspended as u8)),
+            InjectedContextState::new_for_test(false),
             Arc::new(AtomicU64::new(0)),
             AudioStats::new(),
-            event_sender.clone(),
+            InjectedEventDispatchSender::from_event_setup(event_sender.clone(), Arc::new(())),
             applied.clone(),
         );
         renderer.garbage_collector = Some(garbage_producer);
@@ -1539,6 +1572,7 @@ mod tests {
             .unwrap();
         alloc_counter::deny_alloc(|| run_callback(&mut test.renderer));
         assert_applied(&watcher, first, 0, GraphLifecycleOutcome::Applied);
+        assert!(test.events.handle_pending_events());
         assert_eq!(watcher.receiver().try_recv(), Ok(()));
 
         let second = lifecycle_barrier(2, 0, GraphLifecycleTransition::Resume);
@@ -1547,6 +1581,7 @@ mod tests {
             .unwrap();
         alloc_counter::deny_alloc(|| run_callback(&mut test.renderer));
         assert_applied(&watcher, second, 0, GraphLifecycleOutcome::Applied);
+        assert!(test.events.handle_pending_events());
         let third = lifecycle_barrier(3, 0, GraphLifecycleTransition::Suspend);
         test.legacy
             .try_send(ControlMessage::GraphLifecycleBarrier(third))
@@ -1554,6 +1589,7 @@ mod tests {
         // The wake for sequence two remains queued, so sequence three observes Full.
         alloc_counter::deny_alloc(|| run_callback(&mut test.renderer));
         assert_applied(&watcher, third, 0, GraphLifecycleOutcome::Applied);
+        assert!(test.events.handle_pending_events());
         assert_eq!(
             watcher.snapshot(NonZeroU64::new(2).unwrap()),
             GraphLifecycleSnapshot::SequenceAdvanced {
@@ -1570,6 +1606,7 @@ mod tests {
             .unwrap();
         alloc_counter::deny_alloc(|| run_callback(&mut test.renderer));
         assert_applied(&watcher, fourth, 0, GraphLifecycleOutcome::Applied);
+        assert!(test.events.handle_pending_events());
     }
 
     #[test]
@@ -1613,6 +1650,10 @@ mod tests {
         let mut test = harness(2, 1);
         let watcher = install_lifecycle_watcher(&mut test.renderer);
         test.renderer.suspended = true;
+        test.renderer.state.store(
+            AudioContextState::Suspended as u8,
+            std::sync::atomic::Ordering::Release,
+        );
         let barrier = lifecycle_barrier(1, 1, GraphLifecycleTransition::Resume);
         test.legacy
             .try_send(ControlMessage::GraphLifecycleBarrier(barrier))
@@ -1655,6 +1696,7 @@ mod tests {
             AudioContextState::Suspended as u8
         );
         assert_applied(&watcher, suspend, 0, GraphLifecycleOutcome::Applied);
+        assert!(test.events.handle_pending_events());
         watcher.receiver().try_recv().unwrap();
 
         let resume = lifecycle_barrier(2, 0, GraphLifecycleTransition::Resume);
@@ -1668,6 +1710,44 @@ mod tests {
             AudioContextState::Running as u8
         );
         assert_applied(&watcher, resume, 0, GraphLifecycleOutcome::Applied);
+    }
+
+    #[test]
+    fn injected_state_barrier_reports_full_and_disconnected_event_delivery() {
+        let mut full = harness(4, 1);
+        let full_watcher = install_lifecycle_watcher(&mut full.renderer);
+        full.event_sender
+            .try_send(EventDispatch::sink_change())
+            .unwrap();
+        let suspend = lifecycle_barrier(1, 0, GraphLifecycleTransition::Suspend);
+        full.legacy
+            .try_send(ControlMessage::GraphLifecycleBarrier(suspend))
+            .unwrap();
+        run_callback(&mut full.renderer);
+        assert!(full.renderer.suspended);
+        assert_applied(
+            &full_watcher,
+            suspend,
+            0,
+            GraphLifecycleOutcome::EventDeliveryFailed,
+        );
+
+        let mut disconnected = harness(4, 1);
+        let disconnected_watcher = install_lifecycle_watcher(&mut disconnected.renderer);
+        drop(disconnected.events);
+        let suspend = lifecycle_barrier(1, 0, GraphLifecycleTransition::Suspend);
+        disconnected
+            .legacy
+            .try_send(ControlMessage::GraphLifecycleBarrier(suspend))
+            .unwrap();
+        run_callback(&mut disconnected.renderer);
+        assert!(disconnected.renderer.suspended);
+        assert_applied(
+            &disconnected_watcher,
+            suspend,
+            0,
+            GraphLifecycleOutcome::EventDeliveryFailed,
+        );
     }
 
     #[test]
@@ -1868,6 +1948,7 @@ mod tests {
                 .unwrap();
             run_callback(&mut test.renderer);
             assert_applied(&watcher, barrier, 0, GraphLifecycleOutcome::Applied);
+            assert!(test.events.handle_pending_events());
             watcher.receiver().try_recv().unwrap();
         }
     }
