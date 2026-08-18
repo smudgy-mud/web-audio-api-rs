@@ -65,6 +65,8 @@ pub(crate) struct RenderThread {
 unsafe impl Send for Graph {}
 unsafe impl Sync for Graph {}
 unsafe impl Send for RenderThread {}
+// Retained for the legacy OfflineAudioContext future's documented Send + Sync contract. The
+// injected output seam does not rely on this: AudioRenderCallback remains deliberately !Sync.
 unsafe impl Sync for RenderThread {}
 
 impl std::fmt::Debug for RenderThread {
@@ -129,10 +131,25 @@ impl RenderThread {
     }
 
     pub(crate) fn spawn_garbage_collector_thread(&mut self) {
+        let _detached = self.spawn_joinable_garbage_collector_thread();
+    }
+
+    /// Installs the render-side garbage collector and returns its join handle.
+    ///
+    /// The injected-output lifecycle owns this handle and joins it only after the render callback
+    /// has retired and `RenderThread` Drop has enqueued the preallocated poison record. Legacy
+    /// backends intentionally continue to use `spawn_garbage_collector_thread`, which detaches the
+    /// same sidecar as before.
+    pub(crate) fn spawn_joinable_garbage_collector_thread(
+        &mut self,
+    ) -> Option<std::thread::JoinHandle<()>> {
         if self.garbage_collector.is_none() {
             let (gc_producer, gc_consumer) = llq::Queue::new().split();
-            spawn_garbage_collector_thread(gc_consumer);
+            let join = spawn_garbage_collector_thread(gc_consumer);
             self.garbage_collector = Some(gc_producer);
+            Some(join)
+        } else {
+            None
         }
     }
 
@@ -499,8 +516,14 @@ impl RenderThread {
         });
     }
 
-    /// Run destructors of all alive nodes in the audio graph
-    fn unload_graph(mut self) {
+    /// Runs node teardown and drops the graph on the calling non-render thread.
+    ///
+    /// Taking the graph first makes this idempotent even when a node hook panics: unwinding drops
+    /// the detached graph here rather than later in `RenderThread::drop`.
+    pub(crate) fn prepare_for_reclaim(&mut self) {
+        let Some(mut graph) = self.graph.take() else {
+            return;
+        };
         let current_frame = self.frames_played.load(Ordering::Relaxed);
         let current_time = current_frame as f64 / self.sample_rate as f64;
 
@@ -511,7 +534,12 @@ impl RenderThread {
             event_sender: self.event_sender.clone(),
             node_id: Cell::new(AudioNodeId(0)), // placeholder value
         };
-        self.graph.take().unwrap().before_drop(&scope);
+        graph.before_drop(&scope);
+    }
+
+    /// Run destructors of all alive nodes in the audio graph.
+    fn unload_graph(mut self) {
+        self.prepare_for_reclaim();
     }
 
     pub fn render<S: FromSample<f32> + Clone>(&mut self, output_buffer: &mut [S]) {
@@ -676,8 +704,10 @@ struct TerminateGarbageCollectorThread;
 struct ControlReceiverRetirement(Option<Receiver<ControlMessage>>);
 
 // Spawns a sidecar thread of the `RenderThread` for dropping resources.
-fn spawn_garbage_collector_thread(consumer: llq::Consumer<Box<dyn Any + Send>>) {
-    let _join_handle = std::thread::spawn(move || run_garbage_collector_thread(consumer));
+fn spawn_garbage_collector_thread(
+    consumer: llq::Consumer<Box<dyn Any + Send>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || run_garbage_collector_thread(consumer))
 }
 
 fn run_garbage_collector_thread(mut consumer: llq::Consumer<Box<dyn Any + Send>>) {
@@ -703,7 +733,9 @@ fn run_garbage_collector_thread(mut consumer: llq::Consumer<Box<dyn Any + Send>>
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
+    use std::sync::mpsc::{self, SyncSender};
     use std::sync::{Arc, Mutex};
+    use std::thread::{self, ThreadId};
 
     use super::*;
     use crate::events::EventLoop;
@@ -721,6 +753,14 @@ mod tests {
         event_sender: Sender<EventDispatch>,
         garbage: llq::Consumer<Box<dyn Any + Send>>,
         retained_receiver: Receiver<ControlMessage>,
+    }
+
+    struct GarbageCollectorDropProbe(SyncSender<ThreadId>);
+
+    impl Drop for GarbageCollectorDropProbe {
+        fn drop(&mut self) {
+            let _ = self.0.send(thread::current().id());
+        }
     }
 
     fn harness(control_capacity: usize, event_capacity: usize) -> TestHarness {
@@ -1186,5 +1226,35 @@ mod tests {
 
         renderer.handle_control_messages();
         assert_eq!(&*log.lock().unwrap(), &(0..300).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn joinable_garbage_collector_confirms_off_thread_reclamation() {
+        let (_sender, receiver) = crossbeam_channel::unbounded();
+        let (event_sender, _event_receiver) = crossbeam_channel::unbounded();
+        let mut renderer = RenderThread::new(
+            48_000.,
+            2,
+            receiver,
+            Arc::new(AtomicU8::new(AudioContextState::Suspended as u8)),
+            Arc::new(AtomicU64::new(0)),
+            AudioStats::new(),
+            event_sender,
+            ControlBatchApplied::default(),
+        );
+        let join = renderer.spawn_joinable_garbage_collector_thread().unwrap();
+        let collector_thread = join.thread().id();
+        let (dropped_send, dropped_recv) = mpsc::sync_channel(1);
+        renderer
+            .garbage_collector
+            .as_mut()
+            .unwrap()
+            .push(llq::Node::new(
+                Box::new(GarbageCollectorDropProbe(dropped_send)) as Box<dyn Any + Send>,
+            ));
+
+        drop(renderer);
+        join.join().unwrap();
+        assert_eq!(dropped_recv.recv().unwrap(), collector_thread);
     }
 }
