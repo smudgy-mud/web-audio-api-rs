@@ -9,6 +9,11 @@ mod concrete_base;
 pub use concrete_base::*;
 
 mod injected_admission;
+#[cfg(test)]
+pub(crate) use injected_admission::AdmissionSnapshot;
+pub(crate) use injected_admission::{
+    AdmissionError, CapacityWorkerId, CapacityWorkerJoinError, InjectedContextAdmissionGate,
+};
 
 #[cfg(feature = "diagnostics")]
 mod diagnostics;

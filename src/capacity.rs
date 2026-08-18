@@ -1,10 +1,14 @@
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, Sender};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::context::{BaseAudioContext, ConcreteBaseAudioContext};
+use crate::context::{
+    AdmissionError, BaseAudioContext, CapacityWorkerId, CapacityWorkerJoinError,
+    ConcreteBaseAudioContext, ControlEventDispatch, ControlEventSendOutcome,
+    InjectedContextAdmissionGate,
+};
 use crate::events::{EventDispatch, EventHandler, EventPayload, EventType};
 use crate::stats::{AudioStats, AudioStatsSnapshot};
 use crate::Event;
@@ -86,16 +90,20 @@ impl AudioRenderCapacity {
             stats,
             sample_rate: context.sample_rate(),
             frames_played: context.frames_played_counter(),
-            event_send: context.event_sender(),
+            event_dispatch: context.control_event_dispatch(),
             #[cfg(test)]
             send_observer: None,
             #[cfg(test)]
             ready_observer: None,
         };
 
+        let service = match runner.event_dispatch.injected_gate() {
+            Some(gate) => AudioRenderCapacityService::new_injected(Arc::new(runner), gate),
+            None => AudioRenderCapacityService::new(Arc::new(runner)),
+        };
         Self {
             context,
-            service: Arc::new(AudioRenderCapacityService::new(Arc::new(runner))),
+            service: Arc::new(service),
         }
     }
 
@@ -154,7 +162,7 @@ struct MetricsCapacityWorker {
     stats: AudioStats,
     sample_rate: f32,
     frames_played: Arc<AtomicU64>,
-    event_send: Sender<EventDispatch>,
+    event_dispatch: ControlEventDispatch,
     #[cfg(test)]
     send_observer: Option<Sender<CapacityEventSendOutcome>>,
     #[cfg(test)]
@@ -182,7 +190,7 @@ impl CapacityWorkerRunner for MetricsCapacityWorker {
             stats: self.stats.clone(),
             sample_rate: self.sample_rate,
             frames_played: Arc::clone(&self.frames_played),
-            event_send: self.event_send.clone(),
+            event_dispatch: self.event_dispatch.clone(),
             timestamp,
             previous,
             #[cfg(test)]
@@ -195,7 +203,7 @@ struct PreparedMetricsCapacityWorker {
     stats: AudioStats,
     sample_rate: f32,
     frames_played: Arc<AtomicU64>,
-    event_send: Sender<EventDispatch>,
+    event_dispatch: ControlEventDispatch,
     timestamp: f64,
     previous: AudioStatsSnapshot,
     #[cfg(test)]
@@ -230,14 +238,25 @@ impl PreparedCapacityWorker for PreparedMetricsCapacityWorker {
             }
 
             let peak_load = self.stats.take_peak_load();
-            let event = render_capacity_event(self.timestamp, self.previous, next, peak_load);
-            let outcome = match self
-                .event_send
-                .try_send(EventDispatch::render_capacity(event))
-            {
-                Ok(()) => CapacityEventSendOutcome::Delivered,
-                Err(TrySendError::Full(_)) => CapacityEventSendOutcome::Full,
-                Err(TrySendError::Disconnected(_)) => CapacityEventSendOutcome::Disconnected,
+            let timestamp = self.timestamp;
+            let previous = self.previous;
+            let outcome = match self.event_dispatch.try_send_with(move || {
+                EventDispatch::render_capacity(render_capacity_event(
+                    timestamp, previous, next, peak_load,
+                ))
+            }) {
+                ControlEventSendOutcome::Delivered => CapacityEventSendOutcome::Delivered,
+                ControlEventSendOutcome::Full => CapacityEventSendOutcome::Full,
+                ControlEventSendOutcome::Disconnected => CapacityEventSendOutcome::Disconnected,
+                ControlEventSendOutcome::AdmissionRejected(AdmissionError::Contended) => {
+                    CapacityEventSendOutcome::Dropped
+                }
+                ControlEventSendOutcome::AdmissionRejected(
+                    AdmissionError::Sealed
+                    | AdmissionError::Poisoned
+                    | AdmissionError::Exhausted
+                    | AdmissionError::CapacityWorkerActive,
+                ) => CapacityEventSendOutcome::Disconnected,
             };
             if outcome == CapacityEventSendOutcome::Disconnected {
                 #[cfg(test)]
@@ -260,6 +279,9 @@ impl PreparedCapacityWorker for PreparedMetricsCapacityWorker {
 enum CapacityEventSendOutcome {
     Delivered,
     Full,
+    /// A diagnostic tick lost non-waiting admission contention. The interval is intentionally
+    /// dropped just like a full queue, and the worker remains live.
+    Dropped,
     Disconnected,
 }
 
@@ -301,18 +323,52 @@ impl CapacityWorker {
 struct CapacityServiceState {
     transition_in_progress: bool,
     closed: bool,
-    worker: Option<CapacityWorker>,
+    worker: Option<CapacityWorkerHandle>,
+}
+
+#[derive(Clone)]
+enum CapacityServiceMode {
+    Legacy,
+    /// The gate, rather than this service, owns every committed `JoinHandle`. The service retains
+    /// only the exact id needed to atomically take that owner for ordinary stop/restart.
+    Injected(InjectedContextAdmissionGate),
+}
+
+enum CapacityWorkerHandle {
+    Legacy(CapacityWorker),
+    Injected(CapacityWorkerId),
 }
 
 struct AudioRenderCapacityService {
     state: Mutex<CapacityServiceState>,
     transition_done: Condvar,
     runner: Arc<dyn CapacityWorkerRunner>,
+    mode: CapacityServiceMode,
 }
 
 enum CapacityTransition {
     Closed,
-    Active(Option<CapacityWorker>),
+    Active(Option<CapacityWorkerHandle>),
+}
+
+#[derive(Default)]
+struct CapacityRetirement {
+    panicked: bool,
+    /// A seal, poison, or registry mismatch owns/quarantines the retirement authority. The
+    /// service must permanently refuse restart rather than guess that no worker remains.
+    terminal: bool,
+}
+
+enum CapacityStartFailure {
+    Spawn(std::io::Error),
+    Admission(AdmissionError),
+}
+
+struct CapacityStartResult {
+    worker: Option<CapacityWorkerHandle>,
+    retirement_panicked: bool,
+    terminal: bool,
+    failure: Option<CapacityStartFailure>,
 }
 
 impl AudioRenderCapacityService {
@@ -321,6 +377,19 @@ impl AudioRenderCapacityService {
             state: Mutex::new(CapacityServiceState::default()),
             transition_done: Condvar::new(),
             runner,
+            mode: CapacityServiceMode::Legacy,
+        }
+    }
+
+    fn new_injected(
+        runner: Arc<dyn CapacityWorkerRunner>,
+        gate: InjectedContextAdmissionGate,
+    ) -> Self {
+        Self {
+            state: Mutex::new(CapacityServiceState::default()),
+            transition_done: Condvar::new(),
+            runner,
+            mode: CapacityServiceMode::Injected(gate),
         }
     }
 
@@ -345,18 +414,164 @@ impl AudioRenderCapacityService {
         CapacityTransition::Active(state.worker.take())
     }
 
-    fn finish_transition(&self, worker: Option<CapacityWorker>) {
+    fn finish_transition(&self, worker: Option<CapacityWorkerHandle>, force_closed: bool) {
         let mut state = self.lock_state();
         debug_assert!(state.transition_in_progress);
         debug_assert!(state.worker.is_none());
         state.worker = worker;
+        state.closed |= force_closed;
         state.transition_in_progress = false;
         drop(state);
         self.transition_done.notify_all();
     }
 
-    fn retire(worker: Option<CapacityWorker>) -> bool {
-        worker.is_some_and(CapacityWorker::stop_and_join)
+    fn quarantine_join_error(error: CapacityWorkerJoinError) -> bool {
+        let CapacityWorkerJoinError::Panicked(payload) = error;
+        // Panic payloads are arbitrary. Forget before logging or touching shared lifecycle state,
+        // since even destructing a hostile payload may panic.
+        std::mem::forget(payload);
+        true
+    }
+
+    fn retire(
+        mode: &CapacityServiceMode,
+        worker: Option<CapacityWorkerHandle>,
+    ) -> CapacityRetirement {
+        let Some(worker) = worker else {
+            return CapacityRetirement::default();
+        };
+        match (mode, worker) {
+            (CapacityServiceMode::Legacy, CapacityWorkerHandle::Legacy(worker)) => {
+                CapacityRetirement {
+                    panicked: worker.stop_and_join(),
+                    terminal: false,
+                }
+            }
+            (CapacityServiceMode::Injected(gate), CapacityWorkerHandle::Injected(id)) => loop {
+                match gate.try_take_capacity_worker(id) {
+                    Ok(Some(worker)) => {
+                        break CapacityRetirement {
+                            panicked: worker
+                                .stop_and_join()
+                                .err()
+                                .is_some_and(Self::quarantine_join_error),
+                            terminal: false,
+                        };
+                    }
+                    Ok(None) => {
+                        // An id mismatch can only be caused by private misuse. No owner is dropped
+                        // here; fail closed because another authority may still own a live worker.
+                        break CapacityRetirement {
+                            panicked: false,
+                            terminal: true,
+                        };
+                    }
+                    Err(AdmissionError::Contended) => std::thread::yield_now(),
+                    Err(
+                        AdmissionError::Sealed
+                        | AdmissionError::Poisoned
+                        | AdmissionError::Exhausted
+                        | AdmissionError::CapacityWorkerActive,
+                    ) => {
+                        // Sealing extracted the owner; poison retains it in the inaccessible gate
+                        // registry. In the poisoned case `stop()` cannot truthfully acknowledge
+                        // signaling or joining the worker: its owner stays quarantined for the
+                        // process lifetime. In either case this service must never start a
+                        // replacement.
+                        break CapacityRetirement {
+                            panicked: false,
+                            terminal: true,
+                        };
+                    }
+                }
+            },
+            _ => unreachable!("capacity worker ownership mode is immutable"),
+        }
+    }
+
+    fn start_worker(&self, update_interval: Duration) -> CapacityStartResult {
+        match &self.mode {
+            CapacityServiceMode::Legacy => {
+                let prepared = self.runner.prepare();
+                match CapacityWorker::spawn(prepared, update_interval) {
+                    Ok(worker) => CapacityStartResult {
+                        worker: Some(CapacityWorkerHandle::Legacy(worker)),
+                        retirement_panicked: false,
+                        terminal: false,
+                        failure: None,
+                    },
+                    Err(error) => CapacityStartResult {
+                        worker: None,
+                        retirement_panicked: false,
+                        terminal: false,
+                        failure: Some(CapacityStartFailure::Spawn(error)),
+                    },
+                }
+            }
+            CapacityServiceMode::Injected(gate) => {
+                let registration = loop {
+                    match gate.try_begin_capacity_worker() {
+                        Ok(registration) => break registration,
+                        Err(AdmissionError::Contended) => std::thread::yield_now(),
+                        Err(error) => {
+                            return CapacityStartResult {
+                                worker: None,
+                                retirement_panicked: false,
+                                terminal: true,
+                                failure: Some(CapacityStartFailure::Admission(error)),
+                            };
+                        }
+                    }
+                };
+
+                // The bound registration/producer lease is acquired before baseline preparation.
+                // A concurrent seal therefore observes and drains this whole start attempt.
+                let prepared = self.runner.prepare();
+                let started =
+                    match registration.start(move |stop| prepared.run(stop, update_interval)) {
+                        Ok(started) => started,
+                        Err(error) => {
+                            return CapacityStartResult {
+                                worker: None,
+                                retirement_panicked: false,
+                                terminal: false,
+                                failure: Some(CapacityStartFailure::Spawn(error)),
+                            };
+                        }
+                    };
+                let mut started = started;
+                loop {
+                    match started.try_commit() {
+                        Ok(id) => {
+                            return CapacityStartResult {
+                                worker: Some(CapacityWorkerHandle::Injected(id)),
+                                retirement_panicked: false,
+                                terminal: false,
+                                failure: None,
+                            };
+                        }
+                        Err(failure) => {
+                            let (error, returned) = failure.into_parts();
+                            if error == AdmissionError::Contended {
+                                started = returned;
+                                std::thread::yield_now();
+                                continue;
+                            }
+                            let retirement_panicked = returned
+                                .stop_and_join()
+                                .err()
+                                .is_some_and(Self::quarantine_join_error);
+                            return CapacityStartResult {
+                                worker: None,
+                                retirement_panicked,
+                                terminal: true,
+                                failure: Some(CapacityStartFailure::Admission(error)),
+                            };
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn report_retirement_panic(panicked: bool) {
@@ -364,6 +579,18 @@ impl AudioRenderCapacityService {
             // The transition is already coherent and the hostile payload has already been
             // forgotten, so even an adversarial logger cannot strand the service mutex/state.
             log::error!("AudioRenderCapacity worker panicked");
+        }
+    }
+
+    fn report_start_failure(failure: Option<CapacityStartFailure>) {
+        match failure {
+            Some(CapacityStartFailure::Spawn(error)) => {
+                log::error!("Failed to start AudioRenderCapacity worker: {error}");
+            }
+            Some(CapacityStartFailure::Admission(error)) => {
+                log::error!("AudioRenderCapacity admission failed closed: {error:?}");
+            }
+            None => {}
         }
     }
 
@@ -375,7 +602,12 @@ impl AudioRenderCapacityService {
         // No service-state lock is held while waiting for the predecessor or spawning its
         // replacement. Other lifecycle calls wait on the condition variable and cannot orphan a
         // handle or overlap a worker.
-        let predecessor_panicked = Self::retire(previous);
+        let predecessor = Self::retire(&self.mode, previous);
+        if predecessor.terminal {
+            self.finish_transition(None, true);
+            Self::report_retirement_panic(predecessor.panicked);
+            return;
+        }
 
         // Preserve legacy ordering: start first retires its predecessor, then applies the 1 ms
         // floor and converts the requested interval. Positive infinity therefore still stops the
@@ -386,41 +618,34 @@ impl AudioRenderCapacityService {
         let update_interval = match update_interval {
             Ok(interval) => interval,
             Err(payload) => {
-                self.finish_transition(None);
-                Self::report_retirement_panic(predecessor_panicked);
+                self.finish_transition(None, false);
+                Self::report_retirement_panic(predecessor.panicked);
                 std::panic::resume_unwind(payload);
             }
         };
 
-        // Baseline preparation is synchronous, after predecessor join and before spawn/return.
-        let prepared = self.runner.prepare();
-        let (worker, spawn_error) = match CapacityWorker::spawn(prepared, update_interval) {
-            Ok(worker) => (Some(worker), None),
-            Err(error) => (None, Some(error)),
-        };
-        self.finish_transition(worker);
-        Self::report_retirement_panic(predecessor_panicked);
-        if let Some(error) = spawn_error {
-            log::error!("Failed to start AudioRenderCapacity worker: {error}");
-        }
+        let started = self.start_worker(update_interval);
+        self.finish_transition(started.worker, started.terminal);
+        Self::report_retirement_panic(predecessor.panicked || started.retirement_panicked);
+        Self::report_start_failure(started.failure);
     }
 
     fn stop(&self) {
         let CapacityTransition::Active(worker) = self.begin_transition(false) else {
             return;
         };
-        let panicked = Self::retire(worker);
-        self.finish_transition(None);
-        Self::report_retirement_panic(panicked);
+        let retired = Self::retire(&self.mode, worker);
+        self.finish_transition(None, retired.terminal);
+        Self::report_retirement_panic(retired.panicked);
     }
 
     fn close(&self) {
         let CapacityTransition::Active(worker) = self.begin_transition(true) else {
             return;
         };
-        let panicked = Self::retire(worker);
-        self.finish_transition(None);
-        Self::report_retirement_panic(panicked);
+        let retired = Self::retire(&self.mode, worker);
+        self.finish_transition(None, retired.terminal);
+        Self::report_retirement_panic(retired.panicked);
     }
 }
 
@@ -433,8 +658,8 @@ impl Drop for AudioRenderCapacityService {
         debug_assert!(!state.transition_in_progress);
         state.closed = true;
         let worker = state.worker.take();
-        let panicked = Self::retire(worker);
-        Self::report_retirement_panic(panicked);
+        let retired = Self::retire(&self.mode, worker);
+        Self::report_retirement_panic(retired.panicked);
     }
 }
 
@@ -481,6 +706,7 @@ mod tests {
     use super::*;
     use crate::context::{AudioContext, AudioContextOptions};
     use crate::events::EventLoop;
+    use crate::io::{self, ControlThreadInit, RenderThreadInit};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -549,6 +775,80 @@ mod tests {
         (Arc::new(AudioRenderCapacityService::new(runner)), probe)
     }
 
+    fn counting_service_injected() -> (
+        Arc<AudioRenderCapacityService>,
+        Arc<WorkerProbe>,
+        InjectedContextAdmissionGate,
+    ) {
+        let probe = Arc::new(WorkerProbe::default());
+        let runner: Arc<dyn CapacityWorkerRunner> = Arc::new(CountingRunner(Arc::clone(&probe)));
+        let gate = InjectedContextAdmissionGate::new();
+        (
+            Arc::new(AudioRenderCapacityService::new_injected(
+                runner,
+                gate.clone(),
+            )),
+            probe,
+            gate,
+        )
+    }
+
+    fn seal_gate(gate: &InjectedContextAdmissionGate) -> crate::context::AdmissionSnapshot {
+        let sealed = loop {
+            match gate.try_seal() {
+                Ok(sealed) => break sealed,
+                Err(AdmissionError::Contended) => thread::yield_now(),
+                Err(error) => panic!("unexpected admission seal failure: {error:?}"),
+            }
+        };
+        let (worker, drain) = sealed.into_parts();
+        if let Some(worker) = worker {
+            if let Err(CapacityWorkerJoinError::Panicked(payload)) = worker.stop_and_join() {
+                std::mem::forget(payload);
+                panic!("injected capacity worker panicked while sealing");
+            }
+        }
+        drain.wait()
+    }
+
+    fn injected_base_harness(
+        gate: InjectedContextAdmissionGate,
+    ) -> (
+        ConcreteBaseAudioContext,
+        AudioStats,
+        EventLoop,
+        RenderThreadInit,
+    ) {
+        let (control, render) = io::thread_init();
+        let ControlThreadInit {
+            state,
+            frames_played,
+            stats,
+            ctrl_msg_send,
+            control_batch_send,
+            control_batch_applied,
+            event_send,
+            event_recv,
+        } = control;
+        let event_loop = EventLoop::new(event_recv);
+        let (_node_id_producer, node_id_consumer) = llq::Queue::new().split();
+        let base = ConcreteBaseAudioContext::new_injected(
+            48_000.,
+            2,
+            state,
+            frames_played,
+            ctrl_msg_send,
+            control_batch_send,
+            control_batch_applied,
+            event_send,
+            event_loop.clone(),
+            false,
+            node_id_consumer,
+            gate,
+        );
+        (base, stats, event_loop, render)
+    }
+
     #[test]
     fn test_same_instance() {
         let options = AudioContextOptions {
@@ -564,6 +864,117 @@ mod tests {
         // assert all items are actually the same instance
         assert!(Arc::ptr_eq(&rc1.service, &rc2.service));
         assert!(Arc::ptr_eq(&rc1.service, &rc3.service));
+    }
+
+    #[test]
+    fn injected_base_and_capacity_clones_share_seal_while_render_sender_stays_ungated() {
+        let gate = InjectedContextAdmissionGate::new();
+        let (base, stats, event_loop, render_init) = injected_base_harness(gate.clone());
+        let surviving_base = base.clone();
+        let capacity = AudioRenderCapacity::new(base, stats);
+        let surviving_capacity = capacity.clone();
+
+        capacity.start(AudioRenderCapacityOptions {
+            update_interval: 60.,
+        });
+        capacity.stop();
+        capacity.start(AudioRenderCapacityOptions {
+            update_interval: 60.,
+        });
+        capacity.start(AudioRenderCapacityOptions {
+            update_interval: 60.,
+        });
+        assert!(matches!(
+            gate.try_begin_capacity_worker(),
+            Err(AdmissionError::CapacityWorkerActive)
+        ));
+
+        let sealed = gate.try_seal().unwrap();
+        let (worker, drain) = sealed.into_parts();
+        let worker = worker.unwrap();
+        assert_eq!(worker.id().get(), 3);
+        worker.stop_and_join().unwrap();
+        assert!(drain.wait().is_drained());
+
+        let factory_called = AtomicBool::new(false);
+        assert_eq!(
+            surviving_base.send_event_with(|| {
+                factory_called.store(true, Ordering::Release);
+                EventDispatch::sink_change()
+            }),
+            Err(ControlEventSendOutcome::AdmissionRejected(
+                AdmissionError::Sealed
+            ))
+        );
+        assert!(!factory_called.load(Ordering::Acquire));
+
+        // The service holds only the stale committed id. It cannot recover the sealed worker or
+        // install another one, even through a public clone retained past context sealing.
+        surviving_capacity.start(AudioRenderCapacityOptions {
+            update_interval: 0.001,
+        });
+        assert!(surviving_capacity.service.lock_state().closed);
+        surviving_capacity.stop();
+
+        // Render-owned production is intentionally a separate raw capability. Admission drain is
+        // not, and must not later be promoted directly into, EventProducersQuiesced.
+        let (handled_send, handled_recv) = mpsc::sync_channel(1);
+        event_loop.set_handler(
+            EventType::SinkChange,
+            EventHandler::Once(Box::new(move |_| handled_send.send(()).unwrap())),
+        );
+        render_init
+            .event_send
+            .try_send(EventDispatch::sink_change())
+            .unwrap();
+        assert!(event_loop.handle_pending_events());
+        handled_recv.recv_timeout(TEST_TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn injected_base_full_send_holds_drain_through_rejected_payload_drop() {
+        struct BlockingDropControl {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+        struct BlockingDrop(&'static BlockingDropControl);
+        impl Drop for BlockingDrop {
+            fn drop(&mut self) {
+                self.0.entered.send(()).unwrap();
+                self.0.release.recv().unwrap();
+            }
+        }
+
+        let gate = InjectedContextAdmissionGate::new();
+        let (base, _stats, _event_loop, render_init) = injected_base_harness(gate.clone());
+        for _ in 0..256 {
+            render_init
+                .event_send
+                .try_send(EventDispatch::sink_change())
+                .unwrap();
+        }
+        let (drop_entered_send, drop_entered_recv) = crossbeam_channel::bounded(1);
+        let (drop_release_send, drop_release_recv) = crossbeam_channel::bounded(1);
+        let drop_control: &'static BlockingDropControl = Box::leak(Box::new(BlockingDropControl {
+            entered: drop_entered_send,
+            release: drop_release_recv,
+        }));
+        let sender = thread::spawn(move || {
+            base.send_event_with(|| {
+                EventDispatch::message(
+                    crate::context::AudioNodeId(92),
+                    Box::new(BlockingDrop(drop_control)),
+                )
+            })
+        });
+        drop_entered_recv.recv_timeout(TEST_TIMEOUT).unwrap();
+
+        let sealed = gate.try_seal().unwrap();
+        let (_, drain) = sealed.into_parts();
+        assert_eq!(drain.snapshot().external_events, 1);
+        drop_release_send.send(()).unwrap();
+        assert_eq!(sender.join().unwrap(), Err(ControlEventSendOutcome::Full));
+        assert!(drain.wait().is_drained());
     }
 
     #[test]
@@ -676,6 +1087,188 @@ mod tests {
     }
 
     #[test]
+    fn injected_restart_takes_and_joins_gate_owned_predecessor() {
+        let (service, probe, gate) = counting_service_injected();
+        service.start(60.);
+        probe.wait_for(|probe| probe.live.load(Ordering::Acquire) == 1);
+        service.start(60.);
+        probe.wait_for(|probe| probe.starts.load(Ordering::Acquire) == 2);
+
+        assert_eq!(probe.max_live.load(Ordering::Acquire), 1);
+        assert_eq!(probe.live.load(Ordering::Acquire), 1);
+        service.stop();
+        assert_eq!(probe.live.load(Ordering::Acquire), 0);
+        assert_eq!(probe.exits.load(Ordering::Acquire), 2);
+        assert!(seal_gate(&gate).is_drained());
+    }
+
+    #[test]
+    fn injected_start_losing_seal_race_joins_uncommitted_worker_and_closes_service() {
+        struct BlockingPrepareRunner {
+            probe: Arc<WorkerProbe>,
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+        impl CapacityWorkerRunner for BlockingPrepareRunner {
+            fn prepare(&self) -> Box<dyn PreparedCapacityWorker> {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+                Box::new(PreparedCountingRunner(Arc::clone(&self.probe)))
+            }
+        }
+
+        let probe = Arc::new(WorkerProbe::default());
+        let gate = InjectedContextAdmissionGate::new();
+        let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+        let (release_send, release_recv) = crossbeam_channel::bounded(1);
+        let runner: Arc<dyn CapacityWorkerRunner> = Arc::new(BlockingPrepareRunner {
+            probe: Arc::clone(&probe),
+            entered: entered_send,
+            release: release_recv,
+        });
+        let service = Arc::new(AudioRenderCapacityService::new_injected(
+            runner,
+            gate.clone(),
+        ));
+        let starter_service = Arc::clone(&service);
+        let starter = thread::spawn(move || starter_service.start(60.));
+        entered_recv.recv_timeout(TEST_TIMEOUT).unwrap();
+
+        let sealed = loop {
+            match gate.try_seal() {
+                Ok(sealed) => break sealed,
+                Err(AdmissionError::Contended) => thread::yield_now(),
+                Err(error) => panic!("unexpected admission seal failure: {error:?}"),
+            }
+        };
+        let (worker, drain) = sealed.into_parts();
+        assert!(worker.is_none(), "the worker has not reached commit");
+        assert_eq!(drain.snapshot().capacity_registrations, 1);
+        assert_eq!(drain.snapshot().capacity_producers, 1);
+
+        release_send.send(()).unwrap();
+        starter.join().unwrap();
+        assert!(drain.wait().is_drained());
+        assert_eq!(probe.starts.load(Ordering::Acquire), 1);
+        assert_eq!(probe.exits.load(Ordering::Acquire), 1);
+        assert_eq!(probe.live.load(Ordering::Acquire), 0);
+
+        // A surviving service clone observes the terminal start result and cannot create a worker.
+        service.start(0.001);
+        assert_eq!(probe.starts.load(Ordering::Acquire), 1);
+        let state = service.lock_state();
+        assert!(state.closed);
+        assert!(state.worker.is_none());
+    }
+
+    #[test]
+    fn injected_structural_contention_is_retried_without_losing_worker_authority() {
+        let (service, probe, gate) = counting_service_injected();
+        let (lock_entered_send, lock_entered_recv) = crossbeam_channel::bounded(1);
+        let (lock_release_send, lock_release_recv) = crossbeam_channel::bounded(1);
+        let locking_gate = gate.clone();
+        let locker = thread::spawn(move || {
+            locking_gate.hold_phase_lock_for_test(lock_entered_send, lock_release_recv);
+        });
+        lock_entered_recv.recv_timeout(TEST_TIMEOUT).unwrap();
+
+        let (start_done_send, start_done_recv) = crossbeam_channel::bounded(1);
+        let starting_service = Arc::clone(&service);
+        let starter = thread::spawn(move || {
+            starting_service.start(60.);
+            start_done_send.send(()).unwrap();
+        });
+        assert!(matches!(
+            start_done_recv.recv_timeout(Duration::from_millis(30)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(probe.starts.load(Ordering::Acquire), 0);
+        lock_release_send.send(()).unwrap();
+        locker.join().unwrap();
+        start_done_recv.recv_timeout(TEST_TIMEOUT).unwrap();
+        starter.join().unwrap();
+        probe.wait_for(|probe| probe.live.load(Ordering::Acquire) == 1);
+
+        service.stop();
+        assert_eq!(probe.starts.load(Ordering::Acquire), 1);
+        assert_eq!(probe.exits.load(Ordering::Acquire), 1);
+        assert!(seal_gate(&gate).is_drained());
+    }
+
+    #[test]
+    fn injected_poison_before_start_fails_closed_without_spawning() {
+        let (service, probe, gate) = counting_service_injected();
+        let poisoning_gate = gate.clone();
+        assert!(
+            thread::spawn(move || poisoning_gate.poison_phase_lock_for_test())
+                .join()
+                .is_err()
+        );
+
+        service.start(0.001);
+        assert_eq!(probe.starts.load(Ordering::Acquire), 0);
+        let state = service.lock_state();
+        assert!(state.closed);
+        assert!(state.worker.is_none());
+    }
+
+    #[test]
+    fn injected_stop_and_seal_race_transfer_the_single_join_owner() {
+        let (service, probe, gate) = counting_service_injected();
+        service.start(60.);
+        probe.wait_for(|probe| probe.live.load(Ordering::Acquire) == 1);
+
+        let race = Arc::new(Barrier::new(3));
+        let stopping_service = Arc::clone(&service);
+        let stop_race = Arc::clone(&race);
+        let stopping = thread::spawn(move || {
+            stop_race.wait();
+            stopping_service.stop();
+        });
+        let sealing_gate = gate.clone();
+        let seal_race = Arc::clone(&race);
+        let sealing = thread::spawn(move || {
+            seal_race.wait();
+            seal_gate(&sealing_gate)
+        });
+        race.wait();
+        stopping.join().unwrap();
+        assert!(sealing.join().unwrap().is_drained());
+
+        assert_eq!(probe.starts.load(Ordering::Acquire), 1);
+        assert_eq!(probe.exits.load(Ordering::Acquire), 1);
+        assert_eq!(probe.live.load(Ordering::Acquire), 0);
+        service.start(0.001);
+        assert_eq!(probe.starts.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn injected_final_service_drop_and_seal_race_do_not_detach_worker() {
+        let (service, probe, gate) = counting_service_injected();
+        service.start(60.);
+        probe.wait_for(|probe| probe.live.load(Ordering::Acquire) == 1);
+
+        let race = Arc::new(Barrier::new(3));
+        let drop_race = Arc::clone(&race);
+        let dropping = thread::spawn(move || {
+            drop_race.wait();
+            drop(service);
+        });
+        let seal_race = Arc::clone(&race);
+        let sealing_gate = gate.clone();
+        let sealing = thread::spawn(move || {
+            seal_race.wait();
+            seal_gate(&sealing_gate)
+        });
+        race.wait();
+        dropping.join().unwrap();
+        assert!(sealing.join().unwrap().is_drained());
+        assert_eq!(probe.starts.load(Ordering::Acquire), 1);
+        assert_eq!(probe.exits.load(Ordering::Acquire), 1);
+        assert_eq!(probe.live.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn concurrent_starts_are_linearized_without_orphaning_workers() {
         let (service, probe) = counting_service();
         let barrier = Arc::new(Barrier::new(9));
@@ -756,7 +1349,7 @@ mod tests {
             stats: stats.clone(),
             sample_rate: 48_000.,
             frames_played: Arc::new(AtomicU64::new(0)),
-            event_send,
+            event_dispatch: ControlEventDispatch::legacy_for_test(event_send),
             send_observer: None,
             ready_observer: Some(ready_send),
         };
@@ -798,7 +1391,7 @@ mod tests {
             stats: stats.clone(),
             sample_rate: 48_000.,
             frames_played: Arc::clone(&frames_played),
-            event_send,
+            event_dispatch: ControlEventDispatch::legacy_for_test(event_send),
             send_observer: Some(observer_send),
             ready_observer: Some(ready_send),
         };
@@ -842,6 +1435,169 @@ mod tests {
     }
 
     #[test]
+    fn injected_tick_admitted_before_seal_finishes_then_worker_is_joined_and_drained() {
+        let stats = AudioStats::new();
+        let gate = InjectedContextAdmissionGate::new();
+        let (event_send, event_recv) = crossbeam_channel::bounded(1);
+        let (admitted_send, admitted_recv) = crossbeam_channel::bounded(1);
+        let (release_send, release_recv) = crossbeam_channel::bounded(1);
+        let after_admission: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            admitted_send.send(()).unwrap();
+            release_recv.recv().unwrap();
+        });
+        let event_dispatch =
+            ControlEventDispatch::injected_with_observer(event_send, gate.clone(), after_admission);
+        let (observer_send, observer_recv) = crossbeam_channel::unbounded();
+        let (ready_send, ready_recv) = crossbeam_channel::bounded(1);
+        let runner = MetricsCapacityWorker {
+            stats: stats.clone(),
+            sample_rate: 48_000.,
+            frames_played: Arc::new(AtomicU64::new(0)),
+            event_dispatch,
+            send_observer: Some(observer_send),
+            ready_observer: Some(ready_send),
+        };
+        let service = AudioRenderCapacityService::new_injected(Arc::new(runner), gate.clone());
+        service.start(0.001);
+        assert_eq!(ready_recv.try_recv(), Ok(()));
+        stats.record_render_callback(1, 1);
+        admitted_recv.recv_timeout(TEST_TIMEOUT).unwrap();
+
+        let sealed = loop {
+            match gate.try_seal() {
+                Ok(sealed) => break sealed,
+                Err(AdmissionError::Contended) => thread::yield_now(),
+                Err(error) => panic!("unexpected admission seal failure: {error:?}"),
+            }
+        };
+        let (worker, drain) = sealed.into_parts();
+        assert_eq!(drain.snapshot().external_events, 1);
+        assert_eq!(drain.snapshot().capacity_producers, 1);
+        release_send.send(()).unwrap();
+        assert_eq!(
+            observer_recv.recv_timeout(TEST_TIMEOUT).unwrap(),
+            CapacityEventSendOutcome::Delivered
+        );
+        worker.unwrap().stop_and_join().unwrap();
+        assert!(drain.wait().is_drained());
+        assert!(event_recv.try_recv().is_ok());
+
+        // The service still has a stale id, but the gate owns the irreversible decision. A
+        // surviving clone cannot take or replace the worker after sealing.
+        service.start(0.001);
+        assert!(service.lock_state().closed);
+    }
+
+    #[test]
+    fn injected_diagnostic_tick_drops_on_contention_and_worker_continues() {
+        let stats = AudioStats::new();
+        let gate = InjectedContextAdmissionGate::new();
+        let (event_send, event_recv) = crossbeam_channel::bounded(2);
+        let (observer_send, observer_recv) = crossbeam_channel::unbounded();
+        let (ready_send, ready_recv) = crossbeam_channel::bounded(1);
+        let runner = MetricsCapacityWorker {
+            stats: stats.clone(),
+            sample_rate: 48_000.,
+            frames_played: Arc::new(AtomicU64::new(0)),
+            event_dispatch: ControlEventDispatch::injected(event_send, gate.clone()),
+            send_observer: Some(observer_send),
+            ready_observer: Some(ready_send),
+        };
+        let service = AudioRenderCapacityService::new_injected(Arc::new(runner), gate.clone());
+        service.start(0.001);
+        ready_recv.recv_timeout(TEST_TIMEOUT).unwrap();
+
+        let (lock_entered_send, lock_entered_recv) = crossbeam_channel::bounded(1);
+        let (lock_release_send, lock_release_recv) = crossbeam_channel::bounded(1);
+        let locking_gate = gate.clone();
+        let locker = thread::spawn(move || {
+            locking_gate.hold_phase_lock_for_test(lock_entered_send, lock_release_recv);
+        });
+        lock_entered_recv.recv_timeout(TEST_TIMEOUT).unwrap();
+        stats.record_render_callback(1, 1);
+        assert_eq!(
+            observer_recv.recv_timeout(TEST_TIMEOUT).unwrap(),
+            CapacityEventSendOutcome::Dropped
+        );
+        assert!(event_recv.try_recv().is_err());
+
+        lock_release_send.send(()).unwrap();
+        locker.join().unwrap();
+        stats.record_render_callback(1, 1);
+        assert_eq!(
+            observer_recv.recv_timeout(TEST_TIMEOUT).unwrap(),
+            CapacityEventSendOutcome::Delivered
+        );
+        assert!(event_recv.recv_timeout(TEST_TIMEOUT).is_ok());
+        service.stop();
+        assert!(seal_gate(&gate).is_drained());
+    }
+
+    #[test]
+    fn injected_full_and_disconnect_cleanup_are_admitted_and_terminal_rejection_is_lazy() {
+        struct BlockingDropControl {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+        struct BlockingDrop(&'static BlockingDropControl);
+        impl Drop for BlockingDrop {
+            fn drop(&mut self) {
+                self.0.entered.send(()).unwrap();
+                self.0.release.recv().unwrap();
+            }
+        }
+
+        let gate = InjectedContextAdmissionGate::new();
+        let (event_send, event_recv) = crossbeam_channel::bounded(1);
+        event_send.try_send(EventDispatch::sink_change()).unwrap();
+        let dispatch = ControlEventDispatch::injected(event_send, gate.clone());
+        let (drop_entered_send, drop_entered_recv) = crossbeam_channel::bounded(1);
+        let (drop_release_send, drop_release_recv) = crossbeam_channel::bounded(1);
+        let drop_control: &'static BlockingDropControl = Box::leak(Box::new(BlockingDropControl {
+            entered: drop_entered_send,
+            release: drop_release_recv,
+        }));
+        let sending_dispatch = dispatch.clone();
+        let sending = thread::spawn(move || {
+            sending_dispatch.try_send_with(|| {
+                EventDispatch::message(
+                    crate::context::AudioNodeId(91),
+                    Box::new(BlockingDrop(drop_control)),
+                )
+            })
+        });
+        drop_entered_recv.recv_timeout(TEST_TIMEOUT).unwrap();
+
+        let sealed = gate.try_seal().unwrap();
+        let (_, drain) = sealed.into_parts();
+        assert_eq!(drain.snapshot().external_events, 1);
+        drop_release_send.send(()).unwrap();
+        assert_eq!(sending.join().unwrap(), ControlEventSendOutcome::Full);
+        assert!(drain.wait().is_drained());
+
+        let factory_called = AtomicBool::new(false);
+        assert_eq!(
+            dispatch.try_send_with(|| {
+                factory_called.store(true, Ordering::Release);
+                EventDispatch::sink_change()
+            }),
+            ControlEventSendOutcome::AdmissionRejected(AdmissionError::Sealed)
+        );
+        assert!(!factory_called.load(Ordering::Acquire));
+        drop(event_recv);
+
+        let disconnected_gate = InjectedContextAdmissionGate::new();
+        let (event_send, event_recv) = crossbeam_channel::bounded(1);
+        drop(event_recv);
+        let disconnected = ControlEventDispatch::injected(event_send, disconnected_gate.clone());
+        assert_eq!(
+            disconnected.try_send_with(EventDispatch::sink_change),
+            ControlEventSendOutcome::Disconnected
+        );
+        assert!(seal_gate(&disconnected_gate).is_drained());
+    }
+
+    #[test]
     fn disconnected_event_receiver_exits_worker_and_is_joined_by_stop() {
         let stats = AudioStats::new();
         let (event_send, event_recv) = crossbeam_channel::bounded(1);
@@ -852,7 +1608,7 @@ mod tests {
             stats: stats.clone(),
             sample_rate: 48_000.,
             frames_played: Arc::new(AtomicU64::new(0)),
-            event_send,
+            event_dispatch: ControlEventDispatch::legacy_for_test(event_send),
             send_observer: Some(observer_send),
             ready_observer: Some(ready_send),
         };

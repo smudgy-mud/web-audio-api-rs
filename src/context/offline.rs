@@ -181,7 +181,7 @@ impl OfflineAudioContext {
         self.base.set_state(AudioContextState::Closed);
         let _ = self
             .base
-            .send_event(EventDispatch::complete(result.clone()));
+            .send_event_with(|| EventDispatch::complete(result.clone()));
 
         // spin the event loop once more to handle the statechange/complete events
         event_loop.handle_pending_events();
@@ -226,7 +226,7 @@ impl OfflineAudioContext {
         self.base.set_state(AudioContextState::Closed);
         let _ = self
             .base
-            .send_event(EventDispatch::complete(result.clone()));
+            .send_event_with(|| EventDispatch::complete(result.clone()));
 
         // spin the event loop once more to handle the statechange/complete events
         event_loop.handle_pending_events();
