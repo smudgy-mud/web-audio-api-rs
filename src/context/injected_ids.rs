@@ -16,7 +16,7 @@
 
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 
 use super::AudioNodeId;
@@ -180,6 +180,20 @@ pub(crate) enum ProvisionalNodeIdError {
     ProtocolViolation,
 }
 
+pub(crate) struct ProvisionalNodeRestoreFailure {
+    pub(crate) error: ProvisionalNodeIdError,
+    pub(crate) node: llq::Node<AudioNodeId>,
+}
+
+impl std::fmt::Debug for ProvisionalNodeRestoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvisionalNodeRestoreFailure")
+            .field("error", &self.error)
+            .field("id", &*self.node)
+            .finish()
+    }
+}
+
 /// Exact provisional reclaim nodes for one serialized constructor transaction.
 ///
 /// A fresh id allocates its reclaim node only after the caller has acquired all higher-level
@@ -190,10 +204,21 @@ pub(crate) enum ProvisionalNodeIdError {
 pub(crate) struct ProvisionalNodeIds {
     inner: Arc<InjectedNodeIdInner>,
     nodes: arrayvec::ArrayVec<Option<llq::Node<AudioNodeId>>, MAX_PROVISIONAL_NODE_IDS>,
-    committed: bool,
+    committed: AtomicBool,
+}
+
+/// Copy accepted-finalizer token. Construction proves every exact reclaim node has moved into the
+/// prepared batch; committing is therefore one infallible atomic store before registration arms.
+#[derive(Clone, Copy)]
+pub(crate) struct ProvisionalNodeIdCommit<'a> {
+    committed: &'a AtomicBool,
 }
 
 impl InjectedNodeIdAllocator {
+    pub(crate) fn identity(&self) -> InjectedNodeIdIdentity {
+        InjectedNodeIdIdentity(Weak::clone(&self.inner))
+    }
+
     pub(crate) fn try_reserve(
         &self,
         count: usize,
@@ -229,7 +254,7 @@ impl InjectedNodeIdAllocator {
         let mut reservation = ProvisionalNodeIds {
             inner: Arc::clone(&inner),
             nodes: arrayvec::ArrayVec::new(),
-            committed: false,
+            committed: AtomicBool::new(false),
         };
         let mut allocation = match inner.allocation.try_lock() {
             Ok(allocation) => allocation,
@@ -279,29 +304,55 @@ impl ProvisionalNodeIds {
         &mut self,
         index: usize,
         node: llq::Node<AudioNodeId>,
-    ) -> Result<(), ProvisionalNodeIdError> {
+    ) -> Result<(), ProvisionalNodeRestoreFailure> {
         let Some(slot) = self.nodes.get_mut(index) else {
-            return Err(ProvisionalNodeIdError::ProtocolViolation);
+            return Err(ProvisionalNodeRestoreFailure {
+                error: ProvisionalNodeIdError::ProtocolViolation,
+                node,
+            });
         };
         if slot.is_some() {
-            return Err(ProvisionalNodeIdError::ProtocolViolation);
+            return Err(ProvisionalNodeRestoreFailure {
+                error: ProvisionalNodeIdError::ProtocolViolation,
+                node,
+            });
         }
         *slot = Some(node);
         Ok(())
     }
 
-    pub(crate) fn commit(mut self) -> Result<(), ProvisionalNodeIdError> {
+    pub(crate) fn commit_token(
+        &self,
+    ) -> Result<ProvisionalNodeIdCommit<'_>, ProvisionalNodeIdError> {
         if self.nodes.iter().any(Option::is_some) {
             return Err(ProvisionalNodeIdError::ProtocolViolation);
         }
-        self.committed = true;
+        Ok(ProvisionalNodeIdCommit {
+            committed: &self.committed,
+        })
+    }
+
+    pub(crate) fn commit(self) -> Result<(), ProvisionalNodeIdError> {
+        self.commit_token()?.commit_accepted();
         Ok(())
+    }
+
+    /// Internal protocol failure after token movement: never publish any still-owned exact nodes
+    /// back to the allocator. Field destruction may destroy them, but they cannot be reused.
+    pub(crate) fn retain_unavailable(&self) {
+        self.committed.store(true, Ordering::Release);
+    }
+}
+
+impl ProvisionalNodeIdCommit<'_> {
+    pub(crate) fn commit_accepted(self) {
+        self.committed.store(true, Ordering::Release);
     }
 }
 
 impl Drop for ProvisionalNodeIds {
     fn drop(&mut self) {
-        if !self.committed {
+        if !self.committed.load(Ordering::Acquire) {
             let mut available = self
                 .inner
                 .available_return
@@ -443,7 +494,7 @@ impl InjectedNodeIdOwner {
     }
 
     #[cfg(test)]
-    fn set_release_hook_for_test(
+    pub(crate) fn set_release_hook_for_test(
         &self,
         entered: crossbeam_channel::Sender<()>,
         release: crossbeam_channel::Receiver<()>,

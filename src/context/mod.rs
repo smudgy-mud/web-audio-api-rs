@@ -24,6 +24,11 @@ pub(crate) use injected_ids::{InjectedGraphReclaimInit, InjectedGraphReclaimPubl
 
 mod injected_node_lifetime;
 
+mod injected_node_construction;
+pub(crate) use injected_node_construction::InjectedGainPayload;
+#[cfg(test)]
+mod injected_node_construction_tests;
+
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
 #[cfg(feature = "diagnostics")]
@@ -75,6 +80,12 @@ impl std::fmt::Debug for AudioNodeId {
 #[derive(Debug)]
 pub struct AudioParamId(u64);
 
+impl AudioParamId {
+    pub(crate) const fn from_node_id(id: AudioNodeId) -> Self {
+        Self(id.0)
+    }
+}
+
 // bit contrived, but for type safety only the context mod can access the inner u64
 impl From<&AudioParamId> for AudioNodeId {
     fn from(i: &AudioParamId) -> Self {
@@ -111,9 +122,12 @@ impl From<u8> for AudioContextState {
 /// Only when implementing the AudioNode trait manually, this struct is of any concern.
 ///
 /// This object allows for communication with the render thread and dynamic lifetime management.
-// The only way to construct this object is by calling [`BaseAudioContext::register`].
+// Legacy nodes receive this from [`BaseAudioContext::register`]; the private injected constructor
+// attaches an exact live-registration only after its whole batch is accepted.
 // This struct should not derive Clone because of the Drop handler.
 pub struct AudioContextRegistration {
+    /// Injected lifetime handle, explicitly dropped while `context` is still alive.
+    injected_lifetime: Option<injected_node_lifetime::InjectedNodeRegistration>,
     /// the audio context in which nodes and connections lives
     context: ConcreteBaseAudioContext,
     /// identify a specific `AudioNode`
@@ -133,6 +147,18 @@ impl std::fmt::Debug for AudioContextRegistration {
 }
 
 impl AudioContextRegistration {
+    pub(crate) fn from_injected(
+        id: AudioNodeId,
+        context: ConcreteBaseAudioContext,
+        lifetime: injected_node_lifetime::InjectedNodeRegistration,
+    ) -> Self {
+        Self {
+            injected_lifetime: Some(lifetime),
+            context,
+            id,
+        }
+    }
+
     /// Get the audio node id of the registration
     #[must_use]
     pub(crate) fn id(&self) -> AudioNodeId {
@@ -160,7 +186,13 @@ impl AudioContextRegistration {
 
 impl Drop for AudioContextRegistration {
     fn drop(&mut self) {
-        self.context.mark_node_dropped(self.id);
+        if let Some(lifetime) = self.injected_lifetime.take() {
+            // The exact constructor/lifetime capabilities remain alive through `context` while
+            // the injected handle publishes its teardown request.
+            drop(lifetime);
+        } else {
+            self.context.mark_node_dropped(self.id);
+        }
     }
 }
 

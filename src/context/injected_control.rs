@@ -478,10 +478,12 @@ impl ControlBatchReservation {
                 error,
             });
         }
-        Ok(self.into_prepared(commands))
+        Ok(self.into_prevalidated(commands))
     }
 
-    fn into_prepared(self, commands: Vec<ControlMessage>) -> PreparedControlBatch {
+    /// Concrete typed transactions may use this only after proving the reserved count and closed
+    /// command set before moving rollback tokens into `commands`.
+    pub(super) fn into_prevalidated(self, commands: Vec<ControlMessage>) -> PreparedControlBatch {
         let Self {
             inner,
             storage,
@@ -506,7 +508,7 @@ impl ControlBatchReservation {
 impl ControlHandleDroppedReservation {
     pub(crate) fn prepare(self, id: super::AudioNodeId) -> PreparedControlBatch {
         self.0
-            .into_prepared(vec![ControlMessage::ControlHandleDropped { id }])
+            .into_prevalidated(vec![ControlMessage::ControlHandleDropped { id }])
     }
 }
 
@@ -552,6 +554,58 @@ impl std::fmt::Debug for PreparedControlBatch {
 pub(crate) struct CommitControlFailure {
     pub(crate) error: InjectedControlError,
     pub(crate) batch: PreparedControlBatch,
+}
+
+struct RejectedControlAuthorities {
+    _inner: Arc<InjectedControlInner>,
+    _storage: ControlBatchPermit,
+    _command_credit: InjectedCommandCredit,
+    _sequence_reservation: BatchSequenceReservation,
+    _placement: ReservedPlacement,
+    _admission: GraphControlAdmission,
+}
+
+pub(super) enum RejectedControlRollback<R> {
+    Completed(R),
+    Panicked,
+}
+
+impl CommitControlFailure {
+    /// Runs one typed rollback over the owned rejected commands while every transport authority,
+    /// credit, and the graph admission remain live. The callback must recover all external
+    /// ownership tokens before destroying any other command payload.
+    pub(super) fn rollback_with_commands<R>(
+        self,
+        rollback: impl FnOnce(Box<[ControlMessage]>) -> R,
+    ) -> (InjectedControlError, RejectedControlRollback<R>) {
+        let Self { error, batch } = self;
+        let PreparedControlBatch {
+            commands,
+            inner,
+            storage,
+            command_credit,
+            sequence_reservation,
+            placement,
+            admission,
+        } = batch;
+        let authorities = RejectedControlAuthorities {
+            _inner: inner,
+            _storage: storage,
+            _command_credit: command_credit,
+            _sequence_reservation: sequence_reservation,
+            _placement: placement,
+            _admission: admission,
+        };
+        let result = match panic::catch_unwind(AssertUnwindSafe(|| rollback(commands))) {
+            Ok(result) => RejectedControlRollback::Completed(result),
+            Err(payload) => {
+                std::mem::forget(payload);
+                RejectedControlRollback::Panicked
+            }
+        };
+        drop(authorities);
+        (error, result)
+    }
 }
 
 impl std::fmt::Debug for CommitControlFailure {
@@ -641,6 +695,10 @@ pub(crate) struct FlushControlOutcome {
 }
 
 impl InjectedControlProducer {
+    pub(crate) fn admission_gate(&self) -> InjectedContextAdmissionGate {
+        self.inner.gate.clone()
+    }
+
     pub(crate) fn identity(&self) -> InjectedControlIdentity {
         InjectedControlIdentity(Arc::downgrade(&self.inner))
     }

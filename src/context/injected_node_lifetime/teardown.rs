@@ -572,7 +572,7 @@ fn quarantine_registry_locked(inner: &NodeLifetimeInner) {
     );
 }
 
-fn quarantine_slot(inner: &Arc<NodeLifetimeInner>, key: RegistrationKey) {
+pub(super) fn quarantine_slot(inner: &Arc<NodeLifetimeInner>, key: RegistrationKey) {
     let _allocation = inner
         .allocation
         .lock()

@@ -303,6 +303,7 @@ pub trait BaseAudioContext {
     #[must_use]
     fn destination(&self) -> node::AudioDestinationNode {
         let registration = AudioContextRegistration {
+            injected_lifetime: None,
             id: DESTINATION_NODE_ID,
             context: self.base().clone(),
         };
@@ -388,6 +389,7 @@ pub trait BaseAudioContext {
     #[cfg(test)]
     fn mock_registration(&self) -> AudioContextRegistration {
         AudioContextRegistration {
+            injected_lifetime: None,
             id: crate::context::AudioNodeId(0),
             context: self.base().clone(),
         }
