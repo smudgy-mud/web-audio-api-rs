@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Receiver;
 
+type EventActivityHandler = dyn Fn() + Send + Sync + 'static;
+
 /// The Event interface
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -175,6 +177,7 @@ pub(crate) enum EventHandler {
 pub(crate) struct EventLoop {
     event_recv: Receiver<EventDispatch>,
     event_handlers: Arc<Mutex<HashMap<EventType, EventHandler>>>,
+    event_activity_handler: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
 }
 
 impl EventLoop {
@@ -182,10 +185,30 @@ impl EventLoop {
         Self {
             event_recv,
             event_handlers: Default::default(),
+            event_activity_handler: Default::default(),
         }
     }
 
     fn handle_event(&self, mut event: EventDispatch) -> ControlFlow<()> {
+        // Notify native integrations before targeted handler lookup. A dequeued event therefore
+        // remains a useful wake even when its target is stale or has no handler.
+        let activity_handler = self.event_activity_handler.lock().unwrap().clone();
+        if let Some(callback) = activity_handler {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback())).is_err() {
+                log::error!("Event activity handler panicked; disabling it");
+
+                // Do not hold the lock while invoking the callback. If the callback (or another
+                // thread) installed a replacement before panicking, preserve that replacement.
+                let mut handler = self.event_activity_handler.lock().unwrap();
+                if handler
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &callback))
+                {
+                    handler.take();
+                }
+            }
+        }
+
         // Terminate the event loop when the audio context is closing
         let mut result = ControlFlow::Continue(());
         if matches!(
@@ -242,16 +265,20 @@ impl EventLoop {
         let self_clone = self.clone();
 
         std::thread::spawn(move || {
-            // This thread is dedicated to event handling, so we can block
-            for event in self_clone.event_recv.iter() {
-                let result = self_clone.handle_event(event);
-                if result.is_break() {
-                    break;
-                }
-            }
-
-            log::debug!("Event loop has terminated");
+            self_clone.run();
         });
+    }
+
+    fn run(&self) {
+        // This thread is dedicated to event handling, so we can block.
+        for event in self.event_recv.iter() {
+            let result = self.handle_event(event);
+            if result.is_break() {
+                break;
+            }
+        }
+
+        log::debug!("Event loop has terminated");
     }
 
     pub fn set_handler(&self, event: EventType, callback: EventHandler) {
@@ -260,5 +287,245 @@ impl EventLoop {
 
     pub fn clear_handler(&self, event: EventType) {
         self.event_handlers.lock().unwrap().remove(&event);
+    }
+
+    pub fn set_activity_handler<F>(&self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.event_activity_handler.lock().unwrap() = Some(Arc::new(callback));
+    }
+
+    pub fn clear_activity_handler(&self) {
+        self.event_activity_handler.lock().unwrap().take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::context::AudioNodeId;
+    use crate::node::ScheduledSourceCompletionToken;
+    use crate::render::AudioWorkletGlobalScope;
+
+    #[test]
+    fn unrelated_backlog_wakes_reconciliation_after_terminal_send_is_dropped() {
+        let (control_init, render_init) = crate::io::thread_init();
+        let event_loop = EventLoop::new(control_init.event_recv);
+        let completion = ScheduledSourceCompletionToken::new();
+        let roots = Arc::new(Mutex::new(vec![completion.clone()]));
+        let roots_for_activity = Arc::clone(&roots);
+        let activity_count = Arc::new(AtomicUsize::new(0));
+        let activity_count_clone = Arc::clone(&activity_count);
+        event_loop.set_activity_handler(move || {
+            activity_count_clone.fetch_add(1, Ordering::Relaxed);
+            roots_for_activity
+                .lock()
+                .unwrap()
+                .retain(|token| !token.is_complete());
+        });
+
+        let mut queued = 0;
+        while render_init
+            .event_send
+            .try_send(EventDispatch::sink_change())
+            .is_ok()
+        {
+            queued += 1;
+        }
+        assert_eq!(queued, 256);
+
+        let scope = AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48_000.,
+            node_id: Cell::new(AudioNodeId(42)),
+            event_sender: render_init.event_send,
+        };
+        completion.mark_complete_and_wake(&scope);
+
+        assert!(completion.is_complete());
+        assert_eq!(roots.lock().unwrap().len(), 1);
+        assert!(event_loop.handle_pending_events());
+        assert!(roots.lock().unwrap().is_empty());
+        assert_eq!(activity_count.load(Ordering::Relaxed), queued as usize);
+    }
+
+    #[test]
+    fn stale_reused_id_event_cannot_consume_context_activity_wake() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        let event_loop = EventLoop::new(event_recv);
+        let reused_id = AudioNodeId(42);
+
+        let old_completion = ScheduledSourceCompletionToken::new();
+        old_completion.mark_complete();
+        let new_completion = ScheduledSourceCompletionToken::new();
+        let roots = Arc::new(Mutex::new(vec![old_completion, new_completion.clone()]));
+        let roots_for_activity = Arc::clone(&roots);
+        let activity_count = Arc::new(AtomicUsize::new(0));
+        let activity_count_clone = Arc::clone(&activity_count);
+        event_loop.set_activity_handler(move || {
+            activity_count_clone.fetch_add(1, Ordering::Relaxed);
+            roots_for_activity
+                .lock()
+                .unwrap()
+                .retain(|token| !token.is_complete());
+        });
+
+        // Model a new source reusing an id while raw records from the old source remain queued.
+        let raw_handler_count = Arc::new(AtomicUsize::new(0));
+        let raw_handler_count_clone = Arc::clone(&raw_handler_count);
+        event_loop.set_handler(
+            EventType::Ended(reused_id),
+            EventHandler::Once(Box::new(move |_| {
+                raw_handler_count_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+        event_send.send(EventDispatch::sink_change()).unwrap();
+        event_send.send(EventDispatch::ended(reused_id)).unwrap();
+
+        assert!(event_loop.handle_pending_events());
+        assert_eq!(activity_count.load(Ordering::Relaxed), 2);
+        assert_eq!(raw_handler_count.load(Ordering::Relaxed), 1);
+        assert_eq!(roots.lock().unwrap().len(), 1);
+
+        let scope = AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48_000.,
+            node_id: Cell::new(reused_id),
+            event_sender: event_send,
+        };
+        new_completion.mark_complete_and_wake(&scope);
+
+        assert!(event_loop.handle_pending_events());
+        assert_eq!(activity_count.load(Ordering::Relaxed), 3);
+        assert_eq!(raw_handler_count.load(Ordering::Relaxed), 1);
+        assert!(roots.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn close_notifies_activity_before_handler_and_stops_event_loop() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        let event_loop = EventLoop::new(event_recv);
+        let activity_count = Arc::new(AtomicUsize::new(0));
+        let activity_count_clone = Arc::clone(&activity_count);
+        event_loop.set_activity_handler(move || {
+            activity_count_clone.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let close_handler_count = Arc::new(AtomicUsize::new(0));
+        let close_handler_count_clone = Arc::clone(&close_handler_count);
+        let activity_seen_by_handler = Arc::clone(&activity_count);
+        event_loop.set_handler(
+            EventType::StateChange,
+            EventHandler::Once(Box::new(move |_| {
+                assert_eq!(activity_seen_by_handler.load(Ordering::Relaxed), 1);
+                close_handler_count_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+
+        event_send
+            .send(EventDispatch::state_change(AudioContextState::Closed))
+            .unwrap();
+        event_send.send(EventDispatch::sink_change()).unwrap();
+        let (done_send, done_recv) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            event_loop.run();
+            done_send.send(()).unwrap();
+        });
+
+        assert!(done_recv.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert_eq!(activity_count.load(Ordering::Relaxed), 1);
+        assert_eq!(close_handler_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn disconnected_receiver_stops_without_spurious_activity() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        let event_loop = EventLoop::new(event_recv);
+        let activity_count = Arc::new(AtomicUsize::new(0));
+        let activity_count_clone = Arc::clone(&activity_count);
+        event_loop.set_activity_handler(move || {
+            activity_count_clone.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let (done_send, done_recv) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            event_loop.run();
+            done_send.send(()).unwrap();
+        });
+        drop(event_send);
+
+        assert!(done_recv.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert_eq!(activity_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn panicking_activity_handler_is_disabled_without_stopping_targeted_events() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        let event_loop = EventLoop::new(event_recv);
+        let activity_count = Arc::new(AtomicUsize::new(0));
+        let activity_count_clone = Arc::clone(&activity_count);
+        event_loop.set_activity_handler(move || {
+            activity_count_clone.fetch_add(1, Ordering::Relaxed);
+            panic!("poisoned integration activity handler");
+        });
+
+        let targeted_count = Arc::new(AtomicUsize::new(0));
+        let targeted_count_clone = Arc::clone(&targeted_count);
+        event_loop.set_handler(
+            EventType::SinkChange,
+            EventHandler::Multiple(Box::new(move |_| {
+                targeted_count_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+        event_send.send(EventDispatch::sink_change()).unwrap();
+        event_send.send(EventDispatch::sink_change()).unwrap();
+
+        assert!(event_loop.handle_pending_events());
+        assert_eq!(activity_count.load(Ordering::Relaxed), 1);
+        assert_eq!(targeted_count.load(Ordering::Relaxed), 2);
+        assert!(event_loop.event_activity_handler.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn panicking_activity_handler_does_not_prevent_close() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        let event_loop = EventLoop::new(event_recv);
+        let activity_count = Arc::new(AtomicUsize::new(0));
+        let activity_count_clone = Arc::clone(&activity_count);
+        event_loop.set_activity_handler(move || {
+            activity_count_clone.fetch_add(1, Ordering::Relaxed);
+            panic!("poisoned integration activity handler");
+        });
+
+        let close_handler_count = Arc::new(AtomicUsize::new(0));
+        let close_handler_count_clone = Arc::clone(&close_handler_count);
+        event_loop.set_handler(
+            EventType::StateChange,
+            EventHandler::Once(Box::new(move |_| {
+                close_handler_count_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+        event_send
+            .send(EventDispatch::state_change(AudioContextState::Closed))
+            .unwrap();
+        event_send.send(EventDispatch::sink_change()).unwrap();
+
+        let (done_send, done_recv) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            event_loop.run();
+            done_send.send(()).unwrap();
+        });
+
+        assert!(done_recv.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert_eq!(activity_count.load(Ordering::Relaxed), 1);
+        assert_eq!(close_handler_count.load(Ordering::Relaxed), 1);
     }
 }

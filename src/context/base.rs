@@ -25,6 +25,34 @@ pub trait BaseAudioContext {
     #[doc(hidden)] // we'd rather not expose the ConcreteBaseAudioContext
     fn base(&self) -> &ConcreteBaseAudioContext;
 
+    /// Registers a native callback that runs whenever this context dequeues an event record.
+    ///
+    /// The callback is a context-wide activity notification, independent of targeted Web Audio
+    /// event handlers. It runs before targeted handler lookup, including for stale or otherwise
+    /// unhandled records. This lets an integration reconcile authoritative native state after a
+    /// best-effort render-thread notification was dropped because the event queue was full: any
+    /// record already in that queue will trigger a future reconciliation.
+    ///
+    /// The callback runs in the native event consumer, never in the real-time render callback. It
+    /// must perform only bounded, nonblocking work and must not enter V8, dispatch JavaScript, wait
+    /// for another thread, or panic. Registering a new callback replaces the previous one. A panic
+    /// is logged and disables that callback without preventing normal event dispatch.
+    ///
+    /// Integrations should capture only a weak reference or an independent sender rather than the
+    /// context itself, and clear the callback on context close, callback poison, and isolate
+    /// teardown. This avoids reference cycles and releases integration-owned resources promptly.
+    fn set_event_activity_handler<F>(&self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.base().set_event_activity_handler(callback);
+    }
+
+    /// Removes this context's native event-activity callback.
+    fn clear_event_activity_handler(&self) {
+        self.base().clear_event_activity_handler();
+    }
+
     /// Decode an [`AudioBuffer`] from a given input stream.
     ///
     /// The current implementation supports Symphonia's audio formats and codecs,
