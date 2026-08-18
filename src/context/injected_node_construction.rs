@@ -5,6 +5,10 @@
 //! two-node Gain transaction without exposing any of those authorities separately.
 
 use std::panic::{self, AssertUnwindSafe};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 use arrayvec::ArrayVec;
 
@@ -34,6 +38,18 @@ pub(crate) struct InjectedNodeConstructor {
     control: InjectedControlProducer,
     allocator: InjectedNodeIdAllocator,
     lifetimes: InjectedNodeLifetimeRegistrar,
+    #[cfg(test)]
+    magic_behavior: AtomicU8,
+    #[cfg(test)]
+    magic_drop_probe: Mutex<Option<MagicPayloadDropProbe>>,
+}
+
+#[cfg(test)]
+pub(super) struct MagicPayloadDropProbe {
+    pub(super) started: crossbeam_channel::Sender<()>,
+    pub(super) release: crossbeam_channel::Receiver<()>,
+    pub(super) tokens_restored: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) panic_after_release: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +67,53 @@ pub(crate) struct InjectedNodeConstructorBuildFailure {
 }
 
 impl InjectedNodeConstructor {
+    pub(super) const fn control(&self) -> &InjectedControlProducer {
+        &self.control
+    }
+
+    pub(super) const fn allocator(&self) -> &InjectedNodeIdAllocator {
+        &self.allocator
+    }
+
+    pub(crate) fn matches_node_id_identity(
+        &self,
+        identity: &super::injected_ids::InjectedNodeIdIdentity,
+    ) -> bool {
+        self.allocator.identity().ptr_eq(identity)
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_magic_behavior_for_test(&self) -> u8 {
+        self.magic_behavior.swap(0, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_magic_behavior_for_test(&self, behavior: u8) {
+        self.magic_behavior.store(behavior, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_magic_drop_probe_for_test(
+        &self,
+        started: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+        panic_after_release: bool,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let tokens_restored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *self.magic_drop_probe.lock().unwrap() = Some(MagicPayloadDropProbe {
+            started,
+            release,
+            tokens_restored: Arc::clone(&tokens_restored),
+            panic_after_release,
+        });
+        tokens_restored
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_magic_drop_probe_for_test(&self) -> Option<MagicPayloadDropProbe> {
+        self.magic_drop_probe.lock().unwrap().take()
+    }
+
     #[allow(dead_code)] // selected by the deferred public injected context constructor
     #[allow(clippy::result_large_err)] // exact weak capabilities must be returned intact
     pub(crate) fn new(
@@ -70,6 +133,10 @@ impl InjectedNodeConstructor {
             control,
             allocator,
             lifetimes,
+            #[cfg(test)]
+            magic_behavior: AtomicU8::new(0),
+            #[cfg(test)]
+            magic_drop_probe: Mutex::new(None),
         })
     }
 
@@ -129,6 +196,18 @@ impl InjectedNodeConstructor {
 
     pub(crate) fn applied_batch_sequence(&self) -> u64 {
         self.control.applied_batch_sequence()
+    }
+
+    #[allow(dead_code)] // selected by the private magic bootstrap before public builder wiring
+    pub(crate) fn try_flush_staged(
+        &self,
+    ) -> Result<super::injected_control::FlushControlOutcome, InjectedControlError> {
+        self.control.try_flush()
+    }
+
+    #[allow(dead_code)] // selected by the private magic bootstrap before public builder wiring
+    pub(crate) fn last_submitted_batch_sequence(&self) -> u64 {
+        self.control.last_submitted_batch_sequence()
     }
 
     pub(crate) fn admission_gate(&self) -> super::InjectedContextAdmissionGate {

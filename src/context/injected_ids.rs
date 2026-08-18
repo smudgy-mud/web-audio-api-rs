@@ -1,4 +1,4 @@
-//! Private rollback-capable node-id foundation for a future injected context.
+//! Private rollback-capable node-id ownership for the injected context path.
 //!
 //! The cloneable allocator is weak. A unique lifecycle-side owner retains the graph's reclaim
 //! consumer and the sole strong allocation state, so surviving base/node handles cannot retain
@@ -205,6 +205,8 @@ pub(crate) struct ProvisionalNodeIds {
     inner: Arc<InjectedNodeIdInner>,
     nodes: arrayvec::ArrayVec<Option<llq::Node<AudioNodeId>>, MAX_PROVISIONAL_NODE_IDS>,
     committed: AtomicBool,
+    #[cfg(test)]
+    force_commit_failure: bool,
 }
 
 /// Copy accepted-finalizer token. Construction proves every exact reclaim node has moved into the
@@ -255,6 +257,8 @@ impl InjectedNodeIdAllocator {
             inner: Arc::clone(&inner),
             nodes: arrayvec::ArrayVec::new(),
             committed: AtomicBool::new(false),
+            #[cfg(test)]
+            force_commit_failure: false,
         };
         let mut allocation = match inner.allocation.try_lock() {
             Ok(allocation) => allocation,
@@ -280,6 +284,10 @@ impl InjectedNodeIdAllocator {
 }
 
 impl ProvisionalNodeIds {
+    pub(crate) fn identity(&self) -> InjectedNodeIdIdentity {
+        InjectedNodeIdIdentity(Arc::downgrade(&self.inner))
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -324,12 +332,21 @@ impl ProvisionalNodeIds {
     pub(crate) fn commit_token(
         &self,
     ) -> Result<ProvisionalNodeIdCommit<'_>, ProvisionalNodeIdError> {
+        #[cfg(test)]
+        if self.force_commit_failure {
+            return Err(ProvisionalNodeIdError::ProtocolViolation);
+        }
         if self.nodes.iter().any(Option::is_some) {
             return Err(ProvisionalNodeIdError::ProtocolViolation);
         }
         Ok(ProvisionalNodeIdCommit {
             committed: &self.committed,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_commit_failure_for_test(&mut self) {
+        self.force_commit_failure = true;
     }
 
     pub(crate) fn commit(self) -> Result<(), ProvisionalNodeIdError> {

@@ -1,7 +1,13 @@
 //! The `ConcreteBaseAudioContext` type
 
 use crate::context::injected_control::InjectedConcreteEventBinding;
+use crate::context::injected_magic_construction::{
+    InjectedMagicConstructionError, InjectedMagicGraph,
+};
 use crate::context::injected_node_construction::InjectedNodeConstructor;
+use crate::context::injected_node_lifetime::{
+    BoundInjectedOutputRenderer, MagicInitializedInjectedOutputRenderer,
+};
 use crate::context::{
     AdmissionError, AudioContextRegistration, AudioContextState, AudioNodeId, BaseAudioContext,
     InjectedContextAdmissionGate, DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS,
@@ -20,6 +26,7 @@ use crate::AudioListener;
 
 use crossbeam_channel::{Sender, TrySendError};
 use std::collections::HashSet;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 
@@ -367,16 +374,78 @@ enum ConcreteEventHandlers {
     Injected(InjectedControlEventDispatch),
 }
 
-#[allow(dead_code)] // consumed by the pending private injected-context assembly
-pub(crate) struct BuildExactInjectedBaseFailure {
+/// Exact, prevalidated base-construction authority.
+///
+/// Constructing this value validates the event/control gate before the magic transaction may
+/// acquire admission, reserve IDs, prewarm HRTF, or allocate graph payloads.
+#[must_use]
+#[allow(dead_code)] // private prerequisite selected by the deferred injected context builder
+pub(crate) struct ExactInjectedBaseBootstrap {
+    renderer: BoundInjectedOutputRenderer,
     constructor: InjectedNodeConstructor,
     binding: InjectedConcreteEventBinding,
 }
 
-impl BuildExactInjectedBaseFailure {
-    #[allow(dead_code)] // mismatch recovery is exercised before public context assembly
-    pub(crate) fn into_parts(self) -> (InjectedNodeConstructor, InjectedConcreteEventBinding) {
-        (self.constructor, self.binding)
+#[allow(dead_code)] // exact mismatch recovery is exercised before public builder wiring
+pub(crate) struct PrepareExactInjectedBaseFailure {
+    renderer: BoundInjectedOutputRenderer,
+    constructor: InjectedNodeConstructor,
+    binding: InjectedConcreteEventBinding,
+}
+
+#[allow(dead_code)]
+impl PrepareExactInjectedBaseFailure {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        BoundInjectedOutputRenderer,
+        InjectedNodeConstructor,
+        InjectedConcreteEventBinding,
+    ) {
+        (self.renderer, self.constructor, self.binding)
+    }
+}
+
+#[allow(dead_code)] // private prerequisite selected by the deferred injected context builder
+pub(crate) enum ExactInjectedBaseBuildFailure {
+    Retryable {
+        error: InjectedMagicConstructionError,
+        bootstrap: ExactInjectedBaseBootstrap,
+    },
+    Terminal {
+        error: InjectedMagicConstructionError,
+        renderer: BoundInjectedOutputRenderer,
+    },
+}
+
+#[allow(dead_code)]
+impl ExactInjectedBaseBuildFailure {
+    pub(crate) const fn error(&self) -> InjectedMagicConstructionError {
+        match self {
+            Self::Retryable { error, .. } | Self::Terminal { error, .. } => *error,
+        }
+    }
+
+    pub(crate) fn into_retryable_parts(
+        self,
+    ) -> Option<(
+        BoundInjectedOutputRenderer,
+        InjectedNodeConstructor,
+        InjectedConcreteEventBinding,
+    )> {
+        match self {
+            Self::Retryable { bootstrap, .. } => {
+                Some((bootstrap.renderer, bootstrap.constructor, bootstrap.binding))
+            }
+            Self::Terminal { .. } => None,
+        }
+    }
+
+    pub(crate) fn into_terminal_renderer(self) -> Option<BoundInjectedOutputRenderer> {
+        match self {
+            Self::Terminal { renderer, .. } => Some(renderer),
+            Self::Retryable { .. } => None,
+        }
     }
 }
 
@@ -386,7 +455,164 @@ impl BaseAudioContext for ConcreteBaseAudioContext {
     }
 }
 
+#[allow(dead_code)]
+impl ExactInjectedBaseBootstrap {
+    /// Atomically installs the permanent magic graph, then assembles the host base from closed
+    /// moves only. The only success-side allocation is the final `Arc`; allocation failure aborts
+    /// the process and is not a recoverable unwind seam that could detach accepted graph state.
+    #[allow(clippy::result_large_err)] // exact recovery returns every unique owner inline
+    pub(crate) fn try_build(
+        self,
+    ) -> Result<MagicInitializedInjectedOutputRenderer, ExactInjectedBaseBuildFailure> {
+        let (sample_rate, max_channel_count, frames_played) = self.renderer.injected_base_facts();
+        let offline = false;
+        let magic = match self.constructor.try_construct_magic_graph(
+            sample_rate,
+            max_channel_count,
+            offline,
+        ) {
+            Ok(magic) => magic,
+            Err(failure) if !failure.retryable => {
+                return Err(ExactInjectedBaseBuildFailure::Terminal {
+                    error: failure.error,
+                    renderer: self.renderer,
+                })
+            }
+            Err(failure) => {
+                return Err(ExactInjectedBaseBuildFailure::Retryable {
+                    error: failure.error,
+                    bootstrap: self,
+                })
+            }
+        };
+        if !magic.matches_constructor(&self.constructor) {
+            // This is an internal proof mismatch after render ownership was accepted. Never offer
+            // either capability as a fresh construction retry.
+            drop(magic);
+            return Err(ExactInjectedBaseBuildFailure::Terminal {
+                error: InjectedMagicConstructionError::ProtocolViolation,
+                renderer: self.renderer,
+            });
+        }
+        Self::finish_build(
+            self,
+            magic,
+            sample_rate,
+            max_channel_count,
+            frames_played,
+            offline,
+        )
+    }
+
+    #[allow(clippy::result_large_err)] // exact terminal failure returns the render owner inline
+    fn finish_build(
+        self,
+        magic: InjectedMagicGraph,
+        sample_rate: f32,
+        max_channel_count: usize,
+        frames_played: Arc<AtomicU64>,
+        offline: bool,
+    ) -> Result<MagicInitializedInjectedOutputRenderer, ExactInjectedBaseBuildFailure> {
+        let Self {
+            mut renderer,
+            constructor,
+            binding,
+        } = self;
+        let (destination_channel_config, listener_params, outcome, installed_magic) =
+            magic.into_host_parts();
+        let required_sequence = match outcome {
+            crate::context::injected_control::CommitControlOutcome::Enqueued { sequence } => {
+                sequence
+            }
+            crate::context::injected_control::CommitControlOutcome::Staged => {
+                let flushed = match constructor.try_flush_staged() {
+                    Ok(flushed) => flushed,
+                    Err(error) => {
+                        return Err(ExactInjectedBaseBuildFailure::Terminal {
+                            error: InjectedMagicConstructionError::Control(error),
+                            renderer,
+                        })
+                    }
+                };
+                if flushed.enqueued != 1 || flushed.remaining_staged != 0 {
+                    return Err(ExactInjectedBaseBuildFailure::Terminal {
+                        error: InjectedMagicConstructionError::ProtocolViolation,
+                        renderer,
+                    });
+                }
+                constructor.last_submitted_batch_sequence()
+            }
+        };
+        let applied = if required_sequence == 0 {
+            false
+        } else {
+            match panic::catch_unwind(AssertUnwindSafe(|| {
+                renderer.apply_magic_before_publication(required_sequence)
+            })) {
+                Ok(applied) => applied,
+                Err(payload) => {
+                    std::mem::forget(payload);
+                    false
+                }
+            }
+        };
+        if !applied {
+            return Err(ExactInjectedBaseBuildFailure::Terminal {
+                error: InjectedMagicConstructionError::ProtocolViolation,
+                renderer,
+            });
+        }
+        let events = binding.into_events();
+        let base = ConcreteBaseAudioContext {
+            inner: Arc::new(ConcreteBaseAudioContextInner {
+                sample_rate,
+                max_channel_count,
+                graph_control: ConcreteGraphControl::Injected(constructor),
+                destination_channel_config,
+                frames_played,
+                listener_params: Some(listener_params),
+                offline,
+                state: ConcreteContextState::Injected,
+                event_handlers: ConcreteEventHandlers::Injected(events.clone()),
+                control_events: ControlEventDispatch::exact(events),
+            }),
+        };
+        renderer
+            .try_finish_magic_initialization(base, installed_magic)
+            .map_err(
+                |(renderer, _base)| ExactInjectedBaseBuildFailure::Terminal {
+                    error: InjectedMagicConstructionError::ProtocolViolation,
+                    renderer,
+                },
+            )
+    }
+}
+
 impl ConcreteBaseAudioContext {
+    /// Validates the exact B4a event branch against the graph constructor without mutating either
+    /// transport. A mismatch returns both values intact and operationally reusable.
+    #[allow(dead_code)] // private prerequisite selected by the deferred injected context builder
+    #[allow(clippy::result_large_err)] // exact mismatch returns all three owners inline
+    pub(crate) fn try_prepare_exact_injected_base(
+        renderer: BoundInjectedOutputRenderer,
+        constructor: InjectedNodeConstructor,
+        binding: InjectedConcreteEventBinding,
+    ) -> Result<ExactInjectedBaseBootstrap, PrepareExactInjectedBaseFailure> {
+        if !binding.matches_constructor(&constructor) || !renderer.matches_constructor(&constructor)
+        {
+            return Err(PrepareExactInjectedBaseFailure {
+                renderer,
+                constructor,
+                binding,
+            });
+        }
+        Ok(ExactInjectedBaseBootstrap {
+            renderer,
+            constructor,
+            binding,
+        })
+    }
+
     #[cfg(test)]
     fn handle_pending_events_for_test(&self) -> bool {
         match &self.inner.event_handlers {
@@ -600,42 +826,6 @@ impl ConcreteBaseAudioContext {
                 control_events,
             }),
         }
-    }
-
-    /// Private exact concrete-base boundary. The event capability and node constructor must have
-    /// originated from the same control identity and admission gate. Validation happens before
-    /// either owner is moved into a published base, so mismatch recovery preserves both intact.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)] // private B4a prerequisite; public context assembly remains deferred
-    pub(crate) fn try_new_exact_injected_node_construction_base(
-        sample_rate: f32,
-        max_channel_count: usize,
-        frames_played: Arc<AtomicU64>,
-        constructor: InjectedNodeConstructor,
-        binding: InjectedConcreteEventBinding,
-        offline: bool,
-    ) -> Result<Self, BuildExactInjectedBaseFailure> {
-        if !binding.matches_constructor(&constructor) {
-            return Err(BuildExactInjectedBaseFailure {
-                constructor,
-                binding,
-            });
-        }
-        let events = binding.into_events();
-        Ok(Self {
-            inner: Arc::new(ConcreteBaseAudioContextInner {
-                sample_rate,
-                max_channel_count,
-                graph_control: ConcreteGraphControl::Injected(constructor),
-                destination_channel_config: AudioNodeOptions::default().into(),
-                frames_played,
-                listener_params: None,
-                offline,
-                state: ConcreteContextState::Injected,
-                event_handlers: ConcreteEventHandlers::Injected(events.clone()),
-                control_events: ControlEventDispatch::exact(events),
-            }),
-        })
     }
 
     fn legacy_graph(&self) -> &LegacyGraphControl {
@@ -1035,6 +1225,11 @@ impl ConcreteBaseAudioContext {
 
     /// Add the [`AudioListener`] to the audio graph (if not already)
     pub(crate) fn ensure_audio_listener_present(&self) {
+        if matches!(&self.inner.graph_control, ConcreteGraphControl::Injected(_)) {
+            // The exact injected bootstrap eagerly publishes listener+params in the same atomic
+            // envelope as destination. Unlike legacy, there is no deferred raw sender queue.
+            return;
+        }
         let mut queued_audio_listener_msgs = self
             .legacy_graph()
             .queued_audio_listener_msgs

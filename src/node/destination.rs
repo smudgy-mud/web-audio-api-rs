@@ -137,6 +137,21 @@ impl AudioDestinationNode {
     }
 }
 
+/// Builds the destination's host-side channel state and renderer without publishing a control
+/// handle. The private injected base transaction uses this only after it owns graph admission and
+/// all eleven magic IDs, so a panic from channel validation unwinds the exact transaction.
+pub(crate) fn destination_raw_parts(
+    channel_count: usize,
+) -> (ChannelConfig, Box<dyn AudioProcessor>) {
+    let channel_config = AudioNodeOptions {
+        channel_count,
+        channel_count_mode: ChannelCountMode::Explicit,
+        channel_interpretation: ChannelInterpretation::Speakers,
+    }
+    .into();
+    (channel_config, Box::new(DestinationRenderer {}))
+}
+
 struct DestinationRenderer {}
 
 impl AudioProcessor for DestinationRenderer {
