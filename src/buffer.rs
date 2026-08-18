@@ -6,6 +6,18 @@ use crate::{
     assert_valid_sample_rate,
 };
 
+#[cfg(test)]
+thread_local! {
+    static RESAMPLE_PCM_ALLOCATION_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn resample_pcm_allocation_count() -> usize {
+    RESAMPLE_PCM_ALLOCATION_COUNT.get()
+}
+
 /// Options for constructing an [`AudioBuffer`]
 // dictionary AudioBufferOptions {
 //   unsigned long numberOfChannels = 1;
@@ -25,6 +37,13 @@ pub struct AudioBufferOptions {
 /// Memory-resident audio asset, basically a matrix of channels * samples
 ///
 /// An AudioBuffer has copy-on-write semantics, so it is cheap to clone.
+///
+/// Buffers returned by budgeted decoding retain their result-dimension and
+/// wrapper-owned PCM reservations across clones for as long as any clone remains
+/// alive. A later mutation may trigger copy-on-write storage that is not separately
+/// charged yet. Integrations that require aggregate accounting for those copies
+/// must mediate mutable access; accounting copy-on-write growth is deferred to a
+/// follow-up compatibility phase.
 ///
 /// - MDN documentation: <https://developer.mozilla.org/en-US/docs/Web/API/AudioBuffer>
 /// - specification: <https://webaudio.github.io/web-audio-api/#AudioBuffer>
@@ -246,6 +265,12 @@ impl AudioBuffer {
         }
     }
 
+    pub(crate) fn set_accounting_lease(&mut self, lease: Arc<dyn AudioBufferAccountingLease>) {
+        if let Some(channel) = self.channels.first_mut() {
+            channel.set_accounting_lease(lease);
+        }
+    }
+
     /// Channel data as slice
     pub(crate) fn channels(&self) -> &[ChannelData] {
         &self.channels
@@ -292,8 +317,13 @@ impl AudioBuffer {
         let channels: Vec<_> = self
             .channels_mut()
             .iter_mut()
-            .map(|channel_data| Arc::make_mut(&mut channel_data.data).split_off(index))
-            .map(ChannelData::from)
+            .map(|channel_data| {
+                let lease = channel_data.accounting_lease.clone();
+                let data = Arc::make_mut(&mut channel_data.data).split_off(index);
+                let mut split = ChannelData::from(data);
+                split.accounting_lease = lease;
+                split
+            })
             .collect();
 
         AudioBuffer::from_channels(channels, self.sample_rate)
@@ -323,32 +353,58 @@ impl AudioBuffer {
             return;
         }
 
-        let source_sr = self.sample_rate as f64;
-        let target_sr = sample_rate as f64;
-        let ratio = target_sr / source_sr;
+        let target_length = self
+            .checked_resample_length(sample_rate)
+            .expect("resampled buffer length overflow");
+        self.resample_with_length(sample_rate, target_length);
+    }
+
+    pub(crate) fn checked_resample_length(&self, sample_rate: f32) -> Option<usize> {
+        if self.length() == 0 || float_eq::float_eq!(self.sample_rate, sample_rate, abs <= 0.1) {
+            return Some(self.length());
+        }
+
+        let ratio = f64::from(sample_rate) / f64::from(self.sample_rate);
+        let target_length = (self.length() as f64 * ratio).ceil();
+
+        if !target_length.is_finite() || target_length < 0.0 || target_length >= usize::MAX as f64 {
+            return None;
+        }
+
+        Some(target_length as usize)
+    }
+
+    pub(crate) fn resample_with_length(&mut self, sample_rate: f32, target_length: usize) {
         let source_length = self.length();
-        let target_length = (self.length() as f64 * ratio).ceil() as usize;
 
         let num_channels = self.number_of_channels();
+        #[cfg(test)]
+        RESAMPLE_PCM_ALLOCATION_COUNT.set(RESAMPLE_PCM_ALLOCATION_COUNT.get() + 1);
         let mut resampled = Vec::<Vec<f32>>::with_capacity(num_channels);
         resampled.resize_with(num_channels, || Vec::<f32>::with_capacity(target_length));
 
-        for i in 0..target_length {
-            let position = i as f64 / (target_length - 1) as f64; // [0., 1.]
-            let playhead = position * (source_length - 1) as f64;
-            let playhead_floored = playhead.floor();
-            let prev_index = playhead_floored as usize;
-            let next_index = (prev_index + 1).min(source_length - 1);
-
-            let k = (playhead - playhead_floored) as f32;
-            let k_inv = 1. - k;
-
+        if target_length == 1 || source_length == 1 {
             for (channel, resampled_data) in resampled.iter_mut().enumerate() {
-                let prev_sample = self.channels[channel].data[prev_index];
-                let next_sample = self.channels[channel].data[next_index];
+                resampled_data.resize(target_length, self.channels[channel].data[0]);
+            }
+        } else {
+            for i in 0..target_length {
+                let position = i as f64 / (target_length - 1) as f64; // [0., 1.]
+                let playhead = position * (source_length - 1) as f64;
+                let playhead_floored = playhead.floor();
+                let prev_index = playhead_floored as usize;
+                let next_index = (prev_index + 1).min(source_length - 1);
 
-                let value = k_inv * prev_sample + k * next_sample;
-                resampled_data.push(value);
+                let k = (playhead - playhead_floored) as f32;
+                let k_inv = 1. - k;
+
+                for (channel, resampled_data) in resampled.iter_mut().enumerate() {
+                    let prev_sample = self.channels[channel].data[prev_index];
+                    let next_sample = self.channels[channel].data[next_index];
+
+                    let value = k_inv * prev_sample + k * next_sample;
+                    resampled_data.push(value);
+                }
             }
         }
 
@@ -366,16 +422,28 @@ impl AudioBuffer {
 /// Single channel audio samples, basically wraps a `Arc<Vec<f32>>`
 ///
 /// ChannelData has copy-on-write semantics, so it is cheap to clone.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub(crate) struct ChannelData {
     data: Arc<Vec<f32>>,
+    accounting_lease: Option<Arc<dyn AudioBufferAccountingLease>>,
 }
+
+pub(crate) trait AudioBufferAccountingLease: Send + Sync {}
+
+impl<T: Send + Sync> AudioBufferAccountingLease for T {}
 
 impl std::fmt::Debug for ChannelData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChannelData")
             .field("len", &self.len())
+            .field("has_accounting_lease", &self.accounting_lease.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ChannelData {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
     }
 }
 
@@ -384,13 +452,21 @@ impl ChannelData {
         let buffer = vec![0.; length];
         let data = Arc::new(buffer);
 
-        Self { data }
+        Self {
+            data,
+            accounting_lease: None,
+        }
     }
 
     pub fn from(data: Vec<f32>) -> Self {
         Self {
             data: Arc::new(data),
+            accounting_lease: None,
         }
+    }
+
+    pub(crate) fn set_accounting_lease(&mut self, lease: Arc<dyn AudioBufferAccountingLease>) {
+        self.accounting_lease = Some(lease);
     }
 
     pub fn len(&self) -> usize {
@@ -767,6 +843,27 @@ mod tests {
         );
 
         assert_float_eq!(buffer.sample_rate, 48000., abs_all <= 0.);
+    }
+
+    #[test]
+    fn test_resample_one_source_frame() {
+        let channel = ChannelData::from(vec![42.]);
+        let mut buffer = AudioBuffer::from_channels(vec![channel], 48_000.);
+        buffer.resample(96_000.);
+
+        assert_eq!(buffer.length(), 2);
+        assert_eq!(buffer.get_channel_data(0), &[42., 42.]);
+    }
+
+    #[test]
+    fn test_resample_to_one_target_frame_is_finite() {
+        let channel = ChannelData::from(vec![1., 2.]);
+        let mut buffer = AudioBuffer::from_channels(vec![channel], 768_000.);
+        buffer.resample(3_000.);
+
+        assert_eq!(buffer.length(), 1);
+        assert_eq!(buffer.get_channel_data(0), &[1.]);
+        assert!(buffer.get_channel_data(0)[0].is_finite());
     }
 
     #[test]
