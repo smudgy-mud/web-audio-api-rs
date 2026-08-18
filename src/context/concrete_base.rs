@@ -323,6 +323,17 @@ impl ConcreteBaseAudioContext {
         self.inner.event_send.send(msg)
     }
 
+    pub(crate) fn set_event_activity_handler<F>(&self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.inner.event_loop.set_activity_handler(callback);
+    }
+
+    pub(crate) fn clear_event_activity_handler(&self) {
+        self.inner.event_loop.clear_activity_handler();
+    }
+
     pub(crate) fn lock_control_msg_sender(&self) -> RwLockWriteGuard<'_, Sender<ControlMessage>> {
         self.inner.render_channel.write().unwrap()
     }
@@ -617,5 +628,30 @@ mod tests {
 
         // dropping should clear connections administration
         assert!(context.base().inner.connections.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_event_activity_handler_registration_and_clear() {
+        let context = OfflineAudioContext::new(1, 128, 48_000.);
+        let activity_count = Arc::new(AtomicU64::new(0));
+        let activity_count_clone = Arc::clone(&activity_count);
+        context.set_event_activity_handler(move || {
+            activity_count_clone.fetch_add(1, Ordering::Relaxed);
+        });
+
+        context
+            .base()
+            .send_event(EventDispatch::sink_change())
+            .unwrap();
+        context.base().inner.event_loop.handle_pending_events();
+        assert_eq!(activity_count.load(Ordering::Relaxed), 1);
+
+        context.clear_event_activity_handler();
+        context
+            .base()
+            .send_event(EventDispatch::sink_change())
+            .unwrap();
+        context.base().inner.event_loop.handle_pending_events();
+        assert_eq!(activity_count.load(Ordering::Relaxed), 1);
     }
 }
