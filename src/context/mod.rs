@@ -19,6 +19,8 @@ pub use offline::*;
 mod online;
 pub use online::*;
 
+mod output_lifecycle;
+
 // magic node values
 /// Destination node id is always at index 0
 pub(crate) const DESTINATION_NODE_ID: AudioNodeId = AudioNodeId(0);
