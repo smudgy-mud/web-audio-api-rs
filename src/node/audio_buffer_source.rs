@@ -10,7 +10,10 @@ use crate::render::{
 };
 use crate::{assert_valid_time_value, AtomicF64, RENDER_QUANTUM_SIZE};
 
-use super::{AudioNode, AudioScheduledSourceNode, ChannelConfig};
+use super::{
+    AudioNode, AudioScheduledSourceNode, AudioScheduledSourceNodeExt, ChannelConfig,
+    ScheduledSourceCompletionToken,
+};
 
 /// Options for constructing an [`AudioBufferSourceNode`]
 // dictionary AudioBufferSourceOptions {
@@ -114,6 +117,7 @@ pub struct AudioBufferSourceNode {
     buffer: Option<AudioBuffer>,
     loop_state: LoopState,
     has_start: bool,
+    completion: ScheduledSourceCompletionToken,
 }
 
 impl AudioNode for AudioBufferSourceNode {
@@ -157,6 +161,12 @@ impl AudioScheduledSourceNode for AudioBufferSourceNode {
         );
 
         self.registration.post_message(ControlMessage::Stop(when));
+    }
+}
+
+impl AudioScheduledSourceNodeExt for AudioBufferSourceNode {
+    fn completion_token(&self) -> ScheduledSourceCompletionToken {
+        self.completion.clone()
     }
 }
 
@@ -205,6 +215,8 @@ impl AudioBufferSourceNode {
                 end: loop_end,
             };
 
+            let completion = ScheduledSourceCompletionToken::new();
+
             let renderer = AudioBufferSourceRenderer {
                 start_time: f64::MAX,
                 stop_time: f64::MAX,
@@ -215,6 +227,7 @@ impl AudioBufferSourceNode {
                 playback_rate: pr_proc,
                 loop_state,
                 render_state: AudioBufferRendererState::default(),
+                completion: completion.clone(),
             };
 
             let node = Self {
@@ -226,6 +239,7 @@ impl AudioBufferSourceNode {
                 buffer: None,
                 loop_state,
                 has_start: false,
+                completion,
             };
 
             (node, Box::new(renderer))
@@ -384,9 +398,17 @@ struct AudioBufferSourceRenderer {
     playback_rate: AudioParamId,
     loop_state: LoopState,
     render_state: AudioBufferRendererState,
+    completion: ScheduledSourceCompletionToken,
 }
 
 impl AudioBufferSourceRenderer {
+    fn trigger_ended(&mut self, scope: &AudioWorkletGlobalScope) {
+        if !self.render_state.ended {
+            self.render_state.ended = true;
+            self.completion.mark_complete_and_wake(scope);
+        }
+    }
+
     fn handle_control_message(&mut self, control: &ControlMessage) {
         match control {
             ControlMessage::StartWithOffsetAndDuration(when, offset, duration) => {
@@ -448,8 +470,7 @@ impl AudioProcessor for AudioBufferSourceRenderer {
         // cf. wpt/webaudio/the-audio-api/the-audiobuffersourcenode-interface/audiobuffersource-start-null-buffer.html
         if self.buffer.is_none() && self.start_time != f64::MAX {
             output.make_silent();
-            self.render_state.ended = true;
-            scope.send_ended_event();
+            self.trigger_ended(scope);
             return false;
         }
 
@@ -458,8 +479,7 @@ impl AudioProcessor for AudioBufferSourceRenderer {
             output.make_silent();
             // stop before start
             if self.stop_time <= next_block_time {
-                self.render_state.ended = true;
-                scope.send_ended_event();
+                self.trigger_ended(scope);
                 return false;
             }
 
@@ -840,8 +860,7 @@ impl AudioProcessor for AudioBufferSourceRenderer {
                 && (computed_playback_rate > 0. && buffer_time >= buffer_duration
                     || computed_playback_rate < 0. && buffer_time < 0.)
         {
-            self.render_state.ended = true;
-            scope.send_ended_event();
+            self.trigger_ended(scope);
         }
 
         true
@@ -876,8 +895,7 @@ impl AudioProcessor for AudioBufferSourceRenderer {
         if !self.render_state.ended
             && (scope.current_time >= self.start_time || scope.current_time >= self.stop_time)
         {
-            scope.send_ended_event();
-            self.render_state.ended = true;
+            self.trigger_ended(scope);
         }
     }
 }
@@ -916,6 +934,51 @@ mod tests {
             &[1.; RENDER_QUANTUM_SIZE][..],
             abs_all <= 0.
         );
+    }
+
+    #[test]
+    fn completion_tracks_natural_buffer_end() {
+        let sample_rate = 48_000.;
+        let mut context = OfflineAudioContext::new(1, 256, sample_rate);
+        let buffer = AudioBuffer::from(vec![vec![1.; 64]], sample_rate);
+        let mut source = context.create_buffer_source();
+        source.set_buffer(buffer);
+        let completion = source.completion_token();
+        source.start_at(0.);
+
+        assert!(!completion.is_complete());
+        let _ = context.start_rendering_sync();
+        assert!(completion.is_complete());
+    }
+
+    #[test]
+    fn completion_tracks_explicit_duration_end() {
+        let sample_rate = 48_000.;
+        let mut context = OfflineAudioContext::new(1, 256, sample_rate);
+        let buffer = AudioBuffer::from(vec![vec![1.; 512]], sample_rate);
+        let mut source = context.create_buffer_source();
+        source.set_buffer(buffer);
+        let completion = source.completion_token();
+        source.start_at_with_offset_and_duration(0., 0., 64. / f64::from(sample_rate));
+
+        assert!(!completion.is_complete());
+        let _ = context.start_rendering_sync();
+        assert!(completion.is_complete());
+    }
+
+    #[test]
+    fn completion_tracks_renderer_drop_after_start() {
+        let sample_rate = 48_000.;
+        let mut context = OfflineAudioContext::new(1, 128, sample_rate);
+        let buffer = AudioBuffer::from(vec![vec![1.; 512]], sample_rate);
+        let mut source = context.create_buffer_source();
+        source.set_buffer(buffer);
+        let completion = source.completion_token();
+        source.start_at(0.);
+
+        assert!(!completion.is_complete());
+        let _ = context.start_rendering_sync();
+        assert!(completion.is_complete());
     }
 
     #[test]

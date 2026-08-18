@@ -7,7 +7,10 @@ use crate::render::{
 };
 use crate::{assert_valid_time_value, RENDER_QUANTUM_SIZE};
 
-use super::{AudioNode, AudioScheduledSourceNode, ChannelConfig};
+use super::{
+    AudioNode, AudioScheduledSourceNode, AudioScheduledSourceNodeExt, ChannelConfig,
+    ScheduledSourceCompletionToken,
+};
 
 /// Options for constructing an [`ConstantSourceNode`]
 // dictionary ConstantSourceOptions {
@@ -78,6 +81,7 @@ pub struct ConstantSourceNode {
     channel_config: ChannelConfig,
     offset: AudioParam,
     has_start: bool,
+    completion: ScheduledSourceCompletionToken,
 }
 
 impl AudioNode for ConstantSourceNode {
@@ -131,6 +135,12 @@ impl AudioScheduledSourceNode for ConstantSourceNode {
     }
 }
 
+impl AudioScheduledSourceNodeExt for ConstantSourceNode {
+    fn completion_token(&self) -> ScheduledSourceCompletionToken {
+        self.completion.clone()
+    }
+}
+
 impl ConstantSourceNode {
     /// Constructs a new `ConstantSourceNode` from explicit options.
     ///
@@ -155,11 +165,14 @@ impl ConstantSourceNode {
             let (param, proc) = context.create_audio_param(param_options, &registration);
             param.set_value(offset);
 
+            let completion = ScheduledSourceCompletionToken::new();
+
             let render = ConstantSourceRenderer {
                 offset: proc,
                 start_time: f64::MAX,
                 stop_time: f64::MAX,
                 ended_triggered: false,
+                completion: completion.clone(),
             };
 
             let node = ConstantSourceNode {
@@ -167,6 +180,7 @@ impl ConstantSourceNode {
                 channel_config: ChannelConfig::default(),
                 offset: param,
                 has_start: false,
+                completion,
             };
 
             (node, Box::new(render))
@@ -188,6 +202,16 @@ struct ConstantSourceRenderer {
     start_time: f64,
     stop_time: f64,
     ended_triggered: bool,
+    completion: ScheduledSourceCompletionToken,
+}
+
+impl ConstantSourceRenderer {
+    fn trigger_ended(&mut self, scope: &AudioWorkletGlobalScope) {
+        if !self.ended_triggered {
+            self.ended_triggered = true;
+            self.completion.mark_complete_and_wake(scope);
+        }
+    }
 }
 
 impl AudioProcessor for ConstantSourceRenderer {
@@ -208,10 +232,7 @@ impl AudioProcessor for ConstantSourceRenderer {
             output.make_silent();
 
             if self.stop_time <= next_block_time {
-                if !self.ended_triggered {
-                    scope.send_ended_event();
-                    self.ended_triggered = true;
-                }
+                self.trigger_ended(scope);
 
                 return false;
             }
@@ -259,10 +280,7 @@ impl AudioProcessor for ConstantSourceRenderer {
         if !still_running {
             // @note: we need this check because this is called a until the program
             // ends, such as if the node was never removed from the graph
-            if !self.ended_triggered {
-                scope.send_ended_event();
-                self.ended_triggered = true;
-            }
+            self.trigger_ended(scope);
         }
 
         still_running
@@ -284,8 +302,7 @@ impl AudioProcessor for ConstantSourceRenderer {
         if !self.ended_triggered
             && (scope.current_time >= self.start_time || scope.current_time >= self.stop_time)
         {
-            scope.send_ended_event();
-            self.ended_triggered = true;
+            self.trigger_ended(scope);
         }
     }
 }

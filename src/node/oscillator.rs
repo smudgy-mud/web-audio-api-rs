@@ -11,7 +11,10 @@ use crate::render::{
 use crate::PeriodicWave;
 use crate::{assert_valid_time_value, RENDER_QUANTUM_SIZE};
 
-use super::{AudioNode, AudioNodeOptions, AudioScheduledSourceNode, ChannelConfig};
+use super::{
+    AudioNode, AudioNodeOptions, AudioScheduledSourceNode, AudioScheduledSourceNodeExt,
+    ChannelConfig, ScheduledSourceCompletionToken,
+};
 
 const SINE_TABLE_LENGTH_USIZE: usize = 2048;
 const SINE_TABLE_LENGTH_F32: f32 = SINE_TABLE_LENGTH_USIZE as f32;
@@ -148,6 +151,8 @@ pub struct OscillatorNode {
     type_: OscillatorType,
     /// Tracks whether `start` has been called already.
     has_start: bool,
+    /// Shared terminal state for native consumers.
+    completion: ScheduledSourceCompletionToken,
 }
 
 impl AudioNode for OscillatorNode {
@@ -203,6 +208,12 @@ impl AudioScheduledSourceNode for OscillatorNode {
     }
 }
 
+impl AudioScheduledSourceNodeExt for OscillatorNode {
+    fn completion_token(&self) -> ScheduledSourceCompletionToken {
+        self.completion.clone()
+    }
+}
+
 impl OscillatorNode {
     /// Returns an `OscillatorNode`
     ///
@@ -246,6 +257,8 @@ impl OscillatorNode {
                 context.create_audio_param(det_param_options, &registration);
             det_param.set_value(detune);
 
+            let completion = ScheduledSourceCompletionToken::new();
+
             let renderer = OscillatorRenderer {
                 type_,
                 frequency: f_proc,
@@ -256,6 +269,7 @@ impl OscillatorNode {
                 started: false,
                 periodic_wave: None,
                 ended_triggered: false,
+                completion: completion.clone(),
                 sine_table: precomputed_sine_table(),
             };
 
@@ -266,6 +280,7 @@ impl OscillatorNode {
                 detune: det_param,
                 type_,
                 has_start: false,
+                completion,
             };
 
             (node, Box::new(renderer))
@@ -360,6 +375,8 @@ struct OscillatorRenderer {
     periodic_wave: Option<PeriodicWave>,
     /// defines if the `ended` events was already dispatched
     ended_triggered: bool,
+    /// Shared terminal state for native consumers.
+    completion: ScheduledSourceCompletionToken,
     /// Precomputed sine table
     sine_table: &'static [f32],
 }
@@ -385,20 +402,14 @@ impl AudioProcessor for OscillatorRenderer {
         if self.stop_time <= scope.current_time {
             output.make_silent();
 
-            if !self.ended_triggered {
-                scope.send_ended_event();
-                self.ended_triggered = true;
-            }
+            self.trigger_ended(scope);
 
             return false;
         } else if self.start_time >= next_block_time {
             output.make_silent();
 
             if self.stop_time <= next_block_time {
-                if !self.ended_triggered {
-                    scope.send_ended_event();
-                    self.ended_triggered = true;
-                }
+                self.trigger_ended(scope);
 
                 return false;
             }
@@ -462,10 +473,7 @@ impl AudioProcessor for OscillatorRenderer {
         }
 
         if self.stop_time <= next_block_time {
-            if !self.ended_triggered {
-                scope.send_ended_event();
-                self.ended_triggered = true;
-            }
+            self.trigger_ended(scope);
 
             return false;
         }
@@ -506,12 +514,18 @@ impl AudioProcessor for OscillatorRenderer {
         if !self.ended_triggered
             && (scope.current_time >= self.start_time || scope.current_time >= self.stop_time)
         {
-            scope.send_ended_event();
-            self.ended_triggered = true;
+            self.trigger_ended(scope);
         }
     }
 }
 impl OscillatorRenderer {
+    fn trigger_ended(&mut self, scope: &AudioWorkletGlobalScope) {
+        if !self.ended_triggered {
+            self.ended_triggered = true;
+            self.completion.mark_complete_and_wake(scope);
+        }
+    }
+
     #[inline]
     fn generate_sample(
         &mut self,
