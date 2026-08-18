@@ -91,6 +91,7 @@ impl AudioBackendManager for NoneBackend {
             frames_played,
             stats,
             ctrl_msg_recv,
+            control_batch_applied,
             event_send,
         } = render_thread_init;
 
@@ -102,6 +103,7 @@ impl AudioBackendManager for NoneBackend {
             frames_played,
             stats,
             event_send,
+            control_batch_applied,
         );
         render_thread.set_startup_pending(startup_pending);
         render_thread.spawn_garbage_collector_thread();

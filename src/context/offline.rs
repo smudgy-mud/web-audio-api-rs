@@ -99,6 +99,8 @@ impl OfflineAudioContext {
         // Use an unbounded channel because we do not require real-time safety.
         let (event_send, event_recv) = crossbeam_channel::unbounded();
         let event_loop = EventLoop::new(event_recv);
+        let control_batch_send = crate::message::ControlBatchSender::new(sender.clone());
+        let control_batch_applied = crate::message::ControlBatchApplied::default();
 
         // setup the render 'thread', which will run inside the control thread
         let renderer = RenderThread::new(
@@ -109,6 +111,7 @@ impl OfflineAudioContext {
             frames_played_clone,
             AudioStats::new(),
             event_send.clone(),
+            control_batch_applied.clone(),
         );
 
         // first, setup the base audio context
@@ -118,6 +121,8 @@ impl OfflineAudioContext {
             state,
             frames_played,
             sender,
+            control_batch_send,
+            control_batch_applied,
             event_send,
             event_loop.clone(),
             true,

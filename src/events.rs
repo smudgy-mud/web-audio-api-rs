@@ -23,6 +23,7 @@ pub struct Event {
 
 #[derive(Hash, Eq, PartialEq, Debug)]
 pub(crate) enum EventType {
+    ControlBatchActivity,
     Ended(AudioNodeId),
     SinkChange,
     StateChange,
@@ -103,6 +104,13 @@ pub(crate) struct EventDispatch {
 }
 
 impl EventDispatch {
+    pub(crate) fn control_batch_activity() -> Self {
+        EventDispatch {
+            type_: EventType::ControlBatchActivity,
+            payload: EventPayload::None,
+        }
+    }
+
     pub fn ended(id: AudioNodeId) -> Self {
         EventDispatch {
             type_: EventType::Ended(id),

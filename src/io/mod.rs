@@ -12,7 +12,7 @@ use crate::context::{AudioContextLatencyCategory, AudioContextOptions, AudioCont
 use crate::events::EventDispatch;
 use crate::media_devices::MediaDeviceInfo;
 use crate::media_streams::{MediaStream, MediaStreamTrack};
-use crate::message::ControlMessage;
+use crate::message::{ControlBatchApplied, ControlBatchSender, ControlMessage};
 use crate::stats::AudioStats;
 use crate::RENDER_QUANTUM_SIZE;
 
@@ -91,6 +91,8 @@ pub(crate) struct ControlThreadInit {
     pub frames_played: Arc<AtomicU64>,
     pub stats: AudioStats,
     pub ctrl_msg_send: Sender<ControlMessage>,
+    pub control_batch_send: ControlBatchSender,
+    pub control_batch_applied: ControlBatchApplied,
     pub event_send: Sender<EventDispatch>,
     pub event_recv: Receiver<EventDispatch>,
 }
@@ -102,6 +104,7 @@ pub(crate) struct RenderThreadInit {
     pub frames_played: Arc<AtomicU64>,
     pub stats: AudioStats,
     pub ctrl_msg_recv: Receiver<ControlMessage>,
+    pub control_batch_applied: ControlBatchApplied,
     pub event_send: Sender<EventDispatch>,
 }
 
@@ -115,11 +118,12 @@ pub(crate) fn thread_init() -> (ControlThreadInit, RenderThreadInit) {
 
     let stats = AudioStats::new();
 
-    // Communication channel for ctrl msgs from the control thread to the render thread.
-    // Use a bounded channel for real-time safety. A maximum of 256 control messages (add/remove
-    // node, settings, ..) will be handled per render quantum. The control thread will block when
-    // the capacity is reached.
+    // Communication channel for ctrl msgs from the control thread to the render thread. A private
+    // batch occupies one physical slot, while command execution is capped at 256 per online
+    // backend callback. Legacy producers retain their existing blocking send behavior.
     let (ctrl_msg_send, ctrl_msg_recv) = crossbeam_channel::bounded(256);
+    let control_batch_send = ControlBatchSender::new(ctrl_msg_send.clone());
+    let control_batch_applied = ControlBatchApplied::default();
 
     // Communication channel for events from the render thread to the control thread.
     // Use a bounded channel for real-time safety. A maximum of 256 events (node ended, error, ..)
@@ -131,6 +135,8 @@ pub(crate) fn thread_init() -> (ControlThreadInit, RenderThreadInit) {
         frames_played: Arc::clone(&frames_played),
         stats: stats.clone(),
         ctrl_msg_send,
+        control_batch_send,
+        control_batch_applied: control_batch_applied.clone(),
         event_send: event_send.clone(),
         event_recv,
     };
@@ -141,6 +147,7 @@ pub(crate) fn thread_init() -> (ControlThreadInit, RenderThreadInit) {
         frames_played,
         stats,
         ctrl_msg_recv,
+        control_batch_applied,
         event_send,
     };
 

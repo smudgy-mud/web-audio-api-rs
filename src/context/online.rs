@@ -66,6 +66,74 @@ impl From<io::AudioBackendError> for AudioContextError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkSwapControlError {
+    Disconnected { operation: &'static str },
+}
+
+impl std::fmt::Display for SinkSwapControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected { operation } => write!(
+                f,
+                "InvalidStateError - render thread disconnected while {operation}"
+            ),
+        }
+    }
+}
+
+impl Error for SinkSwapControlError {}
+
+/// Install the recycled graph and replay records that the old renderer had not dequeued.
+///
+/// A suspended replacement cannot consume concurrently. Its 256-slot channel therefore holds
+/// `Startup` plus at most 255 cached records; any remaining suffix is prepended to mutations that
+/// were already staged while suspended. The normal resume path submits that suffix in FIFO order.
+fn replay_sink_swap_control_messages(
+    base: &ConcreteBaseAudioContext,
+    sender: &crossbeam_channel::Sender<ControlMessage>,
+    graph: Graph,
+    pending_msgs: Vec<ControlMessage>,
+    original_state: AudioContextState,
+) -> Result<(), SinkSwapControlError> {
+    sender
+        .send(ControlMessage::Startup { graph })
+        .map_err(|_| SinkSwapControlError::Disconnected {
+            operation: "installing the recycled graph",
+        })?;
+
+    if original_state == AudioContextState::Suspended {
+        let mut pending = pending_msgs.into_iter();
+        while let Some(message) = pending.next() {
+            match sender.try_send(message) {
+                Ok(()) => {}
+                Err(crossbeam_channel::TrySendError::Full(message)) => {
+                    let mut deferred = Vec::with_capacity(1 + pending.len());
+                    deferred.push(message);
+                    deferred.extend(pending);
+                    base.prepend_suspended_control_msgs(deferred);
+                    break;
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    return Err(SinkSwapControlError::Disconnected {
+                        operation: "replaying cached control messages",
+                    });
+                }
+            }
+        }
+    } else {
+        for message in pending_msgs {
+            sender
+                .send(message)
+                .map_err(|_| SinkSwapControlError::Disconnected {
+                    operation: "replaying cached control messages",
+                })?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Identify the type of playback, which affects tradeoffs
 /// between audio output latency and power consumption
 #[derive(Copy, Clone, Debug, Default)]
@@ -147,7 +215,7 @@ pub struct AudioContext {
     /// true while the render thread has not yet processed its initial Startup message
     startup_pending: std::sync::Arc<AtomicBool>,
     /// Initializer for the render thread (when restart is required)
-    render_thread_init: RenderThreadInit,
+    render_thread_init: Mutex<Option<RenderThreadInit>>,
 }
 
 impl std::fmt::Debug for AudioContext {
@@ -256,6 +324,8 @@ impl AudioContext {
             frames_played,
             stats,
             ctrl_msg_send,
+            control_batch_send,
+            control_batch_applied,
             event_send,
             event_recv,
         } = control_thread_init;
@@ -276,6 +346,8 @@ impl AudioContext {
             state,
             frames_played,
             ctrl_msg_send,
+            control_batch_send,
+            control_batch_applied,
             event_send,
             event_loop.clone(),
             false,
@@ -297,7 +369,7 @@ impl AudioContext {
             render_capacity,
             playback_stats,
             startup_pending,
-            render_thread_init,
+            render_thread_init: Mutex::new(Some(render_thread_init)),
         })
     }
 
@@ -386,7 +458,14 @@ impl AudioContext {
         let ctrl_msg_send = self.base.lock_control_msg_sender();
 
         // Flush out the ctrl msg receiver, cache
-        let mut pending_msgs: Vec<_> = self.render_thread_init.ctrl_msg_recv.try_iter().collect();
+        let render_thread_init = self
+            .render_thread_init
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .expect("open context retains its render-thread initializer");
+        let mut pending_msgs: Vec<_> = render_thread_init.ctrl_msg_recv.try_iter().collect();
 
         // Acquire the active audio graph from the current render thread, shutting it down
         let graph = if matches!(pending_msgs.first(), Some(ControlMessage::Startup { .. })) {
@@ -405,13 +484,21 @@ impl AudioContext {
 
             let (graph_send, graph_recv) = crossbeam_channel::bounded(1);
             let message = ControlMessage::CloseAndRecycle { sender: graph_send };
-            ctrl_msg_send.send(message).unwrap();
+            ctrl_msg_send
+                .send(message)
+                .map_err(|_| SinkSwapControlError::Disconnected {
+                    operation: "requesting graph recycle",
+                })?;
             if original_state == AudioContextState::Suspended {
                 // We must wake up the render thread to be able to handle the shutdown.
                 // No new audio will be produced because it will receive the shutdown command first.
                 backend_manager_guard.resume()?;
             }
-            graph_recv.recv().unwrap()
+            graph_recv
+                .recv()
+                .map_err(|_| SinkSwapControlError::Disconnected {
+                    operation: "waiting for graph recycle",
+                })?
         };
 
         log::debug!("SinkChange: closing audio stream");
@@ -425,7 +512,7 @@ impl AudioContext {
             render_size_hint: AudioContextRenderSizeCategory::default(), // todo reuse existing setting
         };
         log::debug!("SinkChange: starting audio stream");
-        *backend_manager_guard = io::build_output(options, self.render_thread_init.clone())?;
+        *backend_manager_guard = io::build_output(options, render_thread_init)?;
 
         // if the previous backend state was suspend, suspend the new one before shipping the graph
         if original_state == AudioContextState::Suspended {
@@ -433,16 +520,20 @@ impl AudioContext {
             backend_manager_guard.suspend()?;
         }
 
-        // send the audio graph to the new render thread
-        let message = ControlMessage::Startup { graph };
-        ctrl_msg_send.send(message).unwrap();
+        // Replay through the sender whose write guard is already held. Calling
+        // `ConcreteBaseAudioContext::send_control_msg` here would try to acquire a read guard on
+        // the same RwLock and self-deadlock whenever the cached backlog is non-empty.
+        replay_sink_swap_control_messages(
+            &self.base,
+            &ctrl_msg_send,
+            graph,
+            pending_msgs,
+            original_state,
+        )?;
 
-        // flush the cached msgs
-        pending_msgs
-            .into_iter()
-            .for_each(|m| self.base().send_control_msg(m));
-
-        // explicitly release the lock to prevent concurrent render threads
+        // Explicitly release both serialization locks after Startup and the cached FIFO are sent
+        // or, for a full suspended channel, staged ahead of later suspended mutations.
+        drop(ctrl_msg_send);
         drop(backend_manager_guard);
 
         // trigger event when all the work is done
@@ -641,6 +732,7 @@ impl AudioContext {
             .unwrap()
             .close()
             .unwrap_or_else(|e| panic!("InvalidStateError - {e}"));
+        self.retire_render_thread_init();
 
         log::debug!("Closed audio stream");
     }
@@ -779,8 +871,20 @@ impl AudioContext {
         backend_manager_guard
             .close()
             .unwrap_or_else(|e| panic!("InvalidStateError - {e}"));
+        self.retire_render_thread_init();
 
         log::debug!("Closed audio stream");
+    }
+
+    /// Drop the context-owned receiver clone and synchronously clear any records that the closing
+    /// renderer did not dequeue. This runs on the control side after permanent backend close; sink
+    /// replacement deliberately keeps and reuses the initializer instead.
+    fn retire_render_thread_init(&self) {
+        if let Some(init) = self.render_thread_init.lock().unwrap().take() {
+            for message in init.ctrl_msg_recv.try_iter() {
+                drop(message);
+            }
+        }
     }
 
     /// Creates a [`MediaStreamAudioSourceNode`](node::MediaStreamAudioSourceNode) from a
@@ -833,7 +937,138 @@ mod tests {
     use super::*;
     #[cfg(feature = "diagnostics")]
     use crate::context::DESTINATION_NODE_ID;
+    use crate::message::ControlBatchSender;
+    use crate::render::RenderThread;
     use futures::executor;
+
+    fn marker(value: u16, log: &Arc<Mutex<Vec<u16>>>) -> ControlMessage {
+        ControlMessage::TestMarker {
+            value,
+            log: Arc::clone(log),
+        }
+    }
+
+    #[test]
+    fn suspended_sink_replay_saturates_exact_capacity_then_resumes_fifo() {
+        let (control_init, render_init) = io::thread_init();
+        let ControlThreadInit {
+            state,
+            frames_played,
+            stats: _,
+            ctrl_msg_send,
+            control_batch_send,
+            control_batch_applied,
+            event_send,
+            event_recv,
+        } = control_init;
+        let (node_id_producer, node_id_consumer) = llq::Queue::new().split();
+        let base = ConcreteBaseAudioContext::new(
+            48_000.,
+            2,
+            state,
+            frames_played,
+            ctrl_msg_send.clone(),
+            control_batch_send,
+            control_batch_applied,
+            event_send,
+            EventLoop::new(event_recv),
+            false,
+            node_id_consumer,
+        );
+
+        // Discard constructor traffic, then model an already-suspended context with one newer
+        // mutation in its staging FIFO. Cached sink-swap records must be inserted ahead of it.
+        render_init.ctrl_msg_recv.try_iter().for_each(drop);
+        base.suspend_control_msgs(ControlMessage::TestNop);
+        assert!(matches!(
+            render_init.ctrl_msg_recv.recv().unwrap(),
+            ControlMessage::TestNop
+        ));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        base.send_control_msg(marker(257, &log));
+        assert!(render_init.ctrl_msg_recv.is_empty());
+
+        // Build 256 cached batch envelopes without placing them in the replacement channel yet.
+        let (cache_send, cache_recv) = crossbeam_channel::bounded(256);
+        let cache_batches = ControlBatchSender::new(cache_send);
+        for value in 1..=256 {
+            assert_eq!(
+                cache_batches.try_send(vec![marker(value, &log)]),
+                Ok(value.into())
+            );
+        }
+        let cached: Vec<_> = cache_recv.try_iter().collect();
+        assert_eq!(cached.len(), 256);
+
+        replay_sink_swap_control_messages(
+            &base,
+            &ctrl_msg_send,
+            Graph::new(node_id_producer),
+            cached,
+            AudioContextState::Suspended,
+        )
+        .unwrap();
+
+        // The replacement cannot consume while suspended: Startup plus exactly 255 cached
+        // envelopes fill all physical slots. Sequence 256 was prepended to staging, without a
+        // blocking send, ahead of the newer legacy marker 257.
+        assert_eq!(render_init.ctrl_msg_recv.len(), 256);
+        let applied = render_init.control_batch_applied.clone();
+        let mut renderer = RenderThread::new(
+            48_000.,
+            2,
+            render_init.ctrl_msg_recv.clone(),
+            Arc::clone(&render_init.state),
+            Arc::clone(&render_init.frames_played),
+            render_init.stats.clone(),
+            render_init.event_send.clone(),
+            applied.clone(),
+        );
+        renderer.render(&mut [] as &mut [f32]);
+        assert_eq!(applied.load(), 255);
+        assert_eq!(&*log.lock().unwrap(), &(1..=255).collect::<Vec<_>>());
+        assert!(render_init.ctrl_msg_recv.is_empty());
+
+        let (resume_send, resume_recv) = crossbeam_channel::bounded(1);
+        base.resume_control_msgs(ControlMessage::Resume {
+            notify: OneshotNotify::Sync(resume_send),
+        });
+        renderer.render(&mut [] as &mut [f32]);
+        assert_eq!(resume_recv.try_recv(), Ok(()));
+        assert_eq!(applied.load(), 256);
+        assert_eq!(&*log.lock().unwrap(), &(1..=257).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn disconnected_sink_replay_returns_typed_error() {
+        let context = crate::context::OfflineAudioContext::new(1, 128, 48_000.);
+        let (sender, receiver) = crossbeam_channel::bounded(0);
+        let receiver_thread = std::thread::spawn(move || {
+            assert!(matches!(
+                receiver.recv().unwrap(),
+                ControlMessage::Startup { .. }
+            ));
+            // Dropping the rendezvous receiver after Startup makes the cached replay fail.
+        });
+        let (node_id_producer, _node_id_consumer) = llq::Queue::new().split();
+
+        let error = replay_sink_swap_control_messages(
+            context.base(),
+            &sender,
+            Graph::new(node_id_producer),
+            vec![ControlMessage::TestNop],
+            AudioContextState::Running,
+        )
+        .unwrap_err();
+        receiver_thread.join().unwrap();
+
+        assert_eq!(
+            error,
+            SinkSwapControlError::Disconnected {
+                operation: "replaying cached control messages",
+            }
+        );
+    }
 
     #[test]
     fn test_suspend_resume_close() {
@@ -870,6 +1105,7 @@ mod tests {
 
         executor::block_on(context.close());
         assert_eq!(context.state(), AudioContextState::Closed);
+        assert!(context.render_thread_init.lock().unwrap().is_none());
 
         let time4 = context.current_time();
 

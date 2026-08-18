@@ -214,6 +214,7 @@ impl AudioBackendManager for CpalBackend {
             frames_played,
             stats,
             ctrl_msg_recv,
+            control_batch_applied,
             event_send,
         } = render_thread_init;
 
@@ -306,6 +307,7 @@ impl AudioBackendManager for CpalBackend {
             Arc::clone(&frames_played),
             stats.clone(),
             event_send.clone(),
+            control_batch_applied.clone(),
         );
         renderer.set_startup_pending(Arc::clone(&startup_pending));
         renderer.spawn_garbage_collector_thread();
@@ -351,6 +353,7 @@ impl AudioBackendManager for CpalBackend {
                     frames_played,
                     stats.clone(),
                     event_send,
+                    control_batch_applied,
                 );
                 renderer.set_startup_pending(startup_pending);
                 renderer.spawn_garbage_collector_thread();
