@@ -21,7 +21,10 @@ use crate::context::{
     AudioContextState, AudioNodeId, InjectedGraphReclaimInit, OfflineAudioContext,
     OfflineAudioContextCallback,
 };
-use crate::events::{EventDispatch, EventLoop, InjectedJoinableEventLoop};
+use crate::events::{
+    EventDispatch, EventLoop, InjectedContextState, InjectedLifecycleEventLoop,
+    InjectedStateTransition,
+};
 use crate::message::{
     control_batch_storage, control_batch_storage_mut, ControlBatchApplied, ControlBatchNode,
     ControlMessage, GraphLifecycleBarrier, GraphLifecycleOutcome, GraphLifecyclePublisher,
@@ -36,16 +39,16 @@ use super::graph::Graph;
 
 /// Single-use bootstrap producer for one injected context's exact event loop.
 ///
-/// Only [`RenderThread::new_injected`] can consume this non-clone capability. Bootstrap callers
-/// cannot turn it into the internally cloneable render producer or retain an ungated sender after
-/// publishing the renderer.
+/// The only raw-unpacking operation is private to this render module. Setup code may construct the
+/// opaque value, but crate callers cannot send or recover its sender before `RenderThread` consumes
+/// it and owns every internally cloneable render producer.
 pub(crate) struct InjectedEventDispatchSender {
     sender: Sender<EventDispatch>,
     identity: Arc<()>,
 }
 
 impl InjectedEventDispatchSender {
-    pub(crate) fn from_event_loop_pair(sender: Sender<EventDispatch>, identity: Arc<()>) -> Self {
+    pub(crate) fn from_event_setup(sender: Sender<EventDispatch>, identity: Arc<()>) -> Self {
         Self { sender, identity }
     }
 }
@@ -65,10 +68,8 @@ enum EventDispatchSenderKind {
 
 impl EventDispatchSender {
     fn from_injected(sender: InjectedEventDispatchSender) -> Self {
-        Self(EventDispatchSenderKind::Injected {
-            sender: sender.sender,
-            identity: sender.identity,
-        })
+        let InjectedEventDispatchSender { sender, identity } = sender;
+        Self(EventDispatchSenderKind::Injected { sender, identity })
     }
 
     pub(crate) fn try_send(&self, event: EventDispatch) -> Result<(), TrySendError<EventDispatch>> {
@@ -78,8 +79,15 @@ impl EventDispatchSender {
         }
     }
 
-    fn matches_injected(&self, event_loop: &InjectedJoinableEventLoop) -> bool {
+    fn matches_injected(&self, event_loop: &InjectedLifecycleEventLoop) -> bool {
         matches!(&self.0, EventDispatchSenderKind::Injected { identity, .. } if event_loop.matches_identity(identity))
+    }
+
+    fn matches_injected_control(
+        &self,
+        events: &crate::events::InjectedControlEventDispatch,
+    ) -> bool {
+        matches!(&self.0, EventDispatchSenderKind::Injected { identity, .. } if events.matches_identity(identity))
     }
 }
 
@@ -99,6 +107,7 @@ pub(crate) struct RenderThread {
     number_of_channels: usize,
     suspended: bool,
     state: Arc<AtomicU8>,
+    injected_state: Option<InjectedContextState>,
     startup_pending: Option<Arc<AtomicBool>>,
     frames_played: Arc<AtomicU64>,
     receiver: Option<Receiver<ControlMessage>>,
@@ -210,6 +219,7 @@ impl RenderThread {
             number_of_channels,
             suspended: false,
             state,
+            injected_state: None,
             startup_pending: None,
             frames_played,
             receiver: Some(receiver),
@@ -240,22 +250,25 @@ impl RenderThread {
         sample_rate: f32,
         number_of_channels: usize,
         receiver: Receiver<ControlMessage>,
-        state: Arc<AtomicU8>,
+        state: InjectedContextState,
         frames_played: Arc<AtomicU64>,
         stats: AudioStats,
         event_sender: InjectedEventDispatchSender,
         control_batch_applied: ControlBatchApplied,
     ) -> Self {
-        Self::new(
+        let shared_state = state.atomic_for_render();
+        let mut renderer = Self::new(
             sample_rate,
             number_of_channels,
             receiver,
-            state,
+            shared_state,
             frames_played,
             stats,
             EventDispatchSender::from_injected(event_sender),
             control_batch_applied,
-        )
+        );
+        renderer.injected_state = Some(state);
+        renderer
     }
 
     pub(crate) fn set_startup_pending(&mut self, startup_pending: Arc<AtomicBool>) {
@@ -277,9 +290,16 @@ impl RenderThread {
 
     pub(crate) fn matches_injected_event_loop(
         &self,
-        event_loop: &InjectedJoinableEventLoop,
+        event_loop: &InjectedLifecycleEventLoop,
     ) -> bool {
         self.event_sender.matches_injected(event_loop)
+    }
+
+    pub(crate) fn matches_injected_control_events(
+        &self,
+        events: &crate::events::InjectedControlEventDispatch,
+    ) -> bool {
+        self.event_sender.matches_injected_control(events)
     }
 
     /// Installs the render-side lifetime owners required before injected records can be received.
@@ -510,14 +530,12 @@ impl RenderThread {
         let close = match barrier.transition() {
             GraphLifecycleTransition::Suspend => {
                 self.suspended = true;
-                self.state
-                    .store(AudioContextState::Suspended as u8, Ordering::Release);
+                self.store_state_without_event(AudioContextState::Suspended);
                 false
             }
             GraphLifecycleTransition::Resume => {
                 self.suspended = false;
-                self.state
-                    .store(AudioContextState::Running as u8, Ordering::Release);
+                self.store_state_without_event(AudioContextState::Running);
                 false
             }
             GraphLifecycleTransition::Close => {
@@ -530,8 +548,7 @@ impl RenderThread {
                     return ControlFlow::Continue(());
                 }
                 self.suspended = true;
-                self.state
-                    .store(AudioContextState::Closed as u8, Ordering::Release);
+                self.store_state_without_event(AudioContextState::Closed);
                 true
             }
         };
@@ -1026,10 +1043,25 @@ impl RenderThread {
     }
 
     fn set_state(&self, state: AudioContextState) {
-        self.state.store(state as u8, Ordering::Relaxed);
-        self.event_sender
-            .try_send(EventDispatch::state_change(state))
-            .ok();
+        let changed = self.injected_state.as_ref().is_none_or(|injected| {
+            injected.transition_render(state) == InjectedStateTransition::Changed
+        });
+        if self.injected_state.is_none() {
+            self.state.store(state as u8, Ordering::Relaxed);
+        }
+        if changed {
+            self.event_sender
+                .try_send(EventDispatch::state_change(state))
+                .ok();
+        }
+    }
+
+    fn store_state_without_event(&self, state: AudioContextState) {
+        if let Some(injected) = &self.injected_state {
+            let _ = injected.transition_render(state);
+        } else {
+            self.state.store(state as u8, Ordering::Release);
+        }
     }
 }
 

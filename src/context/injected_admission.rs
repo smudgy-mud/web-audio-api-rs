@@ -368,6 +368,10 @@ impl InjectedContextAdmissionGate {
         }
     }
 
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     #[cfg(test)]
     pub(crate) fn hold_phase_lock_for_test(
         &self,

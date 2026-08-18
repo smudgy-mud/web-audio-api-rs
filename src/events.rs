@@ -1,21 +1,30 @@
 #[cfg(feature = "diagnostics")]
 use crate::context::AudioContextDiagnostics;
 use crate::context::ConcreteBaseAudioContext;
-use crate::context::{AudioContextState, AudioNodeId};
+use crate::context::{
+    AdmissionError, AudioContextState, AudioNodeId, InjectedContextAdmissionGate,
+    InjectedControlRenderInit,
+};
+use crate::message::{ControlBatchApplied, ControlMessage};
+use crate::render::RenderThread;
+use crate::stats::AudioStats;
 use crate::{AudioBuffer, AudioRenderCapacityEvent};
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 
 use crate::render::InjectedEventDispatchSender;
 
 type EventActivityHandler = dyn Fn() + Send + Sync + 'static;
+#[cfg(test)]
+type AfterAdmissionObserver = dyn Fn() + Send + Sync + 'static;
 
 /// The Event interface
 #[derive(Debug, Clone)]
@@ -198,24 +207,383 @@ pub(crate) struct EventLoop {
     event_activity_handler: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
 }
 
+/// Single-use setup authority for one injected context's exact event channel.
+///
+/// The raw sender, receiver-owning thread, and identity cannot be separated. Only the injected
+/// render initializer may consume this value and derive the render, admitted-control, and
+/// lifecycle branches. No branch exposes a raw sender or receiver.
+pub(crate) struct InjectedEventDispatchSetup {
+    sender: Sender<EventDispatch>,
+    event_loop: JoinableEventLoop,
+    handlers: Arc<Mutex<HashMap<EventType, EventHandler>>>,
+    activity: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
+    identity: Arc<()>,
+}
+
+/// Non-clone handler-only setup view. It has no event receiver, producer, stop, or join authority.
+#[allow(dead_code)] // production handler assembly follows the private B4a ownership seam
+pub(crate) struct InjectedEventHandlerSetup<'a> {
+    handlers: &'a Arc<Mutex<HashMap<EventType, EventHandler>>>,
+}
+
+impl InjectedEventHandlerSetup<'_> {
+    #[allow(dead_code)] // production handler assembly follows the private B4a ownership seam
+    pub(crate) fn set_handler(&self, event: EventType, callback: EventHandler) {
+        self.handlers.lock().unwrap().insert(event, callback);
+    }
+}
+
+/// Absorbing state shared only by the exact injected renderer, concrete base, and lifecycle owner.
+#[derive(Clone)]
+pub(crate) struct InjectedContextState(Arc<AtomicU8>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedStateTransition {
+    Changed,
+    Unchanged,
+    ClosedAbsorbing,
+    TerminalRejected,
+}
+
+impl InjectedContextState {
+    fn new(initially_suspended: bool) -> Self {
+        Self(Arc::new(AtomicU8::new(if initially_suspended {
+            AudioContextState::Suspended as u8
+        } else {
+            AudioContextState::Running as u8
+        })))
+    }
+
+    pub(crate) fn load(&self) -> AudioContextState {
+        self.0.load(Ordering::Acquire).into()
+    }
+
+    /// Changes a live injected state without ever reopening terminal `Closed`.
+    pub(crate) fn transition_live(&self, next: AudioContextState) -> InjectedStateTransition {
+        if next == AudioContextState::Closed {
+            return InjectedStateTransition::TerminalRejected;
+        }
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            if current == AudioContextState::Closed as u8 {
+                return InjectedStateTransition::ClosedAbsorbing;
+            }
+            if current == next as u8 {
+                return InjectedStateTransition::Unchanged;
+            }
+            match self.0.compare_exchange_weak(
+                current,
+                next as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return InjectedStateTransition::Changed,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(crate) fn transition_render(&self, next: AudioContextState) -> InjectedStateTransition {
+        if next == AudioContextState::Closed {
+            if self.transition_closed() {
+                InjectedStateTransition::Changed
+            } else {
+                InjectedStateTransition::Unchanged
+            }
+        } else {
+            self.transition_live(next)
+        }
+    }
+
+    pub(crate) fn atomic_for_render(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.0)
+    }
+
+    fn transition_closed(&self) -> bool {
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            if current == AudioContextState::Closed as u8 {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                current,
+                AudioContextState::Closed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+/// Cloneable control-side producer which always acquires exact external-event admission first.
+#[derive(Clone)]
+pub(crate) struct InjectedControlEventDispatch {
+    sender: Sender<EventDispatch>,
+    identity: Arc<()>,
+    gate: InjectedContextAdmissionGate,
+    state: InjectedContextState,
+    handlers: Arc<Mutex<HashMap<EventType, EventHandler>>>,
+    activity: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
+    #[cfg(test)]
+    after_admission: Arc<Mutex<Option<Arc<AfterAdmissionObserver>>>>,
+}
+
+impl InjectedControlEventDispatch {
+    pub(crate) fn matches_gate(&self, gate: &InjectedContextAdmissionGate) -> bool {
+        self.gate.ptr_eq(gate)
+    }
+
+    pub(crate) fn matches_identity(&self, identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.identity, identity)
+    }
+
+    pub(crate) fn admission_gate(&self) -> InjectedContextAdmissionGate {
+        self.gate.clone()
+    }
+
+    pub(crate) fn state(&self) -> AudioContextState {
+        self.state.load()
+    }
+
+    pub(crate) fn transition_live_state(&self, next: AudioContextState) -> InjectedStateTransition {
+        self.state.transition_live(next)
+    }
+
+    pub(crate) fn try_send_with<F>(
+        &self,
+        make_event: F,
+    ) -> Result<(), InjectedControlEventSendError>
+    where
+        F: FnOnce() -> EventDispatch + Copy,
+    {
+        let admission = self
+            .gate
+            .try_external_event()
+            .map_err(InjectedControlEventSendError::Admission)?;
+        #[cfg(test)]
+        if let Some(observer) = self.after_admission.lock().unwrap().clone() {
+            observer();
+        }
+        let outcome = match self.sender.try_send(make_event()) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(event)) => {
+                drop(event);
+                Err(InjectedControlEventSendError::Full)
+            }
+            Err(TrySendError::Disconnected(event)) => {
+                drop(event);
+                Err(InjectedControlEventSendError::Disconnected)
+            }
+        };
+        drop(admission);
+        outcome
+    }
+
+    pub(crate) fn set_handler(&self, event: EventType, callback: EventHandler) {
+        self.handlers.lock().unwrap().insert(event, callback);
+    }
+
+    pub(crate) fn clear_handler(&self, event: EventType) {
+        self.handlers.lock().unwrap().remove(&event);
+    }
+
+    pub(crate) fn set_activity_handler<F>(&self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.activity.lock().unwrap() = Some(Arc::new(callback));
+    }
+
+    pub(crate) fn clear_activity_handler(&self) {
+        self.activity.lock().unwrap().take();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_admission_for_test(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self.after_admission.lock().unwrap() = Some(observer);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedControlEventSendError {
+    Full,
+    Disconnected,
+    Admission(AdmissionError),
+}
+
+/// Sole event-consumer retirement authority paired with the exact injected state.
+pub(crate) struct InjectedLifecycleEventLoop {
+    event_loop: Option<JoinableEventLoop>,
+    identity: Arc<()>,
+    state: InjectedContextState,
+}
+
+#[derive(Clone)]
+pub(crate) struct InjectedEventIdentity(Arc<()>);
+
+impl InjectedEventIdentity {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedTerminalStateOutcome {
+    Published,
+    RenderedCloseVerified,
+    MissingRenderedClosePublished,
+    UnexpectedAlreadyClosed,
+}
+
+impl InjectedLifecycleEventLoop {
+    pub(crate) fn matches_identity(&self, identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.identity, identity)
+    }
+
+    pub(crate) fn producer_identity(&self) -> InjectedEventIdentity {
+        InjectedEventIdentity(Arc::clone(&self.identity))
+    }
+
+    pub(crate) fn retire_confirmed(
+        mut self,
+        retired: &crate::context::RetiredInjectedGraph,
+        graceful: bool,
+    ) -> Result<InjectedConfirmedEventRetirement, Self> {
+        if !retired.matches_event_identity(&self.producer_identity()) {
+            return Err(self);
+        }
+        let close_applied = retired.close_applied();
+        let already_closed = !self.state.transition_closed();
+        let outcome = match (close_applied, already_closed) {
+            (true, true) => InjectedTerminalStateOutcome::RenderedCloseVerified,
+            (true, false) => InjectedTerminalStateOutcome::MissingRenderedClosePublished,
+            (false, true) => InjectedTerminalStateOutcome::UnexpectedAlreadyClosed,
+            (false, false) => InjectedTerminalStateOutcome::Published,
+        };
+        let mut event_loop = self.event_loop.take().unwrap();
+        let effective_graceful =
+            graceful && outcome == InjectedTerminalStateOutcome::RenderedCloseVerified;
+        if effective_graceful {
+            event_loop.request_graceful_stop();
+        } else {
+            event_loop.request_terminal_closed_stop();
+        }
+        Ok(InjectedConfirmedEventRetirement {
+            state: outcome,
+            graceful: effective_graceful,
+            joined: event_loop.join(),
+        })
+    }
+}
+
+pub(crate) struct InjectedConfirmedEventRetirement {
+    pub(crate) state: InjectedTerminalStateOutcome,
+    pub(crate) graceful: bool,
+    pub(crate) joined: Result<EventLoopExit, EventLoopJoinError>,
+}
+
+impl Drop for InjectedLifecycleEventLoop {
+    fn drop(&mut self) {
+        if let Some(event_loop) = self.event_loop.take() {
+            // An abandoned exact owner carries no producer-quiescence proof. Its ordinary Drop
+            // must not request a stop while a render/control producer can still be live.
+            std::mem::forget(event_loop);
+        }
+    }
+}
+
+pub(crate) struct BoundInjectedEventDispatch {
+    render: InjectedEventDispatchSender,
+    control: InjectedControlEventDispatch,
+    lifecycle: InjectedLifecycleEventLoop,
+    state: InjectedContextState,
+}
+
+impl BoundInjectedEventDispatch {
+    /// Consumes the whole exact event bundle while constructing the sole renderer. State cannot be
+    /// detached or swapped independently from either producer or the lifecycle consumer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install_renderer(
+        self,
+        sample_rate: f32,
+        number_of_channels: usize,
+        receiver: Receiver<ControlMessage>,
+        frames_played: Arc<AtomicU64>,
+        stats: AudioStats,
+        applied: ControlBatchApplied,
+    ) -> (
+        RenderThread,
+        InjectedControlEventDispatch,
+        InjectedLifecycleEventLoop,
+    ) {
+        let renderer = RenderThread::new_injected(
+            sample_rate,
+            number_of_channels,
+            receiver,
+            self.state,
+            frames_played,
+            stats,
+            self.render,
+            applied,
+        );
+        (renderer, self.control, self.lifecycle)
+    }
+}
+
+impl InjectedEventDispatchSetup {
+    pub(crate) fn bind(self, control: &InjectedControlRenderInit) -> BoundInjectedEventDispatch {
+        let gate = control.event_admission_gate();
+        let initially_suspended = control.initially_suspended();
+        let state = InjectedContextState::new(initially_suspended);
+        BoundInjectedEventDispatch {
+            render: InjectedEventDispatchSender::from_event_setup(
+                self.sender.clone(),
+                Arc::clone(&self.identity),
+            ),
+            control: InjectedControlEventDispatch {
+                sender: self.sender,
+                identity: Arc::clone(&self.identity),
+                gate,
+                state: state.clone(),
+                handlers: self.handlers,
+                activity: self.activity,
+                #[cfg(test)]
+                after_admission: Arc::new(Mutex::new(None)),
+            },
+            lifecycle: InjectedLifecycleEventLoop {
+                event_loop: Some(self.event_loop),
+                identity: self.identity,
+                state: state.clone(),
+            },
+            state,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum EventLoopStop {
     Graceful,
     Silent,
+    TerminalClosed,
 }
 
 /// Confirmed reason that a lifecycle-owned event-loop thread exited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // consumed by private B3b lifecycle; public AudioContext wiring is pending
+#[allow(dead_code)] // consumed by the private lifecycle; public AudioContext wiring is pending
 pub(crate) enum EventLoopExit {
     /// Queued records were drained and one final `Closed` state change was dispatched.
     Graceful,
     /// The thread stopped without draining or dispatching another public event.
     Silent,
+    /// Queued records were discarded and exactly one final `Closed` state change was dispatched.
+    TerminalClosed,
 }
 
 /// Join failure for the lifecycle-owned event-loop thread.
-#[allow(dead_code)] // consumed by private B3b lifecycle; public AudioContext wiring is pending
+#[allow(dead_code)] // consumed by the private lifecycle; public AudioContext wiring is pending
 pub(crate) enum EventLoopJoinError {
     /// Joining the current thread would deadlock.
     CurrentThread,
@@ -244,63 +612,61 @@ impl std::fmt::Debug for EventLoopJoinError {
 /// from this event thread remains or can begin. A successful join does not prove destruction of
 /// handlers or queued payloads retained by other [`EventLoop`] or receiver clones. This owner is
 /// `Send`, so a lifecycle worker may request stop and move it to a different thread for the join.
-#[allow(dead_code)] // consumed by private B3b lifecycle; public AudioContext wiring is pending
+#[allow(dead_code)] // consumed by the private lifecycle; public AudioContext wiring is pending
 pub(crate) struct JoinableEventLoop {
     stop_send: crossbeam_channel::Sender<EventLoopStop>,
     join: Option<JoinHandle<Result<EventLoopExit, EventLoopJoinError>>>,
     stop_requested: bool,
 }
 
-/// Opaque consumer/join owner paired with [`InjectedEventDispatchSender`].
-pub(crate) struct InjectedJoinableEventLoop {
-    event_loop: JoinableEventLoop,
-    identity: Arc<()>,
-}
-
-impl InjectedJoinableEventLoop {
-    pub(crate) fn into_event_loop(self) -> JoinableEventLoop {
-        self.event_loop
-    }
-
-    pub(crate) fn matches_identity(&self, identity: &Arc<()>) -> bool {
-        Arc::ptr_eq(&self.identity, identity)
-    }
-}
-
-/// Creates both exact halves without ever exposing a separable raw injected sender.
+/// Creates the inseparable injected event setup without exposing a raw producer or consumer.
 #[allow(dead_code)] // selected by the pending private injected AudioContext constructor
-pub(crate) fn injected_event_loop_pair(
-) -> std::io::Result<(InjectedEventDispatchSender, InjectedJoinableEventLoop)> {
+pub(crate) fn injected_event_dispatch_setup() -> std::io::Result<InjectedEventDispatchSetup> {
     let (sender, receiver) = crossbeam_channel::unbounded();
-    let event_loop = EventLoop::new(receiver).run_joinable()?;
-    Ok(finish_injected_event_loop_pair(sender, event_loop))
+    let event_loop = EventLoop::new(receiver);
+    finish_injected_event_dispatch_setup(sender, event_loop)
 }
 
 #[cfg(test)]
-pub(crate) fn injected_event_loop_pair_with_setup(
-    setup: impl FnOnce(&EventLoop),
-) -> std::io::Result<(InjectedEventDispatchSender, InjectedJoinableEventLoop)> {
+pub(crate) fn injected_event_dispatch_setup_with_handlers(
+    setup: impl FnOnce(InjectedEventHandlerSetup<'_>),
+) -> std::io::Result<InjectedEventDispatchSetup> {
     let (sender, receiver) = crossbeam_channel::unbounded();
     let event_loop = EventLoop::new(receiver);
-    setup(&event_loop);
-    Ok(finish_injected_event_loop_pair(
-        sender,
-        event_loop.run_joinable()?,
-    ))
+    setup(InjectedEventHandlerSetup {
+        handlers: &event_loop.event_handlers,
+    });
+    finish_injected_event_dispatch_setup(sender, event_loop)
 }
 
-fn finish_injected_event_loop_pair(
+#[cfg(test)]
+pub(crate) fn injected_event_dispatch_setup_bounded_for_test(
+    capacity: usize,
+    setup: impl FnOnce(InjectedEventHandlerSetup<'_>),
+) -> std::io::Result<InjectedEventDispatchSetup> {
+    let (sender, receiver) = crossbeam_channel::bounded(capacity);
+    let event_loop = EventLoop::new(receiver);
+    setup(InjectedEventHandlerSetup {
+        handlers: &event_loop.event_handlers,
+    });
+    finish_injected_event_dispatch_setup(sender, event_loop)
+}
+
+fn finish_injected_event_dispatch_setup(
     sender: crossbeam_channel::Sender<EventDispatch>,
-    event_loop: JoinableEventLoop,
-) -> (InjectedEventDispatchSender, InjectedJoinableEventLoop) {
+    event_loop: EventLoop,
+) -> std::io::Result<InjectedEventDispatchSetup> {
     let identity = Arc::new(());
-    (
-        InjectedEventDispatchSender::from_event_loop_pair(sender, Arc::clone(&identity)),
-        InjectedJoinableEventLoop {
-            event_loop,
-            identity,
-        },
-    )
+    let handlers = Arc::clone(&event_loop.event_handlers);
+    let activity = Arc::clone(&event_loop.event_activity_handler);
+    let event_loop = event_loop.run_joinable()?;
+    Ok(InjectedEventDispatchSetup {
+        sender,
+        event_loop,
+        handlers,
+        activity,
+        identity,
+    })
 }
 
 #[allow(dead_code)] // consumed by private B3b lifecycle; public AudioContext wiring is pending
@@ -309,7 +675,7 @@ impl JoinableEventLoop {
     ///
     /// Render and control producers must already be quiescent. The event thread drains records
     /// already in the queue, coalescing any real `Closed` records, then dispatches exactly one
-    /// final `Closed` state change. B3b's private injected lifecycle establishes producer
+    /// final `Closed` state change. The private injected lifecycle establishes producer
     /// quiescence internally; legacy lifecycle callers supply their existing proof. Call
     /// [`Self::join`] for retirement acknowledgement.
     pub(crate) fn request_graceful_stop(&mut self) {
@@ -322,6 +688,12 @@ impl JoinableEventLoop {
     /// acknowledgement.
     pub(crate) fn request_silent_stop(&mut self) {
         self.request_stop(EventLoopStop::Silent);
+    }
+
+    /// Discards unrelated queued records and dispatches exactly one terminal `Closed` event.
+    /// Producers and exact state publication must already be quiescent/complete.
+    fn request_terminal_closed_stop(&mut self) {
+        self.request_stop(EventLoopStop::TerminalClosed);
     }
 
     fn request_stop(&mut self, mode: EventLoopStop) {
@@ -460,7 +832,7 @@ impl EventLoop {
     /// Starts a lifecycle-owned event thread that can be stopped and explicitly joined.
     ///
     /// This is separate from [`Self::run_in_thread`], whose detached legacy behavior is preserved.
-    #[allow(dead_code)] // consumed by private B3b lifecycle; public AudioContext wiring is pending
+    #[allow(dead_code)] // consumed by the private lifecycle; public AudioContext wiring is pending
     pub(crate) fn run_joinable(&self) -> std::io::Result<JoinableEventLoop> {
         let (stop_send, stop_recv) = crossbeam_channel::bounded(1);
         let event_loop = self.clone();
@@ -527,6 +899,23 @@ impl EventLoop {
     fn finish_stop(&self, stop: EventLoopStop) -> EventLoopExit {
         match stop {
             EventLoopStop::Silent => EventLoopExit::Silent,
+            EventLoopStop::TerminalClosed => {
+                // Silent/controller-drop shutdown does not deliver stale unrelated records. The
+                // lifecycle caller has already proved every producer quiescent, so this discard is
+                // an authoritative boundary and handler reentrancy cannot race a live producer.
+                while let Ok(event) = self.event_recv.try_recv() {
+                    drop(event);
+                }
+                let final_close = EventDispatch::state_change(AudioContextState::Closed);
+                let result = self.handle_event(final_close);
+                debug_assert!(result.is_break());
+                // A terminal handler may enqueue through a surviving but sealed capability. It is
+                // rejected before construction; test-only raw reentrancy is discarded here too.
+                while let Ok(event) = self.event_recv.try_recv() {
+                    drop(event);
+                }
+                EventLoopExit::TerminalClosed
+            }
             EventLoopStop::Graceful => {
                 // The lifecycle caller promises that producers are quiescent before requesting
                 // graceful stop, so reaching an empty queue is an authoritative drain boundary.

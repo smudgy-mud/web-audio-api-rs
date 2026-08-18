@@ -10,8 +10,8 @@ use arrayvec::ArrayVec;
 
 use super::injected_control::{
     AcceptedBatchFinalizeFailure, CommitControlOutcome, CommitWithFinalizeFailure,
-    ControlBatchReservation, InjectedControlError, InjectedControlProducer,
-    RejectedControlRollback,
+    ControlBatchReservation, InjectedControlError, InjectedControlIdentity,
+    InjectedControlProducer, RejectedControlRollback,
 };
 use super::injected_ids::{InjectedNodeIdAllocator, ProvisionalNodeIdError, ProvisionalNodeIds};
 use super::injected_node_lifetime::{
@@ -131,9 +131,12 @@ impl InjectedNodeConstructor {
         self.control.applied_batch_sequence()
     }
 
-    #[cfg(test)]
     pub(crate) fn admission_gate(&self) -> super::InjectedContextAdmissionGate {
         self.control.admission_gate()
+    }
+
+    pub(crate) fn matches_control_identity(&self, identity: &InjectedControlIdentity) -> bool {
+        self.control.identity().ptr_eq(identity)
     }
 }
 

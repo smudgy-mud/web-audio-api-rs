@@ -11,25 +11,34 @@ use crate::context::injected_node_lifetime::{
     NodeLifetimeDriveOutcome, ReadyForInjectedPhysicalReclaim, ReclaimedInjectedGraph,
     SealedInjectedOutput, NODE_LIFETIME_RETRY_INTERVAL,
 };
+use crate::events::{
+    InjectedConfirmedEventRetirement, InjectedLifecycleEventLoop, InjectedTerminalStateOutcome,
+};
 use crate::output::{AudioOutputEventSink, AudioOutputStartFailure, PreparedAudioOutput};
 
 const OPEN_DRIVE_BUDGET: usize = 32;
 
 /// Event-loop authority defaults to quarantine on every unexpected unwind. Only paths which have
 /// independently proved producer quiescence may extract it and request/join a stop.
-struct FailClosedEventLoop(Option<JoinableEventLoop>);
+struct FailClosedEventLoop(Option<InjectedLifecycleEventLoop>);
 
 impl FailClosedEventLoop {
-    fn new(event_loop: JoinableEventLoop) -> Self {
+    fn new(event_loop: InjectedLifecycleEventLoop) -> Self {
         Self(Some(event_loop))
     }
 
-    fn as_mut(&mut self) -> &mut JoinableEventLoop {
-        self.0.as_mut().unwrap()
-    }
-
-    fn into_inner(mut self) -> JoinableEventLoop {
-        self.0.take().unwrap()
+    fn retire_confirmed(
+        mut self,
+        retired: &crate::context::RetiredInjectedGraph,
+        graceful: bool,
+    ) -> Result<InjectedConfirmedEventRetirement, Self> {
+        match self.0.take().unwrap().retire_confirmed(retired, graceful) {
+            Ok(retirement) => Ok(retirement),
+            Err(event_loop) => {
+                self.0 = Some(event_loop);
+                Err(self)
+            }
+        }
     }
 }
 
@@ -63,18 +72,18 @@ enum InjectedStartFailureResources {
         endpoint: Box<dyn RunningAudioOutput>,
         owner: InjectedOutputRenderOwner,
         output_events: AudioOutputEventWatcher,
-        event_loop: JoinableEventLoop,
+        event_loop: InjectedLifecycleEventLoop,
     },
     Partial {
         start_failure: AudioOutputStartFailure,
         owner: InjectedOutputRenderOwner,
         output_events: AudioOutputEventWatcher,
-        event_loop: JoinableEventLoop,
+        event_loop: InjectedLifecycleEventLoop,
     },
     Uncertain {
         owner: InjectedOutputRenderOwner,
         output_events: AudioOutputEventWatcher,
-        event_loop: JoinableEventLoop,
+        event_loop: InjectedLifecycleEventLoop,
     },
 }
 
@@ -96,18 +105,18 @@ pub(crate) enum InjectedOutputStartFailureParts {
         endpoint: Box<dyn RunningAudioOutput>,
         owner: InjectedOutputRenderOwner,
         output_events: AudioOutputEventWatcher,
-        event_loop: JoinableEventLoop,
+        event_loop: InjectedLifecycleEventLoop,
     },
     Partial {
         start_failure: AudioOutputStartFailure,
         owner: InjectedOutputRenderOwner,
         output_events: AudioOutputEventWatcher,
-        event_loop: JoinableEventLoop,
+        event_loop: InjectedLifecycleEventLoop,
     },
     Uncertain {
         owner: InjectedOutputRenderOwner,
         output_events: AudioOutputEventWatcher,
-        event_loop: JoinableEventLoop,
+        event_loop: InjectedLifecycleEventLoop,
     },
 }
 
@@ -293,7 +302,7 @@ struct InjectedRunningResources {
     endpoint: Option<Box<dyn RunningAudioOutput>>,
     owner: Option<InjectedOutputRenderOwner>,
     output_events: Option<AudioOutputEventWatcher>,
-    event_loop: Option<JoinableEventLoop>,
+    event_loop: Option<InjectedLifecycleEventLoop>,
 }
 
 impl Drop for InjectedRunningResources {
@@ -315,7 +324,7 @@ struct InjectedPartialResources {
     endpoint_shutdown: Option<AudioOutputEndpointShutdown>,
     owner: Option<InjectedOutputRenderOwner>,
     output_events: Option<AudioOutputEventWatcher>,
-    event_loop: Option<JoinableEventLoop>,
+    event_loop: Option<InjectedLifecycleEventLoop>,
 }
 
 impl Drop for InjectedPartialResources {
@@ -447,7 +456,7 @@ fn start_running(
     endpoint: Box<dyn RunningAudioOutput>,
     owner: InjectedOutputRenderOwner,
     output_events: AudioOutputEventWatcher,
-    event_loop: JoinableEventLoop,
+    event_loop: InjectedLifecycleEventLoop,
     spawner: &dyn LifecycleWorkerSpawner,
 ) -> Result<InjectedOutputLifecycleController, Box<InjectedOutputStartFailure>> {
     let resources = InjectedRunningResources {
@@ -508,7 +517,7 @@ fn start_partial(
     endpoint_shutdown: AudioOutputEndpointShutdown,
     owner: InjectedOutputRenderOwner,
     output_events: AudioOutputEventWatcher,
-    event_loop: JoinableEventLoop,
+    event_loop: InjectedLifecycleEventLoop,
     spawner: &dyn LifecycleWorkerSpawner,
 ) -> Result<InjectedOutputStartCleanupHandle, Box<InjectedOutputStartFailure>> {
     let resources = InjectedPartialResources {
@@ -577,7 +586,7 @@ fn partial_transfer_failure(
 fn start_uncertain(
     owner: InjectedOutputRenderOwner,
     output_events: AudioOutputEventWatcher,
-    event_loop: JoinableEventLoop,
+    event_loop: InjectedLifecycleEventLoop,
     spawner: &dyn LifecycleWorkerSpawner,
 ) -> Result<InjectedOutputStartCleanupHandle, Box<InjectedOutputStartFailure>> {
     let (bootstrap_send, bootstrap_recv) = crossbeam_channel::bounded(1);
@@ -626,7 +635,7 @@ fn uncertain_worker(
     bootstrap: Receiver<(
         InjectedOutputRenderOwner,
         AudioOutputEventWatcher,
-        JoinableEventLoop,
+        InjectedLifecycleEventLoop,
     )>,
     completer: OutputShutdownCompleter,
 ) {
@@ -654,7 +663,7 @@ fn run_uncertain(
     (owner, output_events, event_loop): (
         InjectedOutputRenderOwner,
         AudioOutputEventWatcher,
-        JoinableEventLoop,
+        InjectedLifecycleEventLoop,
     ),
 ) -> OutputShutdownOutcome {
     let event_loop = FailClosedEventLoop::new(event_loop);
@@ -668,15 +677,13 @@ fn run_uncertain(
             wait_for_ready_render_quiescence(&ready);
             drop(ready);
             drop(output_events);
-            let event_issue =
-                retire_events(event_loop.into_inner(), OutputShutdownMode::Silent).issue;
-            OutputShutdownOutcome::Unconfirmed {
-                failure: OutputShutdownIssue::new(
+            quarantine_unconfirmed_events(
+                event_loop,
+                OutputShutdownIssue::new(
                     OutputShutdownIssueKind::InjectedStartPanicked,
                     "prepared output panicked while accepting the injected callback",
                 ),
-                event_issue,
-            }
+            )
         }
         PreparedInjectedClose::NoProof { render, .. } => {
             wait_for_render_quiescence(&render);
@@ -1162,7 +1169,7 @@ fn finish_ready_with_future(
     ready: ReadyForInjectedPhysicalReclaim,
     future: AudioOutputEndpointShutdown,
     output_events: AudioOutputEventWatcher,
-    mut event_loop: FailClosedEventLoop,
+    event_loop: FailClosedEventLoop,
     mut request: InjectedLifecycleRequest,
 ) -> OutputShutdownOutcome {
     ready.begin_render_shutdown();
@@ -1170,13 +1177,7 @@ fn finish_ready_with_future(
         mode: request.mode,
         endpoint_death: request.endpoint_death,
     };
-    match poll_endpoint_shutdown(
-        future,
-        &output_events,
-        &mut base_request,
-        event_loop.as_mut(),
-        false,
-    ) {
+    match poll_injected_endpoint_shutdown(future, &output_events, &mut base_request) {
         EndpointPollOutcome::Confirmed => {}
         EndpointPollOutcome::Quarantined { future, failure } => {
             std::mem::forget(future);
@@ -1224,7 +1225,7 @@ fn finish_without_graph_proof_with_future(
     render: AudioRenderOwner,
     future: AudioOutputEndpointShutdown,
     output_events: AudioOutputEventWatcher,
-    mut event_loop: FailClosedEventLoop,
+    event_loop: FailClosedEventLoop,
     mut request: InjectedLifecycleRequest,
     issue: OutputShutdownIssue,
 ) -> OutputShutdownOutcome {
@@ -1234,13 +1235,7 @@ fn finish_without_graph_proof_with_future(
         mode: OutputShutdownMode::Silent,
         endpoint_death: request.endpoint_death,
     };
-    match poll_endpoint_shutdown(
-        future,
-        &output_events,
-        &mut base_request,
-        event_loop.as_mut(),
-        false,
-    ) {
+    match poll_injected_endpoint_shutdown(future, &output_events, &mut base_request) {
         EndpointPollOutcome::Confirmed => {}
         EndpointPollOutcome::Quarantined { future, failure } => {
             std::mem::forget(future);
@@ -1283,7 +1278,7 @@ fn finish_without_graph_proof_with_future(
 fn finish_reclaimed_graph(
     mut graph: ReclaimedInjectedGraph,
     output_events: AudioOutputEventWatcher,
-    mut event_loop: FailClosedEventLoop,
+    event_loop: FailClosedEventLoop,
     mut request: InjectedLifecycleRequest,
 ) -> OutputShutdownOutcome {
     promote_late_endpoint_death(&output_events, &mut request);
@@ -1323,9 +1318,8 @@ fn finish_reclaimed_graph(
     }
     if degraded || request.issue.is_some() {
         request.mode = OutputShutdownMode::Silent;
-        event_loop.as_mut().request_silent_stop();
     }
-    let issue = request.issue.take().or_else(|| {
+    let mut issue = request.issue.take().or_else(|| {
         degraded.then(|| {
             OutputShutdownIssue::new(
                 OutputShutdownIssueKind::InjectedNodeLifetime,
@@ -1333,20 +1327,59 @@ fn finish_reclaimed_graph(
             )
         })
     });
-    finish_confirmed_events(output_events, event_loop, request, issue)
-}
-
-fn finish_confirmed_events(
-    output_events: AudioOutputEventWatcher,
-    event_loop: FailClosedEventLoop,
-    mut request: InjectedLifecycleRequest,
-    reclaim_issue: Option<OutputShutdownIssue>,
-) -> OutputShutdownOutcome {
     // Keep the watcher alive through the final classification: a callback death published while
     // endpoint shutdown/reclaim completed must never leave a Graceful receipt behind.
     promote_late_endpoint_death(&output_events, &mut request);
+    let request_graceful = request.mode == OutputShutdownMode::Graceful && issue.is_none();
     drop(output_events);
-    let retirement = retire_events(event_loop.into_inner(), request.mode);
+    let retirement = match panic::catch_unwind(AssertUnwindSafe(|| {
+        event_loop.retire_confirmed(&retired, request_graceful)
+    })) {
+        Ok(Ok(retirement)) => retirement,
+        Ok(Err(event_loop)) => {
+            return quarantine_unconfirmed_events(
+                event_loop,
+                OutputShutdownIssue::new(
+                    OutputShutdownIssueKind::EventThreadUnretired,
+                    "event-loop authority did not match the retired injected graph",
+                ),
+            );
+        }
+        Err(payload) => {
+            quarantine_panic_payload(payload);
+            return OutputShutdownOutcome::Unconfirmed {
+                failure: OutputShutdownIssue::new(
+                    OutputShutdownIssueKind::EventThreadUnretired,
+                    "injected terminal event retirement panicked",
+                ),
+                event_issue: None,
+            };
+        }
+    };
+
+    let state_degraded = matches!(
+        retirement.state,
+        InjectedTerminalStateOutcome::MissingRenderedClosePublished
+            | InjectedTerminalStateOutcome::UnexpectedAlreadyClosed
+    );
+    if !retirement.graceful {
+        request.mode = OutputShutdownMode::Silent;
+    }
+    if state_degraded {
+        request.mode = OutputShutdownMode::Silent;
+        issue.get_or_insert_with(|| {
+            OutputShutdownIssue::new(
+                OutputShutdownIssueKind::EventDeliveryDegraded,
+                "injected terminal state did not match its rendered Close proof",
+            )
+        });
+    }
+    let expected_exit = if retirement.graceful {
+        EventLoopExit::Graceful
+    } else {
+        EventLoopExit::TerminalClosed
+    };
+    let retirement = event_retirement_from_join(retirement.joined, expected_exit);
     if !retirement.retired {
         return OutputShutdownOutcome::Unconfirmed {
             failure: OutputShutdownIssue::new(
@@ -1359,7 +1392,7 @@ fn finish_confirmed_events(
     OutputShutdownOutcome::Confirmed(OutputShutdownReport {
         mode: request.mode,
         endpoint_death: request.endpoint_death,
-        reclaim_issue,
+        reclaim_issue: issue,
         event_issue: retirement.issue,
     })
 }
@@ -1368,13 +1401,10 @@ fn finish_unconfirmed_events(
     event_loop: FailClosedEventLoop,
     failure: OutputShutdownIssue,
 ) -> OutputShutdownOutcome {
-    // Every caller reaches this helper only after the render gate is CLOSED with no invocation in
-    // flight, or after unique renderer reclamation consumed the callback producer.
-    let event_issue = retire_events(event_loop.into_inner(), OutputShutdownMode::Silent).issue;
-    OutputShutdownOutcome::Unconfirmed {
-        failure,
-        event_issue,
-    }
+    // No unconfirmed path owns the exact graph+node retirement proof branded to this consumer.
+    // Quarantine its join authority instead of exposing a stop operation which could race a
+    // substituted or still-live producer.
+    quarantine_unconfirmed_events(event_loop, failure)
 }
 
 fn quarantine_unconfirmed_events(

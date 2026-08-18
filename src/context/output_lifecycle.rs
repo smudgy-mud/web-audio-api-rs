@@ -870,6 +870,30 @@ fn poll_endpoint_shutdown(
     event_loop: &mut JoinableEventLoop,
     stop_events_on_death: bool,
 ) -> EndpointPollOutcome {
+    poll_endpoint_shutdown_inner(
+        future,
+        output_events,
+        request,
+        Some(event_loop),
+        stop_events_on_death,
+    )
+}
+
+fn poll_injected_endpoint_shutdown(
+    future: AudioOutputEndpointShutdown,
+    output_events: &AudioOutputEventWatcher,
+    request: &mut LifecycleRequest,
+) -> EndpointPollOutcome {
+    poll_endpoint_shutdown_inner(future, output_events, request, None, false)
+}
+
+fn poll_endpoint_shutdown_inner(
+    future: AudioOutputEndpointShutdown,
+    output_events: &AudioOutputEventWatcher,
+    request: &mut LifecycleRequest,
+    mut event_loop: Option<&mut JoinableEventLoop>,
+    stop_events_on_death: bool,
+) -> EndpointPollOutcome {
     let mut future = EndpointShutdownQuarantine(Some(future));
     let (wake_send, wake_recv) = crossbeam_channel::bounded(1);
     let waker = Waker::from(Arc::new(ChannelWake(wake_send)));
@@ -878,7 +902,12 @@ fn poll_endpoint_shutdown(
     loop {
         // The atomic latch is authoritative. Rechecking before every poll prevents a self-waking
         // future from starving a queued or dropped best-effort diagnostic.
-        promote_death_to_silent_for_poll(output_events, request, event_loop, stop_events_on_death);
+        promote_death_to_silent_for_poll(
+            output_events,
+            request,
+            event_loop.as_deref_mut(),
+            stop_events_on_death,
+        );
         let polled = panic::catch_unwind(AssertUnwindSafe(|| {
             Pin::new(future.0.as_mut().unwrap()).poll(&mut context)
         }));
@@ -901,7 +930,7 @@ fn poll_endpoint_shutdown(
                 promote_death_to_silent_for_poll(
                     output_events,
                     request,
-                    event_loop,
+                    event_loop.as_deref_mut(),
                     stop_events_on_death,
                 );
                 if diagnostics_connected {
@@ -912,7 +941,7 @@ fn poll_endpoint_shutdown(
                             promote_death_to_silent_for_poll(
                                 output_events,
                                 request,
-                                event_loop,
+                                event_loop.as_deref_mut(),
                                 stop_events_on_death,
                             );
                         }
@@ -942,11 +971,15 @@ fn poll_endpoint_shutdown(
 fn promote_death_to_silent_for_poll(
     output_events: &AudioOutputEventWatcher,
     request: &mut LifecycleRequest,
-    event_loop: &mut JoinableEventLoop,
+    event_loop: Option<&mut JoinableEventLoop>,
     stop_events_on_death: bool,
 ) {
     if stop_events_on_death {
-        promote_death_to_silent(output_events, request, event_loop);
+        promote_death_to_silent(
+            output_events,
+            request,
+            event_loop.expect("legacy death-stop polling retains its event-loop authority"),
+        );
     } else {
         request.endpoint_death = request
             .endpoint_death
@@ -968,43 +1001,12 @@ fn retire_events(mut event_loop: JoinableEventLoop, mode: OutputShutdownMode) ->
         OutputShutdownMode::Silent => event_loop.request_silent_stop(),
     }
 
+    let expected = match mode {
+        OutputShutdownMode::Graceful => EventLoopExit::Graceful,
+        OutputShutdownMode::Silent => EventLoopExit::Silent,
+    };
     match panic::catch_unwind(AssertUnwindSafe(|| event_loop.join())) {
-        Ok(Ok(exit)) => {
-            let expected = match mode {
-                OutputShutdownMode::Graceful => EventLoopExit::Graceful,
-                OutputShutdownMode::Silent => EventLoopExit::Silent,
-            };
-            EventRetirement {
-                retired: true,
-                issue: (exit != expected).then(|| {
-                    OutputShutdownIssue::new(
-                        OutputShutdownIssueKind::EventDeliveryDegraded,
-                        "event loop exited in an unexpected stop mode",
-                    )
-                }),
-            }
-        }
-        Ok(Err(EventLoopJoinError::CurrentThread)) => EventRetirement {
-            retired: false,
-            issue: None,
-        },
-        Ok(Err(EventLoopJoinError::StopChannelDisconnected)) => EventRetirement {
-            retired: true,
-            issue: Some(OutputShutdownIssue::new(
-                OutputShutdownIssueKind::EventDeliveryDegraded,
-                "event stop authority disconnected before selecting a mode",
-            )),
-        },
-        Ok(Err(EventLoopJoinError::Panicked(payload))) => {
-            quarantine_panic_payload(payload);
-            EventRetirement {
-                retired: true,
-                issue: Some(OutputShutdownIssue::new(
-                    OutputShutdownIssueKind::EventDeliveryDegraded,
-                    "event handler panicked before event-thread retirement",
-                )),
-            }
-        }
+        Ok(result) => event_retirement_from_join(result, expected),
         Err(payload) => {
             quarantine_panic_payload(payload);
             EventRetirement {
@@ -1012,6 +1014,44 @@ fn retire_events(mut event_loop: JoinableEventLoop, mode: OutputShutdownMode) ->
                 issue: Some(OutputShutdownIssue::new(
                     OutputShutdownIssueKind::EventThreadUnretired,
                     "event-loop join panicked outside its typed retirement result",
+                )),
+            }
+        }
+    }
+}
+
+fn event_retirement_from_join(
+    result: Result<EventLoopExit, EventLoopJoinError>,
+    expected: EventLoopExit,
+) -> EventRetirement {
+    match result {
+        Ok(exit) => EventRetirement {
+            retired: true,
+            issue: (exit != expected).then(|| {
+                OutputShutdownIssue::new(
+                    OutputShutdownIssueKind::EventDeliveryDegraded,
+                    "event loop exited in an unexpected stop mode",
+                )
+            }),
+        },
+        Err(EventLoopJoinError::CurrentThread) => EventRetirement {
+            retired: false,
+            issue: None,
+        },
+        Err(EventLoopJoinError::StopChannelDisconnected) => EventRetirement {
+            retired: true,
+            issue: Some(OutputShutdownIssue::new(
+                OutputShutdownIssueKind::EventDeliveryDegraded,
+                "event stop authority disconnected before selecting a mode",
+            )),
+        },
+        Err(EventLoopJoinError::Panicked(payload)) => {
+            quarantine_panic_payload(payload);
+            EventRetirement {
+                retired: true,
+                issue: Some(OutputShutdownIssue::new(
+                    OutputShutdownIssueKind::EventDeliveryDegraded,
+                    "event handler panicked before event-thread retirement",
                 )),
             }
         }

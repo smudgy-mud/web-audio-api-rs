@@ -1,11 +1,15 @@
 //! The `ConcreteBaseAudioContext` type
 
+use crate::context::injected_control::InjectedConcreteEventBinding;
 use crate::context::injected_node_construction::InjectedNodeConstructor;
 use crate::context::{
     AdmissionError, AudioContextRegistration, AudioContextState, AudioNodeId, BaseAudioContext,
     InjectedContextAdmissionGate, DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS,
 };
-use crate::events::{EventDispatch, EventHandler, EventLoop, EventType};
+use crate::events::{
+    EventDispatch, EventHandler, EventLoop, EventType, InjectedControlEventDispatch,
+    InjectedControlEventSendError, InjectedStateTransition,
+};
 use crate::message::{ControlBatchApplied, ControlBatchSender, ControlMessage};
 use crate::node::{AudioDestinationNode, AudioNode, AudioNodeOptions, ChannelConfig};
 use crate::param::AudioParam;
@@ -23,18 +27,20 @@ use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 ///
 /// Legacy and offline contexts retain their blocking sender behavior. The private injected form
 /// never exposes its raw sender: every attempt first acquires a short admission and holds it until
-/// a rejected record has been destroyed on the caller thread. In B3b this injected variant is
-/// test-only: the production render path consumes a single-use opaque producer, and a future
-/// concrete context must receive an admission-gated branch from the same exact bootstrap.
+/// a rejected record has been destroyed on the caller thread. B4a's exact variant is derived from
+/// the same single-use setup as the renderer and lifecycle consumer. The raw injected variant is
+/// retained only for earlier admission tests.
 #[derive(Clone)]
 pub(crate) struct ControlEventDispatch {
     mode: ControlEventDispatchMode,
 }
 
 #[derive(Clone)]
-#[allow(dead_code)] // injected variants remain private migration-test scaffolding in B3b
+#[allow(dead_code)] // the exact private variant awaits context assembly; raw injection is test-only
 enum ControlEventDispatchMode {
     Legacy(Sender<EventDispatch>),
+    Exact(InjectedControlEventDispatch),
+    #[cfg(test)]
     Injected {
         sender: Sender<EventDispatch>,
         gate: InjectedContextAdmissionGate,
@@ -63,8 +69,7 @@ impl ControlEventDispatch {
         Self::legacy(sender)
     }
 
-    /// Test-only precursor to the future exact event-bootstrap split. Production B3b never
-    /// accepts a raw control-side event sender.
+    /// Earlier test-only precursor. Production injection never accepts a raw control-side sender.
     #[cfg(test)]
     pub(crate) fn injected(
         sender: Sender<EventDispatch>,
@@ -98,6 +103,8 @@ impl ControlEventDispatch {
     pub(crate) fn injected_gate(&self) -> Option<InjectedContextAdmissionGate> {
         match &self.mode {
             ControlEventDispatchMode::Legacy(_) => None,
+            ControlEventDispatchMode::Exact(events) => Some(events.admission_gate()),
+            #[cfg(test)]
             ControlEventDispatchMode::Injected { gate, .. } => Some(gate.clone()),
         }
     }
@@ -118,6 +125,10 @@ impl ControlEventDispatch {
                     ControlEventSendOutcome::Disconnected
                 }
             },
+            ControlEventDispatchMode::Exact(events) => {
+                map_injected_send(events.try_send_with(make_event))
+            }
+            #[cfg(test)]
             ControlEventDispatchMode::Injected { .. } => self.try_send_injected(make_event),
         }
     }
@@ -139,10 +150,15 @@ impl ControlEventDispatch {
                     ControlEventSendOutcome::Disconnected
                 }
             },
+            ControlEventDispatchMode::Exact(events) => {
+                map_injected_send(events.try_send_with(make_event))
+            }
+            #[cfg(test)]
             ControlEventDispatchMode::Injected { .. } => self.try_send_injected(make_event),
         }
     }
 
+    #[cfg(test)]
     fn try_send_injected<F>(&self, make_event: F) -> ControlEventSendOutcome
     where
         F: FnOnce() -> EventDispatch + Copy,
@@ -185,6 +201,40 @@ impl ControlEventDispatch {
         };
         drop(admission);
         outcome
+    }
+
+    #[allow(dead_code)] // selected by pending private injected-context assembly
+    fn exact(events: InjectedControlEventDispatch) -> Self {
+        Self {
+            mode: ControlEventDispatchMode::Exact(events),
+        }
+    }
+
+    fn exact_events(&self) -> Option<&InjectedControlEventDispatch> {
+        match &self.mode {
+            ControlEventDispatchMode::Exact(events) => Some(events),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_exact_after_admission_for_test(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        self.exact_events()
+            .expect("exact admission observer requires exact control events")
+            .set_after_admission_for_test(observer);
+    }
+}
+
+fn map_injected_send(
+    outcome: Result<(), InjectedControlEventSendError>,
+) -> ControlEventSendOutcome {
+    match outcome {
+        Ok(()) => ControlEventSendOutcome::Delivered,
+        Err(InjectedControlEventSendError::Full) => ControlEventSendOutcome::Full,
+        Err(InjectedControlEventSendError::Disconnected) => ControlEventSendOutcome::Disconnected,
+        Err(InjectedControlEventSendError::Admission(error)) => {
+            ControlEventSendOutcome::AdmissionRejected(error)
+        }
     }
 }
 
@@ -298,11 +348,36 @@ struct ConcreteBaseAudioContextInner {
     /// Denotes if this AudioContext is offline or not
     offline: bool,
     /// Current state of the `ConcreteBaseAudioContext`, shared with the RenderThread
-    state: Arc<AtomicU8>,
+    state: ConcreteContextState,
     /// Stores the event handlers
-    event_loop: EventLoop,
+    event_handlers: ConcreteEventHandlers,
     /// Opaque control-side capability for events handled by the EventLoop.
     control_events: ControlEventDispatch,
+}
+
+#[allow(dead_code)] // exact variant is selected by pending private injected-context assembly
+enum ConcreteContextState {
+    Legacy(Arc<AtomicU8>),
+    Injected,
+}
+
+#[allow(dead_code)] // exact variant is selected by pending private injected-context assembly
+enum ConcreteEventHandlers {
+    Legacy(EventLoop),
+    Injected(InjectedControlEventDispatch),
+}
+
+#[allow(dead_code)] // consumed by the pending private injected-context assembly
+pub(crate) struct BuildExactInjectedBaseFailure {
+    constructor: InjectedNodeConstructor,
+    binding: InjectedConcreteEventBinding,
+}
+
+impl BuildExactInjectedBaseFailure {
+    #[allow(dead_code)] // mismatch recovery is exercised before public context assembly
+    pub(crate) fn into_parts(self) -> (InjectedNodeConstructor, InjectedConcreteEventBinding) {
+        (self.constructor, self.binding)
+    }
 }
 
 impl BaseAudioContext for ConcreteBaseAudioContext {
@@ -312,6 +387,15 @@ impl BaseAudioContext for ConcreteBaseAudioContext {
 }
 
 impl ConcreteBaseAudioContext {
+    #[cfg(test)]
+    fn handle_pending_events_for_test(&self) -> bool {
+        match &self.inner.event_handlers {
+            ConcreteEventHandlers::Legacy(event_loop) => event_loop.handle_pending_events(),
+            ConcreteEventHandlers::Injected(_) => {
+                panic!("exact injected events are owned by their dedicated event thread")
+            }
+        }
+    }
     /// Creates a `BaseAudioContext` instance
     #[allow(clippy::too_many_arguments)] // TODO refactor with builder pattern
     pub(super) fn new(
@@ -409,8 +493,8 @@ impl ConcreteBaseAudioContext {
             frames_played,
             listener_params: None,
             offline,
-            state,
-            event_loop,
+            state: ConcreteContextState::Legacy(state),
+            event_handlers: ConcreteEventHandlers::Legacy(event_loop),
             control_events,
         };
         let base = Self {
@@ -511,11 +595,47 @@ impl ConcreteBaseAudioContext {
                 frames_played,
                 listener_params: None,
                 offline,
-                state,
-                event_loop,
+                state: ConcreteContextState::Legacy(state),
+                event_handlers: ConcreteEventHandlers::Legacy(event_loop),
                 control_events,
             }),
         }
+    }
+
+    /// Private exact concrete-base boundary. The event capability and node constructor must have
+    /// originated from the same control identity and admission gate. Validation happens before
+    /// either owner is moved into a published base, so mismatch recovery preserves both intact.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // private B4a prerequisite; public context assembly remains deferred
+    pub(crate) fn try_new_exact_injected_node_construction_base(
+        sample_rate: f32,
+        max_channel_count: usize,
+        frames_played: Arc<AtomicU64>,
+        constructor: InjectedNodeConstructor,
+        binding: InjectedConcreteEventBinding,
+        offline: bool,
+    ) -> Result<Self, BuildExactInjectedBaseFailure> {
+        if !binding.matches_constructor(&constructor) {
+            return Err(BuildExactInjectedBaseFailure {
+                constructor,
+                binding,
+            });
+        }
+        let events = binding.into_events();
+        Ok(Self {
+            inner: Arc::new(ConcreteBaseAudioContextInner {
+                sample_rate,
+                max_channel_count,
+                graph_control: ConcreteGraphControl::Injected(constructor),
+                destination_channel_config: AudioNodeOptions::default().into(),
+                frames_played,
+                listener_params: None,
+                offline,
+                state: ConcreteContextState::Injected,
+                event_handlers: ConcreteEventHandlers::Injected(events.clone()),
+                control_events: ControlEventDispatch::exact(events),
+            }),
+        })
     }
 
     fn legacy_graph(&self) -> &LegacyGraphControl {
@@ -683,11 +803,19 @@ impl ConcreteBaseAudioContext {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        self.inner.event_loop.set_activity_handler(callback);
+        match &self.inner.event_handlers {
+            ConcreteEventHandlers::Legacy(event_loop) => {
+                event_loop.set_activity_handler(callback);
+            }
+            ConcreteEventHandlers::Injected(events) => events.set_activity_handler(callback),
+        }
     }
 
     pub(crate) fn clear_event_activity_handler(&self) {
-        self.inner.event_loop.clear_activity_handler();
+        match &self.inner.event_handlers {
+            ConcreteEventHandlers::Legacy(event_loop) => event_loop.clear_activity_handler(),
+            ConcreteEventHandlers::Injected(events) => events.clear_activity_handler(),
+        }
     }
 
     pub(crate) fn lock_control_msg_sender(&self) -> RwLockWriteGuard<'_, Sender<ControlMessage>> {
@@ -754,17 +882,32 @@ impl ConcreteBaseAudioContext {
     /// Returns state of current context
     #[must_use]
     pub(super) fn state(&self) -> AudioContextState {
-        self.inner.state.load(Ordering::Acquire).into()
+        match &self.inner.state {
+            ConcreteContextState::Legacy(state) => state.load(Ordering::Acquire).into(),
+            ConcreteContextState::Injected => {
+                self.inner.control_events.exact_events().unwrap().state()
+            }
+        }
     }
 
     /// Updates state of current context
     pub(super) fn set_state(&self, state: AudioContextState) {
         // Only used from OfflineAudioContext or suspended AudioContext, otherwise the state
         // changed are spawned from the render thread
-        let current_state = self.state();
-        if current_state != state {
-            self.inner.state.store(state as u8, Ordering::Release);
-            let _ = self.send_event_with(|| EventDispatch::state_change(state));
+        match &self.inner.state {
+            ConcreteContextState::Legacy(shared) => {
+                let current_state = shared.load(Ordering::Acquire);
+                if current_state != state as u8 {
+                    shared.store(state as u8, Ordering::Release);
+                    let _ = self.send_event_with(|| EventDispatch::state_change(state));
+                }
+            }
+            ConcreteContextState::Injected => {
+                let events = self.inner.control_events.exact_events().unwrap();
+                if events.transition_live_state(state) == InjectedStateTransition::Changed {
+                    let _ = self.send_event_with(|| EventDispatch::state_change(state));
+                }
+            }
         }
     }
 
@@ -921,11 +1064,17 @@ impl ConcreteBaseAudioContext {
     }
 
     pub(crate) fn set_event_handler(&self, event: EventType, callback: EventHandler) {
-        self.inner.event_loop.set_handler(event, callback);
+        match &self.inner.event_handlers {
+            ConcreteEventHandlers::Legacy(event_loop) => event_loop.set_handler(event, callback),
+            ConcreteEventHandlers::Injected(events) => events.set_handler(event, callback),
+        }
     }
 
     pub(crate) fn clear_event_handler(&self, event: EventType) {
-        self.inner.event_loop.clear_handler(event);
+        match &self.inner.event_handlers {
+            ConcreteEventHandlers::Legacy(event_loop) => event_loop.clear_handler(event),
+            ConcreteEventHandlers::Injected(events) => events.clear_handler(event),
+        }
     }
 }
 
@@ -1089,7 +1238,7 @@ mod tests {
             .base()
             .send_event_with(EventDispatch::sink_change)
             .unwrap();
-        context.base().inner.event_loop.handle_pending_events();
+        context.base().handle_pending_events_for_test();
         assert_eq!(activity_count.load(Ordering::Relaxed), 1);
 
         context.clear_event_activity_handler();
@@ -1097,7 +1246,7 @@ mod tests {
             .base()
             .send_event_with(EventDispatch::sink_change)
             .unwrap();
-        context.base().inner.event_loop.handle_pending_events();
+        context.base().handle_pending_events_for_test();
         assert_eq!(activity_count.load(Ordering::Relaxed), 1);
     }
 }
