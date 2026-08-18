@@ -707,8 +707,9 @@ impl AudioContext {
             return;
         }
 
-        // Stop AudioRenderCapacity before closing so no capacity events are queued during shutdown.
-        self.render_capacity.stop();
+        // Permanently stop AudioRenderCapacity before closing so surviving public clones cannot
+        // restart event production during shutdown.
+        self.render_capacity.close();
 
         if self.state() == AudioContextState::Running {
             // First, stop rendering via a control message
@@ -848,8 +849,9 @@ impl AudioContext {
             return;
         }
 
-        // Stop AudioRenderCapacity before closing so no capacity events are queued during shutdown.
-        self.render_capacity.stop();
+        // Permanently stop AudioRenderCapacity before closing so surviving public clones cannot
+        // restart event production during shutdown.
+        self.render_capacity.close();
 
         // First, stop rendering via a control message
         if self.state() == AudioContextState::Running {

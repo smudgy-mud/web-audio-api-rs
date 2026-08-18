@@ -349,6 +349,18 @@ impl ConcreteBaseAudioContext {
         self.inner.event_send.send(msg)
     }
 
+    /// Clone the bounded event capability without retaining this entire context in a background
+    /// metrics worker.
+    pub(crate) fn event_sender(&self) -> Sender<EventDispatch> {
+        self.inner.event_send.clone()
+    }
+
+    /// Clone the render-frame clock without retaining this entire context in a background metrics
+    /// worker.
+    pub(crate) fn frames_played_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.inner.frames_played)
+    }
+
     pub(crate) fn set_event_activity_handler<F>(&self, callback: F)
     where
         F: Fn() + Send + Sync + 'static,
