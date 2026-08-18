@@ -270,12 +270,28 @@ impl BoundInjectedRenderer {
     }
 
     #[cfg(test)]
-    fn into_render_thread_for_test(self) -> (RenderThread, InjectedNodeLifetimeOwner) {
+    pub(crate) fn into_render_thread_for_test(self) -> (RenderThread, InjectedNodeLifetimeOwner) {
         (self.renderer, self.node_lifetimes)
     }
 }
 
 impl InjectedControlRenderInit {
+    #[cfg(test)]
+    pub(crate) fn reclaim_one_ordinary_for_test(&self) -> bool {
+        match self.receiver.try_recv() {
+            Ok(ControlMessage::InjectedBatch { batch, physical }) => {
+                drop(physical);
+                drop(batch);
+                true
+            }
+            Ok(other) => {
+                drop(other);
+                panic!("expected one injected ordinary batch")
+            }
+            Err(_) => false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::result_large_err)] // retry must return the exact init and bootstrap intact
     pub(crate) fn build_render_thread(
@@ -429,6 +445,12 @@ pub(crate) struct ControlBatchReservation {
     admission: GraphControlAdmission,
 }
 
+/// Dedicated one-command reservation for node-handle teardown. Keeping this wrapper separate from
+/// ordinary batch preparation prevents `ControlHandleDropped` from entering the general mutation
+/// whitelist while still using the same bounded transport and admission accounting.
+#[must_use]
+pub(crate) struct ControlHandleDroppedReservation(ControlBatchReservation);
+
 impl ControlBatchReservation {
     pub(crate) fn prepare_with<F>(
         self,
@@ -456,6 +478,10 @@ impl ControlBatchReservation {
                 error,
             });
         }
+        Ok(self.into_prepared(commands))
+    }
+
+    fn into_prepared(self, commands: Vec<ControlMessage>) -> PreparedControlBatch {
         let Self {
             inner,
             storage,
@@ -465,7 +491,7 @@ impl ControlBatchReservation {
             admission,
             ..
         } = self;
-        Ok(PreparedControlBatch {
+        PreparedControlBatch {
             commands: commands.into_boxed_slice(),
             inner,
             storage,
@@ -473,7 +499,14 @@ impl ControlBatchReservation {
             sequence_reservation,
             placement,
             admission,
-        })
+        }
+    }
+}
+
+impl ControlHandleDroppedReservation {
+    pub(crate) fn prepare(self, id: super::AudioNodeId) -> PreparedControlBatch {
+        self.0
+            .into_prepared(vec![ControlMessage::ControlHandleDropped { id }])
     }
 }
 
@@ -633,8 +666,12 @@ impl InjectedControlProducer {
         if self.inner.accepted_finalizer_failed.load(Ordering::Acquire) {
             return Err(InjectedControlError::ProtocolViolation);
         }
-        if state.phase != TransportPhase::Open {
-            return Err(InjectedControlError::Sealed);
+        match state.phase {
+            TransportPhase::Open => {}
+            TransportPhase::SealStarted | TransportPhase::Sealed => {
+                return Err(InjectedControlError::Sealed)
+            }
+            TransportPhase::Failed => return Err(InjectedControlError::ProtocolViolation),
         }
         let command_credit = self
             .inner
@@ -687,6 +724,13 @@ impl InjectedControlProducer {
             placement,
             admission,
         })
+    }
+
+    pub(crate) fn try_begin_control_handle_drop(
+        &self,
+    ) -> Result<ControlHandleDroppedReservation, InjectedControlError> {
+        self.try_begin_operation(1)
+            .map(ControlHandleDroppedReservation)
     }
 
     pub(crate) fn try_commit(
@@ -1002,7 +1046,7 @@ impl InjectedControlProducer {
     }
 
     #[cfg(test)]
-    fn accounting(&self) -> (usize, usize, usize, usize) {
+    pub(crate) fn accounting(&self) -> (usize, usize, usize, usize) {
         (
             self.inner.logical_commands.in_flight(),
             self.inner.batch_storage.in_flight(),
@@ -1023,8 +1067,19 @@ impl InjectedControlProducer {
     }
 
     #[cfg(test)]
-    fn fail_transport(&self) {
+    pub(crate) fn fail_transport(&self) {
         self.inner.state.lock().unwrap().phase = TransportPhase::Failed;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_transport_state_for_test(
+        &self,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    ) {
+        let _state = self.inner.state.lock().unwrap();
+        entered.send(()).unwrap();
+        release.recv().unwrap();
     }
 }
 
