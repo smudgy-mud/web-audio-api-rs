@@ -58,6 +58,8 @@ pub use spatial::AudioListener;
 
 mod io;
 
+pub mod output;
+
 mod analysis;
 mod message;
 
