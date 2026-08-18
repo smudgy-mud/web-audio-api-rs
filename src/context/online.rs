@@ -938,14 +938,653 @@ mod tests {
     #[cfg(feature = "diagnostics")]
     use crate::context::DESTINATION_NODE_ID;
     use crate::message::ControlBatchSender;
+    use crate::node::{AudioNode, AudioScheduledSourceNode};
+    use crate::output::{
+        audio_render_thread_pair, AudioOutputConfig, AudioOutputContextId,
+        AudioOutputEndpointShutdown, AudioOutputError, AudioOutputErrorKind, AudioOutputEventSink,
+        AudioOutputFactory, AudioOutputRequest, AudioOutputStartFailure, AudioRenderCallback,
+        AudioRenderFormat, AudioRenderOwner, AudioRenderStatus, EndpointShutdownConfirmed,
+        PreparedAudioOutput, RunningAudioOutput,
+    };
     use crate::render::RenderThread;
     use futures::executor;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+    use std::thread::{self, JoinHandle, ThreadId};
+    use std::time::{Duration, Instant};
 
     fn marker(value: u16, log: &Arc<Mutex<Vec<u16>>>) -> ControlMessage {
         ControlMessage::TestMarker {
             value,
             log: Arc::clone(log),
         }
+    }
+
+    const INJECTED_TEST_RATE: f32 = 48_000.;
+    const INJECTED_TEST_CHANNELS: usize = 2;
+    const INJECTED_TEST_FRAMES: usize = 128;
+    const INJECTED_TEST_TIMEOUT: Duration = Duration::from_secs(2);
+    static NEXT_INJECTED_TEST_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Default)]
+    struct InjectedEndpointProbe {
+        render_count: AtomicU64,
+        saw_nonzero: AtomicBool,
+        callback_destroyed: AtomicBool,
+        shutdown_joined: AtomicBool,
+        abort_completed: AtomicBool,
+        format: Mutex<Option<AudioRenderFormat>>,
+        callback_thread: Mutex<Option<ThreadId>>,
+    }
+
+    impl InjectedEndpointProbe {
+        fn render_count(&self) -> u64 {
+            self.render_count.load(AtomicOrdering::Acquire)
+        }
+    }
+
+    enum InjectedEndpointCommand {
+        Resume(crossbeam_channel::Sender<()>),
+        Suspend(crossbeam_channel::Sender<()>),
+        Shutdown,
+    }
+
+    struct TrackedRenderCallback {
+        callback: Option<AudioRenderCallback>,
+        probe: Arc<InjectedEndpointProbe>,
+    }
+
+    impl TrackedRenderCallback {
+        fn callback(&mut self) -> &mut AudioRenderCallback {
+            self.callback
+                .as_mut()
+                .expect("tracked callback is present until endpoint retirement")
+        }
+    }
+
+    impl Drop for TrackedRenderCallback {
+        fn drop(&mut self) {
+            drop(self.callback.take());
+            self.probe
+                .callback_destroyed
+                .store(true, AtomicOrdering::Release);
+        }
+    }
+
+    fn run_injected_endpoint(
+        mut tracked: TrackedRenderCallback,
+        receiver: crossbeam_channel::Receiver<InjectedEndpointCommand>,
+        mut output: Vec<f32>,
+    ) {
+        let format = tracked.callback().format();
+        let interval = Duration::from_secs_f64(
+            format.max_frames_per_callback() as f64 / f64::from(format.sample_rate()),
+        );
+        let probe = Arc::clone(&tracked.probe);
+        *probe.callback_thread.lock().unwrap() = Some(thread::current().id());
+        let mut running = true;
+
+        loop {
+            match receiver.recv_timeout(interval) {
+                Ok(InjectedEndpointCommand::Resume(ack)) => {
+                    running = true;
+                    let _ = ack.send(());
+                }
+                Ok(InjectedEndpointCommand::Suspend(ack)) => {
+                    running = false;
+                    let _ = ack.send(());
+                }
+                Ok(InjectedEndpointCommand::Shutdown) => {
+                    drop(tracked);
+                    return;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) if running => {
+                    let status = tracked.callback().render_interleaved_f32(&mut output);
+                    if status == AudioRenderStatus::Stop {
+                        return;
+                    }
+                    probe.render_count.fetch_add(1, AtomicOrdering::Release);
+                    if output.iter().any(|sample| sample.abs() > f32::EPSILON) {
+                        probe.saw_nonzero.store(true, AtomicOrdering::Release);
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    struct InjectedTestFactory {
+        probe: Arc<InjectedEndpointProbe>,
+        fail_start: bool,
+        fail_start_cleanup: bool,
+        configured_sample_rate: Option<f32>,
+    }
+
+    impl InjectedTestFactory {
+        fn new(fail_start: bool) -> Self {
+            Self {
+                probe: Arc::new(InjectedEndpointProbe::default()),
+                fail_start,
+                fail_start_cleanup: false,
+                configured_sample_rate: None,
+            }
+        }
+
+        fn with_failed_start_cleanup() -> Self {
+            Self {
+                fail_start_cleanup: true,
+                ..Self::new(true)
+            }
+        }
+
+        fn with_configured_sample_rate(sample_rate: f32) -> Self {
+            Self {
+                configured_sample_rate: Some(sample_rate),
+                ..Self::new(false)
+            }
+        }
+    }
+
+    impl AudioOutputFactory for InjectedTestFactory {
+        fn prepare(
+            &self,
+            request: &AudioOutputRequest,
+        ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+            let format = AudioRenderFormat::new(
+                self.configured_sample_rate.unwrap_or_else(|| {
+                    request
+                        .requested_sample_rate()
+                        .unwrap_or(INJECTED_TEST_RATE)
+                }),
+                request.number_of_channels(),
+                INJECTED_TEST_FRAMES,
+            )?;
+            let config = AudioOutputConfig::new(format, request.sink_id(), 0.)?;
+            Ok(Box::new(InjectedPreparedOutput {
+                config,
+                probe: Arc::clone(&self.probe),
+                fail_start: self.fail_start,
+                fail_start_cleanup: self.fail_start_cleanup,
+            }))
+        }
+    }
+
+    struct InjectedPreparedOutput {
+        config: AudioOutputConfig,
+        probe: Arc<InjectedEndpointProbe>,
+        fail_start: bool,
+        fail_start_cleanup: bool,
+    }
+
+    impl PreparedAudioOutput for InjectedPreparedOutput {
+        fn config(&self) -> &AudioOutputConfig {
+            &self.config
+        }
+
+        fn start(
+            self: Box<Self>,
+            callback: AudioRenderCallback,
+            _events: AudioOutputEventSink,
+        ) -> Result<Box<dyn RunningAudioOutput>, AudioOutputStartFailure> {
+            let format = callback.format();
+            *self.probe.format.lock().unwrap() = Some(format);
+            let tracked = TrackedRenderCallback {
+                callback: Some(callback),
+                probe: Arc::clone(&self.probe),
+            };
+            if self.fail_start {
+                drop(tracked);
+                let shutdown = if self.fail_start_cleanup {
+                    Err(AudioOutputError::new(
+                        AudioOutputErrorKind::Shutdown,
+                        "injected test endpoint failed partial-start cleanup",
+                    ))
+                } else {
+                    Ok(())
+                };
+                return Err(AudioOutputStartFailure::new(
+                    AudioOutputError::new(
+                        AudioOutputErrorKind::BackendSpecific,
+                        "injected test endpoint rejected startup",
+                    ),
+                    AudioOutputEndpointShutdown::ready(shutdown),
+                ));
+            }
+
+            let (sender, receiver) = crossbeam_channel::bounded(8);
+            let output = vec![0.; format.max_frames_per_callback() * format.number_of_channels()];
+            let join = thread::Builder::new()
+                .name("injected-test-output".to_owned())
+                .spawn(move || run_injected_endpoint(tracked, receiver, output))
+                .map_err(|error| {
+                    AudioOutputStartFailure::new(
+                        AudioOutputError::new(
+                            AudioOutputErrorKind::BackendSpecific,
+                            format!("failed to spawn injected test endpoint: {error}"),
+                        ),
+                        AudioOutputEndpointShutdown::ready(Ok(())),
+                    )
+                })?;
+
+            Ok(Box::new(InjectedRunningOutput {
+                sender,
+                join: Some(join),
+                probe: Arc::clone(&self.probe),
+            }))
+        }
+
+        fn abort(self: Box<Self>) -> AudioOutputEndpointShutdown {
+            let probe = Arc::clone(&self.probe);
+            AudioOutputEndpointShutdown::from_future(async move {
+                probe.abort_completed.store(true, AtomicOrdering::Release);
+                Ok(())
+            })
+        }
+    }
+
+    struct InjectedRunningOutput {
+        sender: crossbeam_channel::Sender<InjectedEndpointCommand>,
+        join: Option<JoinHandle<()>>,
+        probe: Arc<InjectedEndpointProbe>,
+    }
+
+    impl InjectedRunningOutput {
+        fn acknowledged_command(
+            &self,
+            command: impl FnOnce(crossbeam_channel::Sender<()>) -> InjectedEndpointCommand,
+        ) -> Result<(), AudioOutputError> {
+            let (ack_send, ack_recv) = crossbeam_channel::bounded(1);
+            self.sender.send(command(ack_send)).map_err(|_| {
+                AudioOutputError::new(
+                    AudioOutputErrorKind::Shutdown,
+                    "injected test endpoint callback thread disconnected",
+                )
+            })?;
+            ack_recv.recv_timeout(INJECTED_TEST_TIMEOUT).map_err(|_| {
+                AudioOutputError::new(
+                    AudioOutputErrorKind::Shutdown,
+                    "injected test endpoint command was not acknowledged",
+                )
+            })
+        }
+    }
+
+    impl RunningAudioOutput for InjectedRunningOutput {
+        fn resume(&mut self) -> Result<(), AudioOutputError> {
+            self.acknowledged_command(InjectedEndpointCommand::Resume)
+        }
+
+        fn suspend(&mut self) -> Result<(), AudioOutputError> {
+            self.acknowledged_command(InjectedEndpointCommand::Suspend)
+        }
+
+        fn shutdown(mut self: Box<Self>) -> AudioOutputEndpointShutdown {
+            let _ = self.sender.send(InjectedEndpointCommand::Shutdown);
+            let join_result = self.join.take().unwrap().join().map_err(|_| {
+                AudioOutputError::new(
+                    AudioOutputErrorKind::Shutdown,
+                    "injected test endpoint callback thread panicked",
+                )
+            });
+            self.probe
+                .shutdown_joined
+                .store(true, AtomicOrdering::Release);
+            let result = join_result.and_then(|()| {
+                let callback_destroyed =
+                    self.probe.callback_destroyed.load(AtomicOrdering::Acquire);
+                if callback_destroyed {
+                    Ok(())
+                } else {
+                    Err(AudioOutputError::new(
+                        AudioOutputErrorKind::Shutdown,
+                        "injected endpoint joined without confirming callback destruction",
+                    ))
+                }
+            });
+            AudioOutputEndpointShutdown::ready(result)
+        }
+    }
+
+    struct InjectedContextHarness {
+        base: ConcreteBaseAudioContext,
+        event_loop: EventLoop,
+        output_events: crate::output::AudioOutputEventWatcher,
+        owner: Option<AudioRenderOwner>,
+        running: Option<Box<dyn RunningAudioOutput>>,
+    }
+
+    impl BaseAudioContext for InjectedContextHarness {
+        fn base(&self) -> &ConcreteBaseAudioContext {
+            &self.base
+        }
+    }
+
+    impl InjectedContextHarness {
+        fn new(factory: &dyn AudioOutputFactory) -> Result<Self, AudioOutputError> {
+            let context_id = NEXT_INJECTED_TEST_CONTEXT_ID.fetch_add(1, AtomicOrdering::Relaxed);
+            let request = AudioOutputRequest::new(
+                AudioOutputContextId::new(context_id).unwrap(),
+                "injected-test",
+                Some(INJECTED_TEST_RATE),
+                INJECTED_TEST_CHANNELS,
+                AudioContextLatencyCategory::Interactive,
+                AudioContextRenderSizeCategory::Default,
+                Some(format!("injected test context {context_id}")),
+            )?;
+            let prepared = factory.prepare(&request)?;
+            let config = prepared.config().clone();
+            if let Err(error) = request.validate_config(&config) {
+                executor::block_on(prepared.abort())?;
+                return Err(error);
+            }
+            let format = config.format();
+
+            let (control_init, render_init) = io::thread_init();
+            let ControlThreadInit {
+                state,
+                frames_played,
+                stats: _,
+                ctrl_msg_send,
+                control_batch_send,
+                control_batch_applied,
+                event_send,
+                event_recv,
+            } = control_init;
+            let RenderThreadInit {
+                state: render_state,
+                startup_pending,
+                frames_played: render_frames_played,
+                stats: render_stats,
+                ctrl_msg_recv,
+                control_batch_applied: render_control_batch_applied,
+                event_send: render_event_send,
+            } = render_init;
+
+            let (node_id_producer, node_id_consumer) = llq::Queue::new().split();
+            ctrl_msg_send
+                .send(ControlMessage::Startup {
+                    graph: Graph::new(node_id_producer),
+                })
+                .map_err(|_| {
+                    AudioOutputError::new(
+                        AudioOutputErrorKind::Shutdown,
+                        "injected test control channel disconnected during startup",
+                    )
+                })?;
+
+            let mut renderer = RenderThread::new(
+                format.sample_rate(),
+                format.number_of_channels(),
+                ctrl_msg_recv,
+                render_state,
+                render_frames_played,
+                render_stats,
+                render_event_send,
+                render_control_batch_applied,
+            );
+            renderer.set_startup_pending(startup_pending);
+            let (output_sink, output_events) = AudioOutputEventSink::bounded(8);
+            let (owner, callback) = audio_render_thread_pair(format, renderer, output_sink.clone());
+            let running = match prepared.start(callback, output_sink) {
+                Ok(running) => running,
+                Err(failure) => {
+                    owner.begin_shutdown();
+                    let (error, shutdown) = failure.into_parts();
+                    executor::block_on(shutdown)?;
+                    let reclaim = owner
+                        .try_reclaim_after_shutdown(EndpointShutdownConfirmed::new())
+                        .map_err(|_| {
+                            AudioOutputError::new(
+                                AudioOutputErrorKind::Shutdown,
+                                "injected endpoint retained its callback after failed startup",
+                            )
+                        })?;
+                    reclaim?;
+                    return Err(error);
+                }
+            };
+
+            let event_loop = EventLoop::new(event_recv);
+            let base = ConcreteBaseAudioContext::new(
+                format.sample_rate(),
+                format.number_of_channels(),
+                state,
+                frames_played,
+                ctrl_msg_send,
+                control_batch_send,
+                control_batch_applied,
+                event_send,
+                event_loop.clone(),
+                false,
+                node_id_consumer,
+            );
+
+            Ok(Self {
+                base,
+                event_loop,
+                output_events,
+                owner: Some(owner),
+                running: Some(running),
+            })
+        }
+
+        fn wait_until(&self, predicate: impl Fn() -> bool) {
+            let deadline = Instant::now() + INJECTED_TEST_TIMEOUT;
+            while !predicate() {
+                self.event_loop.handle_pending_events();
+                assert_eq!(self.output_events.death_reason(), None);
+                assert!(
+                    Instant::now() < deadline,
+                    "injected context did not reach the expected state"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            self.event_loop.handle_pending_events();
+        }
+
+        fn acknowledged_graph_message(
+            &self,
+            submit: impl FnOnce(OneshotNotify) -> ControlMessage,
+            suspended: bool,
+        ) -> Result<(), AudioOutputError> {
+            let (ack_send, ack_recv) = crossbeam_channel::bounded(1);
+            let message = submit(OneshotNotify::Sync(ack_send));
+            if suspended {
+                self.base.suspend_control_msgs(message);
+            } else {
+                self.base.resume_control_msgs(message);
+            }
+            ack_recv.recv_timeout(INJECTED_TEST_TIMEOUT).map_err(|_| {
+                AudioOutputError::new(
+                    AudioOutputErrorKind::Shutdown,
+                    "injected graph lifecycle command was not acknowledged",
+                )
+            })
+        }
+
+        fn suspend(&mut self) -> Result<(), AudioOutputError> {
+            self.acknowledged_graph_message(|notify| ControlMessage::Suspend { notify }, true)?;
+            self.running.as_mut().unwrap().suspend()
+        }
+
+        fn resume(&mut self) -> Result<(), AudioOutputError> {
+            self.running.as_mut().unwrap().resume()?;
+            self.acknowledged_graph_message(|notify| ControlMessage::Resume { notify }, false)
+        }
+
+        fn close(&mut self) -> Result<(), AudioOutputError> {
+            if self.owner.is_none() {
+                return Ok(());
+            }
+
+            if self.state() == AudioContextState::Running {
+                let (ack_send, ack_recv) = crossbeam_channel::bounded(1);
+                self.base.send_control_msg(ControlMessage::Close {
+                    notify: OneshotNotify::Sync(ack_send),
+                });
+                ack_recv.recv_timeout(INJECTED_TEST_TIMEOUT).map_err(|_| {
+                    AudioOutputError::new(
+                        AudioOutputErrorKind::Shutdown,
+                        "injected graph close was not acknowledged",
+                    )
+                })?;
+            } else {
+                self.base.set_state(AudioContextState::Closed);
+            }
+
+            let owner = self.owner.take().unwrap();
+            owner.begin_shutdown();
+            let shutdown = self.running.take().unwrap().shutdown();
+            executor::block_on(shutdown)?;
+            let reclaim = owner
+                .try_reclaim_after_shutdown(EndpointShutdownConfirmed::new())
+                .map_err(|_| {
+                    AudioOutputError::new(
+                        AudioOutputErrorKind::Shutdown,
+                        "injected endpoint retained its callback after shutdown",
+                    )
+                })?;
+            reclaim?;
+            self.event_loop.handle_pending_events();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn injected_outputs_render_isolated_oscillators_and_retire_joinably() {
+        let factory_a = InjectedTestFactory::new(false);
+        let factory_b = InjectedTestFactory::new(false);
+        let mut context_a = InjectedContextHarness::new(&factory_a).unwrap();
+        let mut context_b = InjectedContextHarness::new(&factory_b).unwrap();
+
+        context_a.wait_until(|| context_a.state() == AudioContextState::Running);
+        context_b.wait_until(|| context_b.state() == AudioContextState::Running);
+        let expected_format = AudioRenderFormat::new(
+            INJECTED_TEST_RATE,
+            INJECTED_TEST_CHANNELS,
+            INJECTED_TEST_FRAMES,
+        )
+        .unwrap();
+        assert_eq!(context_a.sample_rate(), INJECTED_TEST_RATE);
+        assert_eq!(context_b.sample_rate(), INJECTED_TEST_RATE);
+        assert_eq!(
+            context_a.destination().max_channel_count(),
+            INJECTED_TEST_CHANNELS
+        );
+        assert_eq!(
+            context_b.destination().max_channel_count(),
+            INJECTED_TEST_CHANNELS
+        );
+        assert_eq!(
+            *factory_a.probe.format.lock().unwrap(),
+            Some(expected_format)
+        );
+        assert_eq!(
+            *factory_b.probe.format.lock().unwrap(),
+            Some(expected_format)
+        );
+        context_a.wait_until(|| factory_a.probe.render_count() > 0);
+        context_b.wait_until(|| factory_b.probe.render_count() > 0);
+        assert!(!factory_a.probe.saw_nonzero.load(AtomicOrdering::Acquire));
+        assert!(!factory_b.probe.saw_nonzero.load(AtomicOrdering::Acquire));
+
+        let mut oscillator_a = context_a.create_oscillator();
+        oscillator_a.connect(&context_a.destination());
+        oscillator_a.start();
+        let mut oscillator_b = context_b.create_oscillator();
+        oscillator_b.connect(&context_b.destination());
+        oscillator_b.start();
+
+        context_a.wait_until(|| factory_a.probe.saw_nonzero.load(AtomicOrdering::Acquire));
+        context_b.wait_until(|| factory_b.probe.saw_nonzero.load(AtomicOrdering::Acquire));
+        assert_ne!(
+            *factory_a.probe.callback_thread.lock().unwrap(),
+            *factory_b.probe.callback_thread.lock().unwrap()
+        );
+
+        context_a.suspend().unwrap();
+        assert_eq!(context_a.state(), AudioContextState::Suspended);
+        let suspended_a_count = factory_a.probe.render_count();
+        let running_b_count = factory_b.probe.render_count();
+        context_b.wait_until(|| factory_b.probe.render_count() > running_b_count);
+        assert_eq!(factory_a.probe.render_count(), suspended_a_count);
+
+        context_a.resume().unwrap();
+        assert_eq!(context_a.state(), AudioContextState::Running);
+        context_a.wait_until(|| factory_a.probe.render_count() > suspended_a_count);
+
+        let b_count_before_a_close = factory_b.probe.render_count();
+        context_a.close().unwrap();
+        assert_eq!(context_a.state(), AudioContextState::Closed);
+        assert!(factory_a
+            .probe
+            .callback_destroyed
+            .load(AtomicOrdering::Acquire));
+        assert!(factory_a
+            .probe
+            .shutdown_joined
+            .load(AtomicOrdering::Acquire));
+        context_b.wait_until(|| factory_b.probe.render_count() > b_count_before_a_close);
+        assert_eq!(context_b.state(), AudioContextState::Running);
+        assert!(!factory_b
+            .probe
+            .shutdown_joined
+            .load(AtomicOrdering::Acquire));
+
+        context_b.close().unwrap();
+        assert!(factory_b
+            .probe
+            .callback_destroyed
+            .load(AtomicOrdering::Acquire));
+        assert!(factory_b
+            .probe
+            .shutdown_joined
+            .load(AtomicOrdering::Acquire));
+    }
+
+    #[test]
+    fn injected_start_failure_destroys_callback_before_ready_and_reclaims_renderer() {
+        let factory = InjectedTestFactory::new(true);
+        let error = match InjectedContextHarness::new(&factory) {
+            Ok(_) => panic!("injected test endpoint unexpectedly started"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), AudioOutputErrorKind::BackendSpecific);
+        assert!(factory
+            .probe
+            .callback_destroyed
+            .load(AtomicOrdering::Acquire));
+    }
+
+    #[test]
+    fn injected_start_failure_surfaces_endpoint_cleanup_error() {
+        // A failed endpoint retirement cannot authorize renderer reclamation. The owner therefore
+        // takes its deliberate fail-closed quarantine path in this negative test.
+        let factory = InjectedTestFactory::with_failed_start_cleanup();
+        let error = match InjectedContextHarness::new(&factory) {
+            Ok(_) => panic!("injected test endpoint unexpectedly started"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), AudioOutputErrorKind::Shutdown);
+        assert_eq!(
+            error.message(),
+            "injected test endpoint failed partial-start cleanup"
+        );
+    }
+
+    #[test]
+    fn injected_mismatched_config_is_aborted_before_validation_error() {
+        let factory = InjectedTestFactory::with_configured_sample_rate(44_100.);
+        let error = match InjectedContextHarness::new(&factory) {
+            Ok(_) => panic!("injected test endpoint accepted a mismatched format"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), AudioOutputErrorKind::NotSupported);
+        assert!(factory.probe.abort_completed.load(AtomicOrdering::Acquire));
+        assert_eq!(factory.probe.render_count(), 0);
     }
 
     #[test]
