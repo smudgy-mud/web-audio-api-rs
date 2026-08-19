@@ -30,8 +30,8 @@ use super::injected_node_lifetime::{
     ProvisionalNodeRegistration,
 };
 use super::{
-    AudioContextRegistration, AudioNodeId, AudioNodeLifetimeReservation,
-    SharedAudioNodeLifetimeReservation,
+    AudioContextRegistration, AudioControlBatchReservation, AudioNodeId,
+    AudioNodeLifetimeReservation, SharedAudioNodeLifetimeReservation,
 };
 use crate::events::{ExactEndedEventKey, InjectedExactEndedEventTarget};
 use crate::message::ControlMessage;
@@ -194,26 +194,57 @@ impl InjectedOscillatorControl {
         &self,
         when: f64,
     ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
-        self.try_command(InjectedOscillatorCommandKind::Start(when))
+        self.try_command(InjectedOscillatorCommandKind::Start(when), None)
+    }
+
+    pub(crate) fn try_start_with_host_reservation(
+        &self,
+        when: f64,
+        reservation: AudioControlBatchReservation,
+    ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
+        self.try_command(
+            InjectedOscillatorCommandKind::Start(when),
+            Some(reservation),
+        )
     }
 
     pub(crate) fn try_stop(
         &self,
         when: f64,
     ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
-        self.try_command(InjectedOscillatorCommandKind::Stop(when))
+        self.try_command(InjectedOscillatorCommandKind::Stop(when), None)
+    }
+
+    pub(crate) fn try_stop_with_host_reservation(
+        &self,
+        when: f64,
+        reservation: AudioControlBatchReservation,
+    ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
+        self.try_command(InjectedOscillatorCommandKind::Stop(when), Some(reservation))
     }
 
     pub(crate) fn try_set_type(
         &self,
         type_: OscillatorType,
     ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
-        self.try_command(InjectedOscillatorCommandKind::SetType(type_))
+        self.try_command(InjectedOscillatorCommandKind::SetType(type_), None)
+    }
+
+    pub(crate) fn try_set_type_with_host_reservation(
+        &self,
+        type_: OscillatorType,
+        reservation: AudioControlBatchReservation,
+    ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
+        self.try_command(
+            InjectedOscillatorCommandKind::SetType(type_),
+            Some(reservation),
+        )
     }
 
     fn try_command(
         &self,
         command: InjectedOscillatorCommandKind,
+        host_reservation: Option<AudioControlBatchReservation>,
     ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
         let result = {
             let _serialized = self
@@ -232,10 +263,13 @@ impl InjectedOscillatorControl {
                 }
                 _ => {}
             }
-            let reservation = self
-                .control
-                .try_begin_oscillator_command()
-                .map_err(InjectedOscillatorMutationError::Control)?;
+            let reservation = match host_reservation {
+                Some(host_reservation) => self
+                    .control
+                    .try_begin_oscillator_command_with_host_reservation(host_reservation),
+                None => self.control.try_begin_oscillator_command(),
+            }
+            .map_err(InjectedOscillatorMutationError::Control)?;
             if !self.lifetime.is_live_for(self.id) {
                 return Err(InjectedOscillatorMutationError::Inactive);
             }
@@ -423,19 +457,23 @@ pub(crate) struct InjectedOscillatorConstruction {
 }
 
 impl InjectedNodeConstructor {
-    pub(super) fn try_begin_oscillator_with_lifetime(
+    pub(super) fn try_begin_oscillator_with_reservations(
         &self,
         events: &crate::events::InjectedControlEventDispatch,
         initial_type: OscillatorType,
         lifetime: Option<AudioNodeLifetimeReservation>,
+        control: Option<AudioControlBatchReservation>,
     ) -> Result<InjectedOscillatorConstruction, InjectedOscillatorConstructionError> {
         if initial_type == OscillatorType::Custom || !events.matches_gate(&self.admission_gate()) {
             return Err(InjectedOscillatorConstructionError::ProtocolViolation);
         }
-        let reservation = self
-            .control
-            .try_begin_operation(OSCILLATOR_COMMAND_COUNT)
-            .map_err(InjectedOscillatorConstructionError::Control)?;
+        let reservation = match control {
+            Some(control) => self
+                .control
+                .try_begin_operation_with_host_reservation(OSCILLATOR_COMMAND_COUNT, control),
+            None => self.control.try_begin_operation(OSCILLATOR_COMMAND_COUNT),
+        }
+        .map_err(InjectedOscillatorConstructionError::Control)?;
         let lifetime = lifetime.map(SharedAudioNodeLifetimeReservation::new);
         let oscillator_serializer = Arc::new(Mutex::new(()));
         let frequency_serializer = Arc::new(Mutex::new(()));
@@ -1257,18 +1295,22 @@ impl InjectedNodeConstructor {
     pub(crate) fn try_begin_gain(
         &self,
     ) -> Result<InjectedGainConstruction, InjectedGainConstructionError> {
-        self.try_begin_gain_with_lifetime(None)
+        self.try_begin_gain_with_reservations(None, None)
     }
 
-    pub(crate) fn try_begin_gain_with_lifetime(
+    pub(crate) fn try_begin_gain_with_reservations(
         &self,
         lifetime: Option<AudioNodeLifetimeReservation>,
+        control: Option<AudioControlBatchReservation>,
     ) -> Result<InjectedGainConstruction, InjectedGainConstructionError> {
         // This admission must precede every ID, lifetime-slot, mirror, or payload mutation.
-        let reservation = self
-            .control
-            .try_begin_operation(GAIN_COMMAND_COUNT)
-            .map_err(InjectedGainConstructionError::Control)?;
+        let reservation = match control {
+            Some(control) => self
+                .control
+                .try_begin_operation_with_host_reservation(GAIN_COMMAND_COUNT, control),
+            None => self.control.try_begin_operation(GAIN_COMMAND_COUNT),
+        }
+        .map_err(InjectedGainConstructionError::Control)?;
         let lifetime = lifetime.map(SharedAudioNodeLifetimeReservation::new);
         // Allocate the post-construction serializer while every later Gain resource is still
         // rollback-owned by this admitted transaction.
