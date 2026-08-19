@@ -1,4 +1,4 @@
-//! Opaque host resource ownership attached to exact hosted graph lifetimes.
+//! Opaque host resource ownership attached to exact hosted graph and command lifetimes.
 
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
@@ -51,6 +51,55 @@ impl Drop for AudioNodeLifetimeReservation {
     }
 }
 
+/// A host-owned reservation released with one exact hosted control batch.
+///
+/// This is an accounting attachment, not graph authority. A hosted operation moves it into the
+/// same fixed logical-command credit that owns the submitted batch. Rejected preparation or
+/// submission releases it during rollback. Accepted work retains it while staged, queued,
+/// rendering, or awaiting off-render-thread batch reclamation. A fail-closed transport quarantine
+/// deliberately retains it.
+///
+/// One reservation may represent every command in the batch; the host remains responsible for
+/// reserving the exact batch cost before calling the corresponding hosted operation. The wrapped
+/// value must have a nonblocking destructor. A destructor panic is contained rather than allowed
+/// to unwind through control rollback or batch reclamation.
+pub struct AudioControlBatchReservation {
+    value: Option<Box<dyn Send + 'static>>,
+}
+
+impl AudioControlBatchReservation {
+    /// Wraps one or more host accounting guards in a single opaque reservation.
+    pub fn new<T>(value: T) -> Self
+    where
+        T: Send + 'static,
+    {
+        Self {
+            value: Some(Box::new(value)),
+        }
+    }
+}
+
+impl fmt::Debug for AudioControlBatchReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AudioControlBatchReservation")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AudioControlBatchReservation {
+    fn drop(&mut self) {
+        let Some(value) = self.value.take() else {
+            return;
+        };
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(value))) {
+            // Accounting destruction cannot unwind through exact rollback, the GC worker, or a
+            // renderer teardown fallback. The panic payload may itself have a hostile Drop.
+            std::mem::forget(payload);
+        }
+    }
+}
+
 /// Shared only by the fixed set of lifetime cleanups created in one compound transaction.
 /// Keeping the payload behind a mutex permits a merely `Send` host guard to be retained by the
 /// `Arc` while cleanup records may move between lifecycle threads.
@@ -83,6 +132,11 @@ mod tests {
     fn opaque_reservation_contains_a_hostile_destructor() {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             drop(AudioNodeLifetimeReservation::new(PanicOnDrop));
+        }));
+        assert!(result.is_ok());
+
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            drop(AudioControlBatchReservation::new(PanicOnDrop));
         }));
         assert!(result.is_ok());
     }

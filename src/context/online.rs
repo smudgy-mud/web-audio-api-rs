@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "diagnostics")]
 use crate::context::{AudioBackendDiagnostics, AudioContextDiagnostics};
 use crate::context::{
-    AudioContextState, AudioNodeLifetimeReservation, BaseAudioContext, ConcreteBaseAudioContext,
+    AudioContextState, AudioControlBatchReservation, AudioNodeLifetimeReservation,
+    BaseAudioContext, ConcreteBaseAudioContext,
 };
 #[cfg(feature = "diagnostics")]
 use crate::events::EventPayload;
@@ -311,6 +312,32 @@ impl AudioContext {
         )
     }
 
+    /// Constructs a hosted `GainNode` with exact graph-lifetime and four-command reservations.
+    ///
+    /// The command reservation remains held through suspension, renderer application, and
+    /// off-render-thread batch reclamation. Rejected construction releases both reservations only
+    /// after rollback. This operation is available only on hosted contexts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a legacy context or when exact construction is rejected.
+    pub fn create_gain_with_reservations(
+        &self,
+        lifetime: AudioNodeLifetimeReservation,
+        control: AudioControlBatchReservation,
+    ) -> node::GainNode {
+        assert!(
+            self.is_hosted(),
+            "NotSupportedError - resource reservations require an exact hosted AudioContext"
+        );
+        node::GainNode::new_injected_with_reservations(
+            &self.base,
+            node::GainOptions::default(),
+            Some(lifetime),
+            Some(control),
+        )
+    }
+
     /// Constructs a hosted fixed-wave `OscillatorNode` while attaching host accounting to all
     /// three exact graph nodes (oscillator, frequency, and detune).
     ///
@@ -333,6 +360,33 @@ impl AudioContext {
             &self.base,
             node::OscillatorOptions::default(),
             Some(reservation),
+        )
+    }
+
+    /// Constructs a hosted fixed-wave `OscillatorNode` with exact graph-lifetime and
+    /// seven-command reservations.
+    ///
+    /// The command reservation remains held through suspension, renderer application, and
+    /// off-render-thread batch reclamation. Rejected construction releases both reservations only
+    /// after rollback. This operation is available only on hosted contexts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a legacy context or when exact construction is rejected.
+    pub fn create_oscillator_with_reservations(
+        &self,
+        lifetime: AudioNodeLifetimeReservation,
+        control: AudioControlBatchReservation,
+    ) -> node::OscillatorNode {
+        assert!(
+            self.is_hosted(),
+            "NotSupportedError - resource reservations require an exact hosted AudioContext"
+        );
+        node::OscillatorNode::new_injected_with_reservations(
+            &self.base,
+            node::OscillatorOptions::default(),
+            Some(lifetime),
+            Some(control),
         )
     }
 
@@ -1771,11 +1825,25 @@ mod tests {
 
         let gain_dropped = Arc::new(AtomicBool::new(false));
         let oscillator_dropped = Arc::new(AtomicBool::new(false));
-        let gain = context.create_gain_with_lifetime_reservation(
+        let gain_commands_dropped = Arc::new(AtomicBool::new(false));
+        let oscillator_commands_dropped = Arc::new(AtomicBool::new(false));
+        let start_command_dropped = Arc::new(AtomicBool::new(false));
+        let stop_command_dropped = Arc::new(AtomicBool::new(false));
+        let gain = context.create_gain_with_reservations(
             AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&gain_dropped))),
+            AudioControlBatchReservation::new(DropProbe(Arc::clone(&gain_commands_dropped))),
         );
-        let oscillator = context.create_oscillator_with_lifetime_reservation(
+        let mut oscillator = context.create_oscillator_with_reservations(
             AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&oscillator_dropped))),
+            AudioControlBatchReservation::new(DropProbe(Arc::clone(&oscillator_commands_dropped))),
+        );
+        oscillator.start_at_with_control_reservation(
+            0.,
+            AudioControlBatchReservation::new(DropProbe(Arc::clone(&start_command_dropped))),
+        );
+        oscillator.stop_at_with_control_reservation(
+            0.01,
+            AudioControlBatchReservation::new(DropProbe(Arc::clone(&stop_command_dropped))),
         );
         drop(gain);
         drop(oscillator);
@@ -1784,6 +1852,10 @@ mod tests {
         // insertion or teardown. Wrapper destruction alone must not release host accounting.
         assert!(!gain_dropped.load(AtomicOrdering::Acquire));
         assert!(!oscillator_dropped.load(AtomicOrdering::Acquire));
+        assert!(!gain_commands_dropped.load(AtomicOrdering::Acquire));
+        assert!(!oscillator_commands_dropped.load(AtomicOrdering::Acquire));
+        assert!(!start_command_dropped.load(AtomicOrdering::Acquire));
+        assert!(!stop_command_dropped.load(AtomicOrdering::Acquire));
 
         suspend_release.send(()).unwrap();
         assert_eq!(
@@ -1792,6 +1864,10 @@ mod tests {
         );
         while !gain_dropped.load(AtomicOrdering::Acquire)
             || !oscillator_dropped.load(AtomicOrdering::Acquire)
+            || !gain_commands_dropped.load(AtomicOrdering::Acquire)
+            || !oscillator_commands_dropped.load(AtomicOrdering::Acquire)
+            || !start_command_dropped.load(AtomicOrdering::Acquire)
+            || !stop_command_dropped.load(AtomicOrdering::Acquire)
         {
             assert!(
                 Instant::now() < deadline,
@@ -1813,13 +1889,18 @@ mod tests {
         drop(surviving_oscillator);
 
         let rejected_dropped = Arc::new(AtomicBool::new(false));
+        let rejected_commands_dropped = Arc::new(AtomicBool::new(false));
         let rejected = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            context.create_gain_with_lifetime_reservation(AudioNodeLifetimeReservation::new(
-                DropProbe(Arc::clone(&rejected_dropped)),
-            ));
+            context.create_gain_with_reservations(
+                AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&rejected_dropped))),
+                AudioControlBatchReservation::new(DropProbe(Arc::clone(
+                    &rejected_commands_dropped,
+                ))),
+            );
         }));
         assert!(rejected.is_err());
         assert!(rejected_dropped.load(AtomicOrdering::Acquire));
+        assert!(rejected_commands_dropped.load(AtomicOrdering::Acquire));
     }
 
     #[test]

@@ -26,7 +26,7 @@ use super::injected_node_lifetime::{
     injected_node_lifetime_registry, DEFAULT_NODE_LIFETIME_CAPACITY,
 };
 use super::injected_node_lifetime::{BoundInjectedOutputRenderer, InjectedNodeLifetimeOwner};
-use super::{InjectedContextAdmissionGate, InjectedGraphReclaimInit};
+use super::{AudioControlBatchReservation, InjectedContextAdmissionGate, InjectedGraphReclaimInit};
 #[cfg(test)]
 use crate::events::EventDispatch;
 use crate::events::{
@@ -928,6 +928,17 @@ pub(crate) struct InjectedAudioParamValueReservation(ControlBatchReservation);
 pub(crate) struct InjectedOscillatorCommandReservation(ControlBatchReservation);
 
 impl ControlBatchReservation {
+    pub(super) fn with_host_reservation(
+        mut self,
+        reservation: AudioControlBatchReservation,
+    ) -> Result<Self, InjectedControlError> {
+        if !self.command_credit.attach_host_reservation(reservation) {
+            return Err(InjectedControlError::ProtocolViolation);
+        }
+        Ok(self)
+    }
+
+    #[allow(clippy::result_large_err)] // rollback must return commands and every exact authority
     pub(crate) fn prepare_with<F>(
         self,
         factory: F,
@@ -1332,6 +1343,18 @@ impl InjectedControlProducer {
             .map_err(|failure| failure.error)
     }
 
+    /// Reserves the exact transport batch and attaches one opaque embedder reservation to its
+    /// logical command credit. The attachment consequently follows staged, queued, renderer, GC,
+    /// rollback, and fail-closed ownership without exposing any transport authority.
+    pub(crate) fn try_begin_operation_with_host_reservation(
+        &self,
+        command_count: usize,
+        host_reservation: AudioControlBatchReservation,
+    ) -> Result<ControlBatchReservation, InjectedControlError> {
+        self.try_begin_operation(command_count)?
+            .with_host_reservation(host_reservation)
+    }
+
     pub(super) fn matches_admitted_operation(&self, operation: &AdmittedGraphOperation) -> bool {
         Arc::ptr_eq(&self.inner, &operation.inner)
     }
@@ -1508,6 +1531,14 @@ impl InjectedControlProducer {
         &self,
     ) -> Result<InjectedOscillatorCommandReservation, InjectedControlError> {
         self.try_begin_operation(1)
+            .map(InjectedOscillatorCommandReservation)
+    }
+
+    pub(crate) fn try_begin_oscillator_command_with_host_reservation(
+        &self,
+        host_reservation: AudioControlBatchReservation,
+    ) -> Result<InjectedOscillatorCommandReservation, InjectedControlError> {
+        self.try_begin_operation_with_host_reservation(1, host_reservation)
             .map(InjectedOscillatorCommandReservation)
     }
 
@@ -2454,7 +2485,7 @@ mod tests {
     use std::thread::{self, ThreadId};
 
     use super::*;
-    use crate::context::{AudioContextState, AudioNodeId};
+    use crate::context::{AudioContextState, AudioControlBatchReservation, AudioNodeId};
     use crate::message::GraphLifecycleOutcome;
     use crate::output::EndpointShutdownConfirmed;
 
@@ -2767,6 +2798,41 @@ mod tests {
             first.producer.try_commit(failure.batch).unwrap(),
             CommitControlOutcome::Enqueued { sequence: 1 }
         );
+    }
+
+    #[test]
+    fn rejected_host_reservation_remains_owned_through_typed_rollback() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let first = Harness::new(1, false);
+        let second = Harness::new(1, false);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let reservation = first
+            .producer
+            .try_begin_operation_with_host_reservation(
+                1,
+                AudioControlBatchReservation::new(DropProbe(Arc::clone(&dropped))),
+            )
+            .unwrap();
+        let batch = reservation
+            .prepare_with(|| vec![ControlMessage::TestNop])
+            .ok()
+            .unwrap();
+        let failure = second.producer.try_commit(batch).err().unwrap();
+        assert!(!dropped.load(Ordering::Acquire));
+
+        let (_, rollback) = failure.rollback_with_commands(|commands| {
+            assert!(!dropped.load(Ordering::Acquire));
+            assert_eq!(commands.len(), 1);
+        });
+        assert!(matches!(rollback, RejectedControlRollback::Completed(())));
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[test]

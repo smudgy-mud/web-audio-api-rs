@@ -940,13 +940,14 @@ impl ConcreteBaseAudioContext {
         let events = self
             .injected_events()
             .ok_or(InjectedOscillatorConstructionError::ProtocolViolation)?;
-        constructor.try_begin_oscillator_with_lifetime(events, initial_type, None)
+        constructor.try_begin_oscillator_with_reservations(events, initial_type, None, None)
     }
 
-    pub(crate) fn try_begin_injected_oscillator_with_lifetime(
+    pub(crate) fn try_begin_injected_oscillator_with_reservations(
         &self,
         initial_type: crate::node::OscillatorType,
         lifetime: Option<super::AudioNodeLifetimeReservation>,
+        control: Option<super::AudioControlBatchReservation>,
     ) -> Result<InjectedOscillatorConstruction, InjectedOscillatorConstructionError> {
         let constructor = self
             .injected_node_constructor()
@@ -954,7 +955,7 @@ impl ConcreteBaseAudioContext {
         let events = self
             .injected_events()
             .ok_or(InjectedOscillatorConstructionError::ProtocolViolation)?;
-        constructor.try_begin_oscillator_with_lifetime(events, initial_type, lifetime)
+        constructor.try_begin_oscillator_with_reservations(events, initial_type, lifetime, control)
     }
 
     pub(crate) fn fail_closed_injected_protocol(&self) {
