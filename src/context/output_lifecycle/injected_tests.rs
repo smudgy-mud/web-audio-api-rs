@@ -1605,7 +1605,14 @@ fn endpoint_suspend_error_is_uncertain_and_never_reenters_shutdown() {
         OutputShutdownIssueKind::EndpointStateTransitionFailed
     );
     assert!(!control.shutdown_called.load(Ordering::Acquire));
-    assert_eq!(base.state(), AudioContextState::Suspended);
+    // Suspend authoritatively stored Suspended before the endpoint rejected its native method.
+    // The forgotten but still-live callback may subsequently consume the fail-closed exact Close
+    // and absorbingly store Closed without minting endpoint/whole-graph proof. Running is invalid;
+    // the Unconfirmed outcome and absence of endpoint shutdown above remain authoritative.
+    assert!(matches!(
+        base.state(),
+        AudioContextState::Suspended | AudioContextState::Closed
+    ));
 }
 
 #[test]
