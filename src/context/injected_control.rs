@@ -1527,6 +1527,25 @@ impl InjectedControlProducer {
         Ok(InjectedAudioParamValueReservation(reservation))
     }
 
+    pub(crate) fn try_begin_audio_param_value_with_host_reservation(
+        &self,
+        host_reservation: AudioControlBatchReservation,
+    ) -> Result<InjectedAudioParamValueReservation, InjectedControlError> {
+        let reservation = self.try_begin_operation_with_host_reservation(1, host_reservation)?;
+        #[cfg(test)]
+        if let Some((entered, release)) = self
+            .inner
+            .audio_param_reservation_hook
+            .lock()
+            .unwrap()
+            .take()
+        {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+        Ok(InjectedAudioParamValueReservation(reservation))
+    }
+
     pub(crate) fn try_begin_oscillator_command(
         &self,
     ) -> Result<InjectedOscillatorCommandReservation, InjectedControlError> {

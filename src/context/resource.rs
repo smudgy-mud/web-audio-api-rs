@@ -100,6 +100,46 @@ impl Drop for AudioControlBatchReservation {
     }
 }
 
+/// A one-shot host callback that reserves accounting for the exact size of a control batch.
+///
+/// Some hosted operations, notably broad `AudioNode::disconnect` calls, cannot know their
+/// command count until the exact connection registry has been serialized and inspected. This
+/// provider lets an embedder reserve that count at the transaction boundary without maintaining
+/// a second, race-prone graph mirror. It is invoked only when the operation will submit a
+/// non-empty batch; duplicate connects and permitted no-match disconnects drop it unused.
+///
+/// Returning `None` rejects the operation before transport reservation or host-graph mutation.
+/// The callback runs on the calling control thread, may be invoked at most once, and must not
+/// block. A callback panic is treated as a fail-closed hosted transaction failure.
+pub struct AudioControlBatchReservationProvider {
+    provider: Box<dyn FnOnce(usize) -> Option<AudioControlBatchReservation> + Send + 'static>,
+}
+
+impl AudioControlBatchReservationProvider {
+    /// Wraps a one-shot reservation callback.
+    pub fn new<F>(provider: F) -> Self
+    where
+        F: FnOnce(usize) -> Option<AudioControlBatchReservation> + Send + 'static,
+    {
+        Self {
+            provider: Box::new(provider),
+        }
+    }
+
+    pub(crate) fn reserve(self, command_count: usize) -> Option<AudioControlBatchReservation> {
+        debug_assert!(command_count != 0);
+        (self.provider)(command_count)
+    }
+}
+
+impl fmt::Debug for AudioControlBatchReservationProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AudioControlBatchReservationProvider")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Shared only by the fixed set of lifetime cleanups created in one compound transaction.
 /// Keeping the payload behind a mutex permits a merely `Send` host guard to be retained by the
 /// `Arc` while cleanup records may move between lifecycle threads.
