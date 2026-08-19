@@ -1,6 +1,6 @@
 //! Deterministic tests for the permanent injected destination/listener transaction.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::{panic, panic::AssertUnwindSafe};
 
@@ -21,8 +21,9 @@ use super::injected_node_lifetime::{
     MagicInitializedInjectedOutputRenderer,
 };
 use super::{
-    AudioContextRegistration, AudioContextState, AudioNodeId, BaseAudioContext,
-    ConcreteBaseAudioContext, InjectedConnectionEndpointKind, InjectedContextAdmissionGate,
+    AudioContextRegistration, AudioContextState, AudioControlBatchReservation, AudioNodeId,
+    BaseAudioContext, ConcreteBaseAudioContext, InjectedConnectionEndpointKind,
+    InjectedContextAdmissionGate,
 };
 use crate::events::{injected_event_dispatch_setup, EventDispatch, EventLoop, EventLoopExit};
 use crate::message::{ControlBatchApplied, ControlBatchSender, ControlMessage};
@@ -204,6 +205,39 @@ fn suspended_magic_envelope_is_flushed_and_applied_before_callback_publication()
     assert_eq!(initialized.base().state(), AudioContextState::Suspended);
     assert!(initialized.base().applied_control_batch_sequence() >= 1);
     retire(initialized, true);
+}
+
+#[test]
+fn magic_host_control_reservation_follows_the_exact_prepublication_batch() {
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    let harness = harness(false);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let bootstrap = ConcreteBaseAudioContext::try_prepare_exact_injected_base(
+        harness.renderer,
+        harness.constructor,
+        harness.binding,
+    )
+    .ok()
+    .unwrap();
+    let initialized = bootstrap
+        .try_build_with_control_reservation(Some(AudioControlBatchReservation::new(DropProbe(
+            Arc::clone(&dropped),
+        ))))
+        .ok()
+        .unwrap();
+
+    // Prepublication application consumes the exact batch on this control thread. Its attached
+    // host accounting is released only by that batch reclamation, not by builder ownership.
+    assert!(dropped.load(Ordering::Acquire));
+    assert!(initialized.base().applied_control_batch_sequence() >= 1);
+    retire(initialized, false);
 }
 
 #[test]
@@ -458,6 +492,14 @@ fn untouched_not_accepted_batch_restores_all_eleven_exact_ids_before_admission_r
 }
 
 fn run_blocked_not_accepted_destructor(panic_after_release: bool) {
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     let harness = harness(false);
     let allocator = harness.allocator.clone();
     let gate = harness.constructor.admission_gate();
@@ -478,8 +520,12 @@ fn run_blocked_not_accepted_destructor(panic_after_release: bool) {
     )
     .ok()
     .unwrap();
+    let host_reservation_dropped = Arc::new(AtomicBool::new(false));
+    let worker_drop_probe = Arc::clone(&host_reservation_dropped);
     let worker = std::thread::spawn(move || {
-        let failure = match bootstrap.try_build() {
+        let failure = match bootstrap.try_build_with_control_reservation(Some(
+            AudioControlBatchReservation::new(DropProbe(worker_drop_probe)),
+        )) {
             Err(failure) => failure,
             Ok(_) => panic!("forced NotAccepted magic batch unexpectedly succeeded"),
         };
@@ -498,9 +544,11 @@ fn run_blocked_not_accepted_destructor(panic_after_release: bool) {
     assert!(capacity_worker.is_none());
     assert_eq!(drain.snapshot().graph_controls, 1);
     assert!(!worker.is_finished());
+    assert!(!host_reservation_dropped.load(Ordering::Acquire));
 
     release_send.send(()).unwrap();
     let (error, terminal) = worker.join().unwrap();
+    assert!(host_reservation_dropped.load(Ordering::Acquire));
     assert!(terminal);
     assert!(drain.wait().is_drained());
     if panic_after_release {
