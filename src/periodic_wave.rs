@@ -1,9 +1,13 @@
 //! PeriodicWave interface
 
 use std::f32::consts::PI;
-use std::sync::Arc;
+use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::{Arc, Mutex};
 
-use crate::context::BaseAudioContext;
+use crate::context::{
+    BaseAudioContext, InjectedControlIdentity, InjectedNodeConstructor, InjectedPeriodicWaveContext,
+};
 
 /// Options for constructing a [`PeriodicWave`]
 #[derive(Debug, Default, Clone)]
@@ -67,13 +71,91 @@ pub struct PeriodicWaveOptions {
 ///
 /// - `cargo run --release --example oscillators`
 ///
-// Basically a wrapper around Arc<Vec<f32>>, so `PeriodicWave`s are cheap to clone
-#[derive(Debug, Clone, Default)]
-pub struct PeriodicWave {
-    wavetable: Arc<Vec<f32>>,
+/// Opaque host accounting retained by every native clone of one periodic-wave table.
+///
+/// The wrapped guard must have a nonblocking destructor. A destructor panic is contained so it
+/// cannot unwind through exact command rollback or the renderer's off-real-time GC worker.
+pub struct PeriodicWaveStorageLease {
+    value: Option<Box<dyn Send + 'static>>,
 }
 
+impl PeriodicWaveStorageLease {
+    /// Wraps host accounting for the fixed native wavetable allocation.
+    pub fn new<T>(value: T) -> Self
+    where
+        T: Send + 'static,
+    {
+        Self {
+            value: Some(Box::new(value)),
+        }
+    }
+}
+
+impl fmt::Debug for PeriodicWaveStorageLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PeriodicWaveStorageLease")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PeriodicWaveStorageLease {
+    fn drop(&mut self) {
+        let Some(value) = self.value.take() else {
+            return;
+        };
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(value))) {
+            std::mem::forget(payload);
+        }
+    }
+}
+
+struct PeriodicWaveStorage {
+    wavetable: Vec<f32>,
+    // Mutex makes a merely Send host lease safe to share with cheap native clones. The engine
+    // never locks it; it exists solely to carry destruction to the last clone's thread.
+    _lease: Option<Mutex<PeriodicWaveStorageLease>>,
+}
+
+// Basically a wrapper around Arc-backed fixed storage, so `PeriodicWave`s are cheap to clone.
+#[derive(Clone)]
+pub struct PeriodicWave {
+    storage: Arc<PeriodicWaveStorage>,
+    injected_context: Option<InjectedPeriodicWaveContext>,
+}
+
+/// Maximum Fourier component count accepted by this implementation.
+pub const MAX_PERIODIC_WAVE_COMPONENTS: usize = 8192;
+
+/// Number of samples in every generated native periodic-wave table.
 const PERIODIC_WAVE_TABLE_LENGTH: usize = 8192;
+
+/// Persistent sample payload bytes owned by every generated native periodic-wave table.
+pub const PERIODIC_WAVE_TABLE_BYTES: usize =
+    PERIODIC_WAVE_TABLE_LENGTH * std::mem::size_of::<f32>();
+
+impl Default for PeriodicWave {
+    fn default() -> Self {
+        Self {
+            storage: Arc::new(PeriodicWaveStorage {
+                wavetable: Vec::new(),
+                _lease: None,
+            }),
+            injected_context: None,
+        }
+    }
+}
+
+impl fmt::Debug for PeriodicWave {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PeriodicWave")
+            .field("table_length", &self.storage.wavetable.len())
+            .field("exact_context", &self.injected_context.is_some())
+            .field("has_storage_lease", &self.storage._lease.is_some())
+            .finish()
+    }
+}
 
 impl PeriodicWave {
     /// Returns a `PeriodicWave`
@@ -101,7 +183,31 @@ impl PeriodicWave {
     // c.f. https://webaudio.github.io/web-audio-api/#oscillator-coefficients
     // - The question of bandlimited oscillators should also be handled
     // e.g. https://www.dafx12.york.ac.uk/papers/dafx12_submission_69.pdf
-    pub fn new<C: BaseAudioContext>(_context: &C, options: PeriodicWaveOptions) -> Self {
+    pub fn new<C: BaseAudioContext>(context: &C, options: PeriodicWaveOptions) -> Self {
+        Self::new_inner(context, options, None)
+    }
+
+    /// Builds a `PeriodicWave` while attaching opaque accounting to its native wavetable storage.
+    ///
+    /// The caller must acquire the reservation before invoking this constructor. The lease follows
+    /// cheap clones into an exact renderer and is released only after the last clone is destroyed.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same invalid coefficient-length conditions as [`PeriodicWave::new`].
+    pub fn new_with_storage_lease<C: BaseAudioContext>(
+        context: &C,
+        options: PeriodicWaveOptions,
+        lease: PeriodicWaveStorageLease,
+    ) -> Self {
+        Self::new_inner(context, options, Some(lease))
+    }
+
+    fn new_inner<C: BaseAudioContext>(
+        context: &C,
+        options: PeriodicWaveOptions,
+        lease: Option<PeriodicWaveStorageLease>,
+    ) -> Self {
         let PeriodicWaveOptions {
             real,
             imag,
@@ -119,6 +225,10 @@ impl PeriodicWave {
                     r.len() >= 2,
                     "IndexSizeError - `real` and `imag` length should at least 2"
                 );
+                assert!(
+                    r.len() <= MAX_PERIODIC_WAVE_COMPONENTS,
+                    "NotSupportedError - `PeriodicWave` supports at most {MAX_PERIODIC_WAVE_COMPONENTS} components"
+                );
 
                 (r, i)
             }
@@ -126,6 +236,10 @@ impl PeriodicWave {
                 assert!(
                     r.len() >= 2,
                     "IndexSizeError - `real` and `imag` length should at least 2"
+                );
+                assert!(
+                    r.len() <= MAX_PERIODIC_WAVE_COMPONENTS,
+                    "NotSupportedError - `PeriodicWave` supports at most {MAX_PERIODIC_WAVE_COMPONENTS} components"
                 );
 
                 let len = r.len();
@@ -135,6 +249,10 @@ impl PeriodicWave {
                 assert!(
                     i.len() >= 2,
                     "IndexSizeError - `real` and `imag` length should at least 2"
+                );
+                assert!(
+                    i.len() <= MAX_PERIODIC_WAVE_COMPONENTS,
+                    "NotSupportedError - `PeriodicWave` supports at most {MAX_PERIODIC_WAVE_COMPONENTS} components"
                 );
 
                 let len = i.len();
@@ -151,13 +269,40 @@ impl PeriodicWave {
         let wavetable =
             Self::generate_wavetable(&real, &imag, normalize, PERIODIC_WAVE_TABLE_LENGTH);
 
+        let injected_context = context
+            .base()
+            .injected_node_constructor()
+            .map(InjectedNodeConstructor::periodic_wave_context);
         Self {
-            wavetable: Arc::new(wavetable),
+            storage: Arc::new(PeriodicWaveStorage {
+                wavetable,
+                _lease: lease.map(Mutex::new),
+            }),
+            injected_context,
         }
     }
 
     pub(crate) fn as_slice(&self) -> &[f32] {
-        &self.wavetable[..]
+        &self.storage.wavetable
+    }
+
+    pub(crate) fn matches_injected_constructor(
+        &self,
+        constructor: &InjectedNodeConstructor,
+    ) -> bool {
+        self.injected_context
+            .as_ref()
+            .is_some_and(|identity| identity.matches_constructor(constructor))
+    }
+
+    pub(crate) fn matches_injected_control(&self, identity: &InjectedControlIdentity) -> bool {
+        self.injected_context
+            .as_ref()
+            .is_some_and(|context| context.matches_control(identity))
+    }
+
+    pub(crate) fn is_injected_context_bound(&self) -> bool {
+        self.injected_context.is_some()
     }
 
     // cf. https://webaudio.github.io/web-audio-api/#waveform-generation
@@ -213,14 +358,23 @@ impl PeriodicWave {
 mod tests {
     use float_eq::assert_float_eq;
     use std::f32::consts::PI;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-    use super::{PeriodicWave, PeriodicWaveOptions, PERIODIC_WAVE_TABLE_LENGTH};
-    use crate::context::AudioContext;
+    use super::{
+        PeriodicWave, PeriodicWaveOptions, PeriodicWaveStorageLease, MAX_PERIODIC_WAVE_COMPONENTS,
+        PERIODIC_WAVE_TABLE_LENGTH,
+    };
+    use crate::context::OfflineAudioContext;
+
+    fn context() -> OfflineAudioContext {
+        OfflineAudioContext::new(1, 1, 48_000.)
+    }
 
     #[test]
     #[should_panic]
     fn fails_to_build_when_only_real_is_defined_and_too_short() {
-        let context = AudioContext::default();
+        let context = context();
 
         let options = PeriodicWaveOptions {
             real: Some(vec![0.]),
@@ -234,7 +388,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn fails_to_build_when_only_imag_is_defined_and_too_short() {
-        let context = AudioContext::default();
+        let context = context();
 
         let options = PeriodicWaveOptions {
             real: None,
@@ -248,7 +402,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn fails_to_build_when_imag_and_real_not_equal_length() {
-        let context = AudioContext::default();
+        let context = context();
 
         let options = PeriodicWaveOptions {
             real: Some(vec![0., 0., 0.]),
@@ -262,7 +416,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn fails_to_build_when_imag_and_real_too_shorts() {
-        let context = AudioContext::default();
+        let context = context();
 
         let options = PeriodicWaveOptions {
             real: Some(vec![0.]),
@@ -271,6 +425,77 @@ mod tests {
         };
 
         let _periodic_wave = PeriodicWave::new(&context, options);
+    }
+
+    #[test]
+    fn rejects_component_counts_above_the_fixed_native_limit_before_table_generation() {
+        let context = context();
+        for options in [
+            PeriodicWaveOptions {
+                real: Some(vec![0.; MAX_PERIODIC_WAVE_COMPONENTS + 1]),
+                imag: None,
+                disable_normalization: false,
+            },
+            PeriodicWaveOptions {
+                real: None,
+                imag: Some(vec![0.; MAX_PERIODIC_WAVE_COMPONENTS + 1]),
+                disable_normalization: false,
+            },
+            PeriodicWaveOptions {
+                real: Some(vec![0.; MAX_PERIODIC_WAVE_COMPONENTS + 1]),
+                imag: Some(vec![0.; MAX_PERIODIC_WAVE_COMPONENTS + 1]),
+                disable_normalization: false,
+            },
+        ] {
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                PeriodicWave::new(&context, options)
+            }))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn storage_lease_follows_all_native_clones_and_contains_a_hostile_destructor() {
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        struct PanicOnDrop;
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("hostile PeriodicWave storage lease destructor");
+            }
+        }
+
+        let context = context();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let wave = PeriodicWave::new_with_storage_lease(
+            &context,
+            PeriodicWaveOptions {
+                real: Some(vec![0., 0.]),
+                imag: Some(vec![0., 1.]),
+                disable_normalization: false,
+            },
+            PeriodicWaveStorageLease::new(DropProbe(Arc::clone(&drops))),
+        );
+        let clone = wave.clone();
+        drop(wave);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        drop(clone);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+
+        let hostile = PeriodicWave::new_with_storage_lease(
+            &context,
+            PeriodicWaveOptions {
+                real: Some(vec![0., 0.]),
+                imag: Some(vec![0., 1.]),
+                disable_normalization: false,
+            },
+            PeriodicWaveStorageLease::new(PanicOnDrop),
+        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(hostile))).is_ok());
     }
 
     #[test]

@@ -2,13 +2,14 @@
 //!
 //! This is a production capability but not a public context constructor. It binds the exact
 //! control transport, node-id allocator, and lifetime registry. It implements exact two-node Gain
-//! and three-node fixed-wave Oscillator transactions without exposing any of those authorities
-//! separately. ConstantSource reuses the same exact two-node transaction shape as Gain while
-//! retaining a distinct scheduled-source command brand. Custom `PeriodicWave` oscillators remain
-//! outside this private slice.
+//! and three-node Oscillator transactions without exposing any of those authorities separately.
+//! ConstantSource reuses the same exact two-node transaction shape as Gain while retaining a
+//! distinct scheduled-source command brand. Custom `PeriodicWave` storage moves through a closed,
+//! preboxed command and is reclaimed off the render thread.
 
+use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrayvec::ArrayVec;
@@ -44,6 +45,7 @@ use crate::param::{
     InjectedAudioParamValue,
 };
 use crate::render::AudioProcessor;
+use crate::PeriodicWave;
 
 const GAIN_COMMAND_COUNT: usize = 4;
 const GAIN_NODE_COUNT: usize = 2;
@@ -70,6 +72,23 @@ const OSCILLATOR_NODE_COUNT: usize = 3;
 const OSCILLATOR_ID_INDEX: usize = 0;
 const FREQUENCY_ID_INDEX: usize = 1;
 const DETUNE_ID_INDEX: usize = 2;
+
+/// Weak exact-context brand carried by a generated `PeriodicWave` without retaining graph or
+/// lifecycle ownership.
+#[derive(Clone)]
+pub(crate) struct InjectedPeriodicWaveContext {
+    control: InjectedControlIdentity,
+}
+
+impl InjectedPeriodicWaveContext {
+    pub(crate) fn matches_constructor(&self, constructor: &InjectedNodeConstructor) -> bool {
+        constructor.matches_control_identity(&self.control)
+    }
+
+    pub(crate) fn matches_control(&self, control: &InjectedControlIdentity) -> bool {
+        self.control.ptr_eq(control)
+    }
+}
 
 /// Single-use exact ended-key mint carried only by an admitted scheduled-source construction.
 /// Its private fields prevent raw id/lifetime pairing elsewhere in the crate.
@@ -137,12 +156,101 @@ impl InjectedOscillatorRenderMessage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InjectedPeriodicWavePayloadToken(u64);
+
+/// Preboxed owned-wave message routed to one exact oscillator and always moved to off-thread GC.
+pub(crate) struct InjectedOscillatorPeriodicWaveRenderMessage {
+    key: ExactEndedEventKey,
+    token: InjectedPeriodicWavePayloadToken,
+    periodic_wave: Option<PeriodicWave>,
+    applied: bool,
+}
+
+impl std::fmt::Debug for InjectedOscillatorPeriodicWaveRenderMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InjectedOscillatorPeriodicWaveRenderMessage")
+            .field("key", &self.key)
+            .field("token", &self.token)
+            .field("has_periodic_wave", &self.periodic_wave.is_some())
+            .field("applied", &self.applied)
+            .finish()
+    }
+}
+
+impl InjectedOscillatorPeriodicWaveRenderMessage {
+    pub(crate) fn apply_to(
+        &mut self,
+        expected: ExactEndedEventKey,
+        current: &mut Option<PeriodicWave>,
+    ) -> bool {
+        if self.key != expected || self.applied || self.periodic_wave.is_none() {
+            return false;
+        }
+        std::mem::swap(current, &mut self.periodic_wave);
+        self.applied = true;
+        true
+    }
+
+    pub(crate) const fn was_applied(&self) -> bool {
+        self.applied
+    }
+
+    fn matches(&self, key: ExactEndedEventKey, token: InjectedPeriodicWavePayloadToken) -> bool {
+        self.key == key && self.token == token && !self.applied && self.periodic_wave.is_some()
+    }
+}
+
+/// One owned exact PeriodicWave command. Its preboxed node is taken exactly once by the renderer.
+pub(crate) struct InjectedOscillatorPeriodicWaveWireCommand {
+    id: AudioNodeId,
+    message: Option<llq::Node<Box<dyn Any + Send>>>,
+}
+
+impl std::fmt::Debug for InjectedOscillatorPeriodicWaveWireCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InjectedOscillatorPeriodicWaveWireCommand")
+            .field("id", &self.id)
+            .field("has_message", &self.message.is_some())
+            .finish()
+    }
+}
+
+impl InjectedOscillatorPeriodicWaveWireCommand {
+    pub(crate) const fn id(&self) -> AudioNodeId {
+        self.id
+    }
+
+    pub(crate) fn take_render_message(&mut self) -> Option<llq::Node<Box<dyn Any + Send>>> {
+        self.message.take()
+    }
+
+    fn matches(
+        &self,
+        id: AudioNodeId,
+        key: ExactEndedEventKey,
+        token: InjectedPeriodicWavePayloadToken,
+    ) -> bool {
+        self.id == id
+            && self.message.as_ref().is_some_and(|message| {
+                message
+                    .as_ref()
+                    .downcast_ref::<InjectedOscillatorPeriodicWaveRenderMessage>()
+                    .is_some_and(|message| message.matches(key, token))
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InjectedOscillatorMutationError {
     Control(InjectedControlError),
     AcceptedFinalizer(AcceptedBatchFinalizeFailure),
     DuplicateStart,
     StopBeforeStart,
     CustomType,
+    ForeignPeriodicWave,
+    PayloadIdentityExhausted,
     Inactive,
     SerializerPoisoned,
     RejectedPayloadPanicked,
@@ -160,6 +268,7 @@ pub(crate) struct InjectedOscillatorControl {
     serializer: Arc<Mutex<()>>,
     has_start: Arc<AtomicBool>,
     type_: Arc<AtomicU8>,
+    next_periodic_wave_token: AtomicU64,
     #[cfg(test)]
     runtime_behavior: Arc<AtomicU8>,
 }
@@ -198,6 +307,7 @@ impl InjectedOscillatorControl {
             serializer,
             has_start,
             type_,
+            next_periodic_wave_token: _,
             #[cfg(test)]
             runtime_behavior,
         } = self;
@@ -223,6 +333,22 @@ impl InjectedOscillatorControl {
     #[cfg(test)]
     pub(crate) fn panic_next_runtime_finalizer_for_test(&self) {
         self.runtime_behavior.store(2, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_periodic_wave_commit_for_test(&self) {
+        self.runtime_behavior.store(3, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_next_periodic_wave_finalizer_for_test(&self) {
+        self.runtime_behavior.store(4, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_periodic_wave_tokens_for_test(&self) {
+        self.next_periodic_wave_token
+            .store(u64::MAX, Ordering::Release);
     }
 
     pub(crate) fn ended_target(&self) -> InjectedExactEndedEventTarget {
@@ -299,6 +425,21 @@ impl InjectedOscillatorControl {
         )
     }
 
+    pub(crate) fn try_set_periodic_wave(
+        &self,
+        periodic_wave: PeriodicWave,
+    ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
+        self.try_set_periodic_wave_inner(periodic_wave, None)
+    }
+
+    pub(crate) fn try_set_periodic_wave_with_host_reservation(
+        &self,
+        periodic_wave: PeriodicWave,
+        reservation: AudioControlBatchReservation,
+    ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
+        self.try_set_periodic_wave_inner(periodic_wave, Some(reservation))
+    }
+
     fn try_command(
         &self,
         command: InjectedOscillatorCommandKind,
@@ -360,7 +501,10 @@ impl InjectedOscillatorControl {
                     InjectedOscillatorCommandKind::Stop(_) => {}
                 }
                 #[cfg(test)]
-                if runtime_behavior.swap(0, Ordering::AcqRel) == 2 {
+                if runtime_behavior
+                    .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
                     panic!("forced exact oscillator accepted-finalizer panic");
                 }
                 Ok(())
@@ -404,6 +548,151 @@ impl InjectedOscillatorControl {
         };
         result
     }
+
+    fn try_set_periodic_wave_inner(
+        &self,
+        periodic_wave: PeriodicWave,
+        host_reservation: Option<AudioControlBatchReservation>,
+    ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
+        if !periodic_wave.matches_injected_control(&self.control.identity()) {
+            return Err(InjectedOscillatorMutationError::ForeignPeriodicWave);
+        }
+
+        let _serialized = self
+            .serializer
+            .lock()
+            .map_err(|_| InjectedOscillatorMutationError::SerializerPoisoned)?;
+        let admitted = self
+            .control
+            .try_admit_graph_operation()
+            .map_err(InjectedOscillatorMutationError::Control)?;
+        let _admission_fence = admitted.admission_fence();
+        let mut fail_closed = FailClosedOscillatorRollback::new(self.control.clone());
+        if !self.lifetime.is_live_for(self.id) {
+            fail_closed.disarm();
+            return Err(InjectedOscillatorMutationError::Inactive);
+        }
+        let token = match self.next_periodic_wave_token.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| current.checked_add(1),
+        ) {
+            Ok(token) => InjectedPeriodicWavePayloadToken(token),
+            Err(_) => {
+                // Exhaustion is terminal. Destroy the caller-owned wave while the admission fence
+                // still holds Close; its host storage lease may have an adversarial destructor.
+                drop(periodic_wave);
+                drop(fail_closed);
+                return Err(InjectedOscillatorMutationError::PayloadIdentityExhausted);
+            }
+        };
+        let render_message = InjectedOscillatorPeriodicWaveRenderMessage {
+            key: self.ended.render_key(),
+            token,
+            periodic_wave: Some(periodic_wave),
+            applied: false,
+        };
+        let wire = InjectedOscillatorPeriodicWaveWireCommand {
+            id: self.id,
+            message: Some(llq::Node::new(
+                Box::new(render_message) as Box<dyn Any + Send>
+            )),
+        };
+        let commands: Box<[ControlMessage]> =
+            Box::new([ControlMessage::InjectedOscillatorPeriodicWave(wire)]);
+        let reservation = match admitted.reserve_commands(1) {
+            Ok(reservation) => reservation,
+            Err(failure) => {
+                fail_closed.disarm();
+                drop(commands);
+                drop(failure.operation);
+                return Err(InjectedOscillatorMutationError::Control(failure.error));
+            }
+        };
+        let reservation = match host_reservation {
+            Some(host_reservation) => match reservation.with_host_reservation(host_reservation) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    fail_closed.disarm();
+                    drop(commands);
+                    return Err(InjectedOscillatorMutationError::Control(error));
+                }
+            },
+            None => reservation,
+        };
+        let batch = reservation.into_preboxed(commands);
+        #[cfg(test)]
+        if self
+            .runtime_behavior
+            .compare_exchange(3, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.control.fail_closed_protocol();
+        }
+        let accepted = match self.control.try_commit_retained(batch) {
+            Ok(accepted) => accepted,
+            Err(failure) => {
+                let control = self.control.clone();
+                let id = self.id;
+                let key = self.ended.render_key();
+                let (error, rollback) = failure.rollback_with_commands(move |commands| {
+                    let mut rollback_guard = FailClosedOscillatorRollback::new(control);
+                    let exact = commands.len() == 1
+                        && matches!(
+                            &commands[0],
+                            ControlMessage::InjectedOscillatorPeriodicWave(value)
+                                if value.matches(id, key, token)
+                        );
+                    let destructor_panicked = drop_control_commands_individually(commands);
+                    if exact && !destructor_panicked {
+                        rollback_guard.disarm();
+                    }
+                    exact && !destructor_panicked
+                });
+                fail_closed.disarm();
+                return match rollback {
+                    RejectedControlRollback::Completed(true) => {
+                        Err(InjectedOscillatorMutationError::Control(error))
+                    }
+                    RejectedControlRollback::Completed(false) => {
+                        Err(InjectedOscillatorMutationError::ProtocolViolation)
+                    }
+                    RejectedControlRollback::Panicked => {
+                        Err(InjectedOscillatorMutationError::RejectedPayloadPanicked)
+                    }
+                };
+            }
+        };
+        fail_closed.disarm();
+        drop(fail_closed);
+        let mut accepted_guard = FailClosedOscillatorRollback::new(self.control.clone());
+        self.type_
+            .store(OscillatorType::Custom as u8, Ordering::Release);
+        #[cfg(test)]
+        if self
+            .runtime_behavior
+            .compare_exchange(4, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            panic!("forced exact oscillator PeriodicWave finalizer panic");
+        }
+        accepted_guard.disarm();
+        Ok(accepted.complete())
+    }
+}
+
+fn drop_control_commands_individually(commands: Box<[ControlMessage]>) -> bool {
+    let mut panicked = false;
+    for command in commands.into_vec() {
+        panicked |= panic::catch_unwind(AssertUnwindSafe(|| drop(command))).map_or_else(
+            |payload| {
+                std::mem::forget(payload);
+                true
+            },
+            |()| false,
+        );
+    }
+    panicked
 }
 
 fn oscillator_commands_match(
@@ -775,6 +1064,7 @@ pub(crate) enum InjectedOscillatorConstructionError {
     Control(InjectedControlError),
     NodeIds(ProvisionalNodeIdError),
     Registration(NodeRegistrationError),
+    ForeignPeriodicWave,
     EventIdentityExhausted,
     AcceptedFinalizer(AcceptedBatchFinalizeFailure),
     RejectedPayloadPanicked,
@@ -814,7 +1104,33 @@ impl InjectedNodeConstructor {
         lifetime: Option<AudioNodeLifetimeReservation>,
         control: Option<AudioControlBatchReservation>,
     ) -> Result<InjectedOscillatorConstruction, InjectedOscillatorConstructionError> {
-        if initial_type == OscillatorType::Custom || !events.matches_gate(&self.admission_gate()) {
+        if initial_type == OscillatorType::Custom {
+            return Err(InjectedOscillatorConstructionError::ProtocolViolation);
+        }
+        self.try_begin_oscillator_transaction(events, initial_type, lifetime, control)
+    }
+
+    pub(super) fn try_begin_custom_oscillator_with_reservations(
+        &self,
+        events: &crate::events::InjectedControlEventDispatch,
+        periodic_wave: &PeriodicWave,
+        lifetime: Option<AudioNodeLifetimeReservation>,
+        control: Option<AudioControlBatchReservation>,
+    ) -> Result<InjectedOscillatorConstruction, InjectedOscillatorConstructionError> {
+        if !periodic_wave.matches_injected_constructor(self) {
+            return Err(InjectedOscillatorConstructionError::ForeignPeriodicWave);
+        }
+        self.try_begin_oscillator_transaction(events, OscillatorType::Custom, lifetime, control)
+    }
+
+    fn try_begin_oscillator_transaction(
+        &self,
+        events: &crate::events::InjectedControlEventDispatch,
+        initial_type: OscillatorType,
+        lifetime: Option<AudioNodeLifetimeReservation>,
+        control: Option<AudioControlBatchReservation>,
+    ) -> Result<InjectedOscillatorConstruction, InjectedOscillatorConstructionError> {
+        if !events.matches_gate(&self.admission_gate()) {
             return Err(InjectedOscillatorConstructionError::ProtocolViolation);
         }
         let reservation = match control {
@@ -1044,6 +1360,7 @@ impl InjectedOscillatorConstruction {
             serializer: Arc::clone(&self.oscillator_serializer),
             has_start: Arc::clone(&self.has_start),
             type_: Arc::clone(&self.type_),
+            next_periodic_wave_token: AtomicU64::new(1),
             #[cfg(test)]
             runtime_behavior: Arc::new(AtomicU8::new(0)),
         };
@@ -1809,6 +2126,12 @@ impl InjectedNodeConstructor {
 
     pub(crate) fn admission_gate(&self) -> super::InjectedContextAdmissionGate {
         self.control.admission_gate()
+    }
+
+    pub(crate) fn periodic_wave_context(&self) -> InjectedPeriodicWaveContext {
+        InjectedPeriodicWaveContext {
+            control: self.control.identity(),
+        }
     }
 
     pub(crate) fn matches_control_identity(&self, identity: &InjectedControlIdentity) -> bool {

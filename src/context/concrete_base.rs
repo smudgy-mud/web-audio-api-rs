@@ -975,6 +975,29 @@ impl ConcreteBaseAudioContext {
         constructor.try_begin_oscillator_with_reservations(events, initial_type, lifetime, control)
     }
 
+    pub(crate) fn try_begin_injected_custom_oscillator_with_reservations(
+        &self,
+        periodic_wave: &crate::PeriodicWave,
+        lifetime: Option<super::AudioNodeLifetimeReservation>,
+        control: Option<super::AudioControlBatchReservation>,
+    ) -> Result<
+        super::injected_node_construction::InjectedOscillatorConstruction,
+        super::injected_node_construction::InjectedOscillatorConstructionError,
+    > {
+        let constructor = self.injected_node_constructor().ok_or(
+            super::injected_node_construction::InjectedOscillatorConstructionError::ProtocolViolation,
+        )?;
+        let events = self.injected_events().ok_or(
+            super::injected_node_construction::InjectedOscillatorConstructionError::ProtocolViolation,
+        )?;
+        constructor.try_begin_custom_oscillator_with_reservations(
+            events,
+            periodic_wave,
+            lifetime,
+            control,
+        )
+    }
+
     pub(crate) fn try_begin_injected_audio_buffer_source_with_reservations(
         &self,
         lifetime: Option<super::AudioNodeLifetimeReservation>,

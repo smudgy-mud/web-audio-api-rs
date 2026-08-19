@@ -16,7 +16,9 @@ pub(crate) use injected_admission::{
 };
 
 mod injected_control;
-pub(crate) use injected_control::{CommitControlOutcome, InjectedControlRenderInit};
+pub(crate) use injected_control::{
+    CommitControlOutcome, InjectedControlIdentity, InjectedControlRenderInit,
+};
 
 mod injected_connections;
 pub(crate) use injected_connections::{
@@ -46,9 +48,11 @@ pub(crate) use injected_node_construction::{
     InjectedConstantSourceConstruction, InjectedConstantSourceConstructionError,
     InjectedConstantSourceControl, InjectedConstantSourceMutationError,
     InjectedConstantSourcePayload, InjectedConstantSourceRenderMessage,
-    InjectedConstantSourceWireCommand, InjectedGainPayload, InjectedOscillatorCommandKind,
-    InjectedOscillatorControl, InjectedOscillatorMutationError, InjectedOscillatorPayload,
-    InjectedOscillatorRenderMessage, InjectedOscillatorWireCommand,
+    InjectedConstantSourceWireCommand, InjectedGainPayload, InjectedNodeConstructor,
+    InjectedOscillatorCommandKind, InjectedOscillatorConstructionError, InjectedOscillatorControl,
+    InjectedOscillatorMutationError, InjectedOscillatorPayload,
+    InjectedOscillatorPeriodicWaveRenderMessage, InjectedOscillatorPeriodicWaveWireCommand,
+    InjectedOscillatorRenderMessage, InjectedOscillatorWireCommand, InjectedPeriodicWaveContext,
     InjectedScheduledSourceEventMint,
 };
 mod injected_buffer_source;

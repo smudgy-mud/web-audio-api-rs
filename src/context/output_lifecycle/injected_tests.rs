@@ -53,7 +53,10 @@ use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope,
 };
 use crate::stats::AudioStats;
-use crate::{AudioBuffer, AudioBufferStorageLease};
+use crate::{
+    AudioBuffer, AudioBufferStorageLease, PeriodicWave, PeriodicWaveOptions,
+    PeriodicWaveStorageLease,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -597,6 +600,10 @@ struct BlockingPanicDropProcessor {
 
 struct DropProbeProcessor(Arc<AtomicUsize>);
 
+struct WaveHoldingProcessor {
+    _wave: PeriodicWave,
+}
+
 static REJECTED_EVENT_DROPS: AtomicUsize = AtomicUsize::new(0);
 static SEALED_EVENT_FACTORIES: AtomicUsize = AtomicUsize::new(0);
 
@@ -615,6 +622,18 @@ impl Drop for DropProbeProcessor {
 }
 
 impl AudioProcessor for DropProbeProcessor {
+    fn process(
+        &mut self,
+        _inputs: &[AudioRenderQuantum],
+        _outputs: &mut [AudioRenderQuantum],
+        _params: AudioParamValues<'_>,
+        _scope: &AudioWorkletGlobalScope,
+    ) -> bool {
+        false
+    }
+}
+
+impl AudioProcessor for WaveHoldingProcessor {
     fn process(
         &mut self,
         _inputs: &[AudioRenderQuantum],
@@ -789,6 +808,17 @@ fn constant_source_payload_for_test(
         },
         offset_initial_value: offset_raw.set_initial_value_for_injected(1.),
     }
+}
+
+fn exact_periodic_wave(base: &ConcreteBaseAudioContext) -> PeriodicWave {
+    PeriodicWave::new(
+        base,
+        PeriodicWaveOptions {
+            real: Some(vec![0., 0.]),
+            imag: Some(vec![0., 1.]),
+            disable_normalization: false,
+        },
+    )
 }
 
 fn wait_receipt(receipt: OutputShutdownReceipt) -> OutputShutdownOutcome {
@@ -1809,6 +1839,78 @@ fn exact_fixed_oscillators_use_ids_eleven_through_thirteen_render_without_alloca
 }
 
 #[test]
+fn exact_custom_periodic_wave_constructs_atomically_renders_without_allocation_and_reclaims_lease()
+{
+    let fixture = lifecycle_fixture_inner(
+        false,
+        false,
+        32,
+        8,
+        injected_event_dispatch_setup().unwrap(),
+    );
+    let base = fixture.take_exact_base();
+    let destination = base.destination();
+    let storage_drops = Arc::new(AtomicUsize::new(0));
+    let periodic_wave = PeriodicWave::new_with_storage_lease(
+        &base,
+        PeriodicWaveOptions {
+            real: Some(vec![0., 0.]),
+            imag: Some(vec![0., 1.]),
+            disable_normalization: false,
+        },
+        PeriodicWaveStorageLease::new(BufferSourceDropProbe(Arc::clone(&storage_drops))),
+    );
+    let mut oscillator = OscillatorNode::new(
+        &base,
+        OscillatorOptions {
+            type_: OscillatorType::Square,
+            frequency: 330.,
+            periodic_wave: Some(periodic_wave),
+            ..OscillatorOptions::default()
+        },
+    );
+    assert_eq!(oscillator.registration().id(), AudioNodeId(11));
+    assert_eq!(oscillator.frequency().registration().id(), AudioNodeId(12));
+    assert_eq!(oscillator.detune().registration().id(), AudioNodeId(13));
+    assert_eq!(oscillator.type_(), OscillatorType::Custom);
+    oscillator.connect(&destination);
+    oscillator.start_at(0.);
+    oscillator.stop_at(0.01);
+    let completion = oscillator.completion_token();
+
+    let control = PumpControl::new(false, true);
+    control
+        .deny_next_render_allocation
+        .store(true, Ordering::Release);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || control.output_nonzero.load(Ordering::Acquire),
+        "exact custom PeriodicWave did not render nonzero output",
+    );
+    wait_until(
+        || completion.is_complete(),
+        "exact custom PeriodicWave oscillator did not complete",
+    );
+    assert_eq!(storage_drops.load(Ordering::Acquire), 0);
+    drop(oscillator);
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.reclaim_issue().is_none());
+    assert_eq!(storage_drops.load(Ordering::Acquire), 1);
+}
+
+#[test]
 fn exact_constant_source_uses_source_and_offset_ids_renders_without_allocation_and_ends_once() {
     let fixture = lifecycle_fixture_inner(
         false,
@@ -2491,6 +2593,98 @@ fn suspended_exact_oscillator_commands_flush_fifo_through_real_b4c_resume() {
 }
 
 #[test]
+fn suspended_periodic_wave_replacements_flush_fifo_and_reclaim_old_storage_off_rt() {
+    let fixture =
+        lifecycle_fixture_inner(true, false, 16, 8, injected_event_dispatch_setup().unwrap());
+    let base = fixture.take_exact_base();
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let first_drops = Arc::new(AtomicUsize::new(0));
+    let second_drops = Arc::new(AtomicUsize::new(0));
+    let command_drops = Arc::new(AtomicUsize::new(0));
+    let wave = |drops: &Arc<AtomicUsize>, imag: f32| {
+        PeriodicWave::new_with_storage_lease(
+            &base,
+            PeriodicWaveOptions {
+                real: Some(vec![0., 0.]),
+                imag: Some(vec![0., imag]),
+                disable_normalization: false,
+            },
+            PeriodicWaveStorageLease::new(BufferSourceDropProbe(Arc::clone(drops))),
+        )
+    };
+    oscillator.set_periodic_wave_with_control_reservation(
+        wave(&first_drops, 1.),
+        AudioControlBatchReservation::new(BufferSourceDropProbe(Arc::clone(&command_drops))),
+    );
+    oscillator.set_periodic_wave_with_control_reservation(
+        wave(&second_drops, 0.5),
+        AudioControlBatchReservation::new(BufferSourceDropProbe(Arc::clone(&command_drops))),
+    );
+    assert_eq!(oscillator.type_(), OscillatorType::Custom);
+    let submitted_after_waves = base
+        .injected_node_constructor()
+        .unwrap()
+        .last_submitted_batch_sequence();
+    let noop_drops = Arc::new(AtomicUsize::new(0));
+    oscillator.set_type_with_control_reservation(
+        OscillatorType::Triangle,
+        AudioControlBatchReservation::new(BufferSourceDropProbe(Arc::clone(&noop_drops))),
+    );
+    assert_eq!(noop_drops.load(Ordering::Acquire), 1);
+    assert_eq!(
+        base.injected_node_constructor()
+            .unwrap()
+            .last_submitted_batch_sequence(),
+        submitted_after_waves
+    );
+    assert_eq!(first_drops.load(Ordering::Acquire), 0);
+    assert_eq!(second_drops.load(Ordering::Acquire), 0);
+    assert_eq!(command_drops.load(Ordering::Acquire), 0);
+
+    let control = PumpControl::new(false, false);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || control.suspend_count.load(Ordering::Acquire) == 1,
+        "initially suspended endpoint was not natively reconciled",
+    );
+    assert_eq!(first_drops.load(Ordering::Acquire), 0);
+    assert_eq!(second_drops.load(Ordering::Acquire), 0);
+
+    control.release.store(true, Ordering::Release);
+    assert_eq!(
+        wait_state(controller.state_control().resume().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    wait_until(
+        || first_drops.load(Ordering::Acquire) == 1,
+        "first staged PeriodicWave was not reclaimed after the second replaced it",
+    );
+    wait_until(
+        || command_drops.load(Ordering::Acquire) == 2,
+        "PeriodicWave command reservations did not follow staged batches through GC",
+    );
+    assert_eq!(second_drops.load(Ordering::Acquire), 0);
+
+    drop(oscillator);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+    assert_eq!(second_drops.load(Ordering::Acquire), 1);
+}
+
+#[test]
 fn suspended_exact_constant_source_commands_flush_fifo_through_real_b4c_resume() {
     let fixture =
         lifecycle_fixture_inner(true, false, 16, 8, injected_event_dispatch_setup().unwrap());
@@ -2685,7 +2879,7 @@ fn never_started_and_future_started_sources_do_not_synthesize_ended_during_close
 }
 
 #[test]
-fn exact_oscillator_validation_precedes_reservation_and_deferred_custom_paths_are_inert() {
+fn exact_oscillator_validation_precedes_reservation_and_foreign_custom_paths_are_inert() {
     let fixture =
         lifecycle_fixture_inner(false, false, 2, 8, injected_event_dispatch_setup().unwrap());
     let base = fixture.take_exact_base();
@@ -2725,6 +2919,30 @@ fn exact_oscillator_validation_precedes_reservation_and_deferred_custom_paths_ar
         assert_eq!(probe.id(2), AudioNodeId(13));
         drop(probe);
     }
+
+    let foreign_fixture =
+        lifecycle_fixture_inner(false, false, 2, 8, injected_event_dispatch_setup().unwrap());
+    let foreign_base = foreign_fixture.take_exact_base();
+    let foreign_wave = exact_periodic_wave(&foreign_base);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        OscillatorNode::new(
+            &base,
+            OscillatorOptions {
+                periodic_wave: Some(foreign_wave),
+                ..OscillatorOptions::default()
+            },
+        )
+    }))
+    .is_err());
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        initial_sequence
+    );
+    let probe = fixture.allocator.try_reserve(3).unwrap();
+    assert_eq!(probe.id(0), AudioNodeId(11));
+    assert_eq!(probe.id(1), AudioNodeId(12));
+    assert_eq!(probe.id(2), AudioNodeId(13));
+    drop(probe);
 
     let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
     let construction_sequence = constructor.last_submitted_batch_sequence();
@@ -2768,6 +2986,21 @@ fn exact_oscillator_validation_precedes_reservation_and_deferred_custom_paths_ar
     };
     assert_eq!(
         confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+
+    let foreign_control = PumpControl::new(false, true);
+    let foreign_lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(foreign_control)),
+        foreign_fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(foreign_controller) = foreign_lifecycle else {
+        panic!("foreign pumping endpoint must start running")
+    };
+    assert_eq!(
+        confirmed(wait_receipt(foreign_controller.shutdown_gracefully())).mode(),
         OutputShutdownMode::Graceful
     );
 }
@@ -2877,6 +3110,61 @@ fn exact_oscillator_not_accepted_parser_restores_all_three_ids_from_the_seven_re
 
     // A normal NotAccepted rollback accepts only the exact seven-record construction shape and
     // restores each reclaim token before returning. Magic permanently owns 0..=10.
+    let restored = fixture.allocator.try_reserve(3).unwrap();
+    assert_eq!(restored.id(0), AudioNodeId(11));
+    assert_eq!(restored.id(1), AudioNodeId(12));
+    assert_eq!(restored.id(2), AudioNodeId(13));
+    drop(restored);
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
+fn exact_custom_oscillator_not_accepted_restores_ids_before_periodic_wave_storage_drop() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let observed_graph_controls = Arc::new(AtomicUsize::new(0));
+    let wave = PeriodicWave::new_with_storage_lease(
+        &base,
+        PeriodicWaveOptions {
+            real: Some(vec![0., 0.]),
+            imag: Some(vec![0., 1.]),
+            disable_normalization: false,
+        },
+        PeriodicWaveStorageLease::new(BufferSourceAdmissionDropProbe {
+            gate: fixture.gate.clone(),
+            observed_graph_controls: Arc::clone(&observed_graph_controls),
+        }),
+    );
+    let transaction = base
+        .try_begin_injected_custom_oscillator_with_reservations(&wave, None, None)
+        .unwrap();
+    base.fail_closed_injected_protocol();
+    assert_eq!(
+        transaction
+            .commit(oscillator_payload_for_test(Box::new(
+                WaveHoldingProcessor { _wave: wave },
+            )))
+            .err(),
+        Some(InjectedOscillatorConstructionError::Control(
+            crate::context::injected_control::InjectedControlError::ProtocolViolation
+        ))
+    );
+    assert!(observed_graph_controls.load(Ordering::Acquire) > 0);
+
     let restored = fixture.allocator.try_reserve(3).unwrap();
     assert_eq!(restored.id(0), AudioNodeId(11));
     assert_eq!(restored.id(1), AudioNodeId(12));
@@ -3241,6 +3529,69 @@ fn exact_oscillator_runtime_saturation_precedes_no_host_mutation_and_recovers() 
 }
 
 #[test]
+fn exact_periodic_wave_runtime_saturation_recovers_and_custom_type_is_absorbing() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || base.applied_control_batch_sequence() >= construction_sequence,
+        "oscillator construction did not apply before PeriodicWave saturation",
+    );
+    wait_until(
+        || constructor.connection_transport_accounting_for_test() == (0, 0, 0, 0),
+        "construction credits did not retire before PeriodicWave saturation",
+    );
+
+    let held = constructor
+        .control()
+        .try_begin_operation(crate::message::CONTROL_COMMANDS_PER_CALLBACK)
+        .unwrap();
+    let submitted_before = constructor.last_submitted_batch_sequence();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_periodic_wave(exact_periodic_wave(&base));
+    }))
+    .is_err());
+    assert_eq!(oscillator.type_(), OscillatorType::Sine);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        submitted_before
+    );
+    drop(held);
+
+    oscillator.set_periodic_wave(exact_periodic_wave(&base));
+    assert_eq!(oscillator.type_(), OscillatorType::Custom);
+    let custom_sequence = constructor.last_submitted_batch_sequence();
+    oscillator.set_type(OscillatorType::Square);
+    assert_eq!(oscillator.type_(), OscillatorType::Custom);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        custom_sequence,
+        "set_type after a custom wave must remain a zero-command no-op"
+    );
+    wait_until(
+        || base.applied_control_batch_sequence() >= custom_sequence,
+        "accepted PeriodicWave command did not apply",
+    );
+    drop(oscillator);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
 fn exact_oscillator_runtime_not_accepted_rolls_back_without_host_mirror_mutation() {
     let fixture = lifecycle_fixture_with_capacity(false, false, 8);
     let base = fixture.take_exact_base();
@@ -3274,6 +3625,66 @@ fn exact_oscillator_runtime_not_accepted_rolls_back_without_host_mirror_mutation
     }))
     .is_err());
     assert_eq!(oscillator.type_(), OscillatorType::Sine);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        submitted_before
+    );
+    assert_eq!(
+        constructor.connection_transport_accounting_for_test(),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
+fn exact_periodic_wave_not_accepted_rolls_back_storage_and_host_type_under_admission() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || base.applied_control_batch_sequence() >= construction_sequence,
+        "oscillator construction did not apply before PeriodicWave rejection",
+    );
+    wait_until(
+        || constructor.connection_transport_accounting_for_test() == (0, 0, 0, 0),
+        "construction credits did not retire before PeriodicWave rejection",
+    );
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let wave = PeriodicWave::new_with_storage_lease(
+        &base,
+        PeriodicWaveOptions {
+            real: Some(vec![0., 0.]),
+            imag: Some(vec![0., 1.]),
+            disable_normalization: false,
+        },
+        PeriodicWaveStorageLease::new(BufferSourceDropProbe(Arc::clone(&drops))),
+    );
+    let submitted_before = constructor.last_submitted_batch_sequence();
+    oscillator
+        .injected_control_for_test()
+        .fail_next_periodic_wave_commit_for_test();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_periodic_wave(wave);
+    }))
+    .is_err());
+    assert_eq!(oscillator.type_(), OscillatorType::Sine);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
     assert_eq!(
         constructor.last_submitted_batch_sequence(),
         submitted_before
@@ -3325,6 +3736,107 @@ fn accepted_oscillator_runtime_finalizer_panic_keeps_command_queue_owned_and_app
 }
 
 #[test]
+fn accepted_periodic_wave_finalizer_panic_keeps_storage_queue_owned_and_applied() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let drops = Arc::new(AtomicUsize::new(0));
+    let wave = PeriodicWave::new_with_storage_lease(
+        &base,
+        PeriodicWaveOptions {
+            real: Some(vec![0., 0.]),
+            imag: Some(vec![0., 1.]),
+            disable_normalization: false,
+        },
+        PeriodicWaveStorageLease::new(BufferSourceDropProbe(Arc::clone(&drops))),
+    );
+    oscillator
+        .injected_control_for_test()
+        .panic_next_periodic_wave_finalizer_for_test();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_periodic_wave(wave);
+    }))
+    .is_err());
+    assert_eq!(oscillator.type_(), OscillatorType::Custom);
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+    let accepted_sequence = constructor.last_submitted_batch_sequence();
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || base.applied_control_batch_sequence() >= accepted_sequence,
+        "accepted PeriodicWave payload was suppressed after finalizer panic",
+    );
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+    drop(oscillator);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn periodic_wave_token_exhaustion_is_terminal_and_destroys_storage_under_admission() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let drops = Arc::new(AtomicUsize::new(0));
+    let wave = PeriodicWave::new_with_storage_lease(
+        &base,
+        PeriodicWaveOptions {
+            real: Some(vec![0., 0.]),
+            imag: Some(vec![0., 1.]),
+            disable_normalization: false,
+        },
+        PeriodicWaveStorageLease::new(BufferSourceDropProbe(Arc::clone(&drops))),
+    );
+    let submitted_before = constructor.last_submitted_batch_sequence();
+    oscillator
+        .injected_control_for_test()
+        .exhaust_periodic_wave_tokens_for_test();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_periodic_wave(wave);
+    }))
+    .is_err());
+    assert_eq!(oscillator.type_(), OscillatorType::Sine);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        submitted_before
+    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_type(OscillatorType::Square);
+    }))
+    .is_err());
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
 fn exact_oscillator_runtime_wrong_processor_latches_before_failed_watermark() {
     let fixture = lifecycle_fixture_with_capacity(false, false, 8);
     let base = fixture.take_exact_base();
@@ -3355,6 +3867,59 @@ fn exact_oscillator_runtime_wrong_processor_latches_before_failed_watermark() {
     assert!(construction_sequence < failed_sequence);
     assert!(constructor.control().render_protocol_failed_for_test());
     drop(constructed);
+}
+
+#[test]
+fn exact_periodic_wave_wrong_processor_fails_watermark_and_reclaims_storage_off_rt() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let transaction = base
+        .try_begin_injected_oscillator(OscillatorType::Sine)
+        .unwrap();
+    let constructed = transaction
+        .commit(oscillator_payload_for_test(Box::new(SilentProcessor)))
+        .unwrap();
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+    let storage_drops = Arc::new(AtomicUsize::new(0));
+    let dropped_off_render = Arc::new(AtomicBool::new(false));
+    let control = PumpControl::new(false, true);
+    let wave = PeriodicWave::new_with_storage_lease(
+        &base,
+        PeriodicWaveOptions {
+            real: Some(vec![0., 0.]),
+            imag: Some(vec![0., 1.]),
+            disable_normalization: false,
+        },
+        PeriodicWaveStorageLease::new(BufferSourceOffRenderDropProbe {
+            control: Arc::clone(&control),
+            drops: Arc::clone(&storage_drops),
+            dropped_off_render: Arc::clone(&dropped_off_render),
+        }),
+    );
+    constructed
+        .oscillator_control
+        .try_set_periodic_wave(wave)
+        .unwrap();
+    let failed_sequence = constructor.last_submitted_batch_sequence();
+
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Silent);
+    assert_eq!(base.applied_control_batch_sequence(), construction_sequence);
+    assert!(construction_sequence < failed_sequence);
+    assert!(constructor.control().render_protocol_failed_for_test());
+    drop(constructed);
+    assert_eq!(storage_drops.load(Ordering::Acquire), 1);
+    assert!(dropped_off_render.load(Ordering::Acquire));
 }
 
 #[test]
