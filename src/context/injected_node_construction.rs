@@ -54,14 +54,14 @@ const OSCILLATOR_ID_INDEX: usize = 0;
 const FREQUENCY_ID_INDEX: usize = 1;
 const DETUNE_ID_INDEX: usize = 2;
 
-/// Single-use exact ended-key mint carried only by an admitted oscillator construction.
+/// Single-use exact ended-key mint carried only by an admitted scheduled-source construction.
 /// Its private fields prevent raw id/lifetime pairing elsewhere in the crate.
-pub(crate) struct InjectedOscillatorEventMint {
+pub(crate) struct InjectedScheduledSourceEventMint {
     id: AudioNodeId,
     lifetime: InjectedNodeRegistrationIdentity,
 }
 
-impl InjectedOscillatorEventMint {
+impl InjectedScheduledSourceEventMint {
     pub(crate) fn into_parts(self) -> (AudioNodeId, InjectedNodeRegistrationIdentity) {
         (self.id, self.lifetime)
     }
@@ -147,6 +147,19 @@ pub(crate) struct InjectedOscillatorControl {
     runtime_behavior: Arc<AtomicU8>,
 }
 
+/// Common accepted scheduled-source authorities, exposed only to sibling exact node
+/// implementations. Moving these parts consumes the oscillator command brand, so another source
+/// can never retain or manufacture both runtime capabilities for one registration.
+pub(super) struct InjectedScheduledSourceControlParts {
+    pub(super) control: InjectedControlProducer,
+    pub(super) node_ids: InjectedNodeIdIdentity,
+    pub(super) id: AudioNodeId,
+    pub(super) lifetime: InjectedNodeRegistrationIdentity,
+    pub(super) ended: InjectedExactEndedEventTarget,
+    pub(super) serializer: Arc<Mutex<()>>,
+    pub(super) has_start: Arc<AtomicBool>,
+}
+
 impl std::fmt::Debug for InjectedOscillatorControl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InjectedOscillatorControl")
@@ -158,6 +171,33 @@ impl std::fmt::Debug for InjectedOscillatorControl {
 }
 
 impl InjectedOscillatorControl {
+    pub(super) fn into_scheduled_source_parts(self) -> InjectedScheduledSourceControlParts {
+        let Self {
+            control,
+            node_ids,
+            id,
+            lifetime,
+            ended,
+            serializer,
+            has_start,
+            type_,
+            #[cfg(test)]
+            runtime_behavior,
+        } = self;
+        drop(type_);
+        #[cfg(test)]
+        drop(runtime_behavior);
+        InjectedScheduledSourceControlParts {
+            control,
+            node_ids,
+            id,
+            lifetime,
+            ended,
+            serializer,
+            has_start,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_runtime_commit_for_test(&self) {
         self.runtime_behavior.store(1, Ordering::Release);
@@ -510,11 +550,12 @@ impl InjectedNodeConstructor {
             1,
             lifetime,
         )?;
-        let mint = InjectedOscillatorEventMint {
+        let mint = InjectedScheduledSourceEventMint {
             id: oscillator_id,
             lifetime: oscillator.identity(),
         };
-        let Some(ended) = InjectedExactEndedEventTarget::from_oscillator_mint(events, mint) else {
+        let Some(ended) = InjectedExactEndedEventTarget::from_scheduled_source_mint(events, mint)
+        else {
             self.fail_closed_protocol();
             ids.retain_unavailable();
             return Err(InjectedOscillatorConstructionError::EventIdentityExhausted);

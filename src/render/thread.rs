@@ -870,6 +870,53 @@ impl RenderThread {
                     self.fail_injected_render_protocol();
                 }
             }
+            InjectedAudioBufferSourceScalar(value) => {
+                let mut message = value.into_render_message();
+                let routed = self
+                    .graph
+                    .as_mut()
+                    .is_some_and(|graph| graph.try_route_message(message.id(), &mut message));
+                if !routed || !message.was_applied() {
+                    self.fail_injected_render_protocol();
+                }
+            }
+            InjectedAudioBufferSourceBuffer(mut value) => {
+                let id = value.id();
+                let Some(mut message) = value.take_render_message() else {
+                    self.fail_injected_render_protocol();
+                };
+                // A corrupt/wrong processor may panic while consuming the authenticated payload.
+                // Contain that unwind until the preboxed message has moved to GC; otherwise its
+                // AudioBuffer storage lease could be destroyed on the render callback thread.
+                let routed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.graph
+                        .as_mut()
+                        .is_some_and(|graph| graph.try_route_message(id, message.as_mut()))
+                }));
+                let applied = message
+                    .as_ref()
+                    .downcast_ref::<crate::context::InjectedAudioBufferSourceBufferRenderMessage>()
+                    .is_some_and(
+                        crate::context::InjectedAudioBufferSourceBufferRenderMessage::was_applied,
+                    );
+                if let Some(gc) = self.garbage_collector.as_mut() {
+                    gc.push(message);
+                } else {
+                    // Exact output construction always installs GC. If that invariant is broken,
+                    // leak fail-closed rather than destroying an AudioBuffer lease on the RT.
+                    std::mem::forget(message);
+                }
+                match routed {
+                    Ok(true) if applied => {}
+                    Ok(_) => self.fail_injected_render_protocol(),
+                    Err(payload) => {
+                        // The payload itself may have a hostile destructor. The fixed protocol
+                        // panic below is the only unwind allowed to leave this boundary.
+                        std::mem::forget(payload);
+                        self.fail_injected_render_protocol();
+                    }
+                }
+            }
             #[cfg(feature = "diagnostics")]
             RunDiagnostics { backend } => {
                 let diagnostics = AudioContextDiagnostics {

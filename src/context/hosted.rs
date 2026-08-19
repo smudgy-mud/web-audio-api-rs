@@ -399,14 +399,13 @@ fn block_on_receipt<F: Future>(future: F) -> F::Output {
 
 /// Builder for an [`AudioContext`] driven by a caller-supplied logical output factory.
 ///
-/// This exact hosted path currently supports the destination/listener magic graph, Gain and
-/// fixed-wave Oscillator nodes, scalar AudioParam mutation, explicit connections, and typed
-/// suspend/resume/close receipts. Custom PeriodicWave data, additional source families, and the
-/// process-wide system-output adapter are deliberately outside this slice. In particular,
-/// disconnected scheduled-source rooting and lossy-ended-event reconciliation remain the
-/// responsibility of the later Deno scheduled-source/event-hub integration. A dropped or
-/// saturated exact ended event is generation-safe but its callback may remain retained until
-/// confirmed whole-context event retirement.
+/// This exact hosted path supports the destination/listener magic graph, Gain, fixed-wave
+/// Oscillator, and AudioBufferSource nodes, scalar AudioParam mutation, explicit connections,
+/// typed suspend/resume/close receipts, and caller-supplied or system output factories. Custom
+/// PeriodicWave data and additional node families remain outside this slice. Disconnected
+/// scheduled-source rooting and lossy-ended-event reconciliation remain the embedder's
+/// responsibility. A dropped or saturated exact ended event is generation-safe but its callback
+/// may remain retained until confirmed whole-context event retirement.
 pub struct AudioContextBuilder {
     output: Arc<dyn AudioOutputFactory>,
     options: AudioContextOptions,

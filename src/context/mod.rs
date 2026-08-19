@@ -43,8 +43,17 @@ pub(crate) use injected_node_lifetime::{
 mod injected_node_construction;
 pub(crate) use injected_node_construction::{
     InjectedAudioParamMutation, InjectedGainPayload, InjectedOscillatorCommandKind,
-    InjectedOscillatorControl, InjectedOscillatorEventMint, InjectedOscillatorMutationError,
-    InjectedOscillatorPayload, InjectedOscillatorRenderMessage, InjectedOscillatorWireCommand,
+    InjectedOscillatorControl, InjectedOscillatorMutationError, InjectedOscillatorPayload,
+    InjectedOscillatorRenderMessage, InjectedOscillatorWireCommand,
+    InjectedScheduledSourceEventMint,
+};
+mod injected_buffer_source;
+pub(crate) use injected_buffer_source::{
+    InjectedAudioBufferSourceBufferRenderMessage, InjectedAudioBufferSourceBufferWireCommand,
+    InjectedAudioBufferSourceConstruction, InjectedAudioBufferSourceConstructionError,
+    InjectedAudioBufferSourceControl, InjectedAudioBufferSourceMutationError,
+    InjectedAudioBufferSourcePayload, InjectedAudioBufferSourceScalarCommand,
+    InjectedAudioBufferSourceScalarRenderMessage, InjectedAudioBufferSourceScalarWireCommand,
 };
 #[cfg(test)]
 mod injected_node_construction_tests;
@@ -172,7 +181,7 @@ pub struct AudioContextRegistration {
     /// Exact public-edge endpoint brand. Permanent magic registrations carry this without an
     /// ordinary lifetime slot; ordinary Gain registrations carry both capabilities.
     injected_connection: Option<injected_connections::InjectedConnectionEndpoint>,
-    /// Exact scheduled-source event key, present only after accepted oscillator publication.
+    /// Exact scheduled-source event key, present only after accepted source publication.
     injected_ended: Option<crate::events::InjectedExactEndedEventTarget>,
     /// the audio context in which nodes and connections lives
     context: ConcreteBaseAudioContext,
@@ -293,7 +302,7 @@ impl AudioContextRegistration {
         self.injected_connection.as_ref()
     }
 
-    pub(crate) fn from_injected_oscillator(
+    pub(crate) fn from_injected_scheduled_source(
         id: AudioNodeId,
         context: ConcreteBaseAudioContext,
         lifetime: injected_node_lifetime::InjectedNodeRegistration,
@@ -320,7 +329,9 @@ impl AudioContextRegistration {
             if let Some(constructor) = context.injected_node_constructor() {
                 constructor.fail_closed_protocol();
             }
-            panic!("exact oscillator capabilities do not match their context/live registration");
+            panic!(
+                "exact scheduled-source capabilities do not match their context/live registration"
+            );
         }
         Self {
             injected_lifetime: Some(lifetime),

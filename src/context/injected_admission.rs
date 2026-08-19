@@ -357,6 +357,11 @@ pub(crate) struct InjectedContextAdmissionGate {
 }
 
 impl InjectedContextAdmissionGate {
+    #[cfg(test)]
+    pub(crate) fn snapshot_for_test(&self) -> AdmissionSnapshot {
+        self.inner.snapshot()
+    }
+
     pub(crate) fn new() -> Self {
         let (drain_wake, drain_receiver) = crossbeam_channel::bounded(1);
         Self {
