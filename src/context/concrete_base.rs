@@ -1,5 +1,6 @@
 //! The `ConcreteBaseAudioContext` type
 
+use crate::context::injected_node_construction::InjectedNodeConstructor;
 use crate::context::{
     AdmissionError, AudioContextRegistration, AudioContextState, AudioNodeId, BaseAudioContext,
     InjectedContextAdmissionGate, DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS,
@@ -248,18 +249,12 @@ impl std::fmt::Debug for ConcreteBaseAudioContext {
 /// Inner representation of the `ConcreteBaseAudioContext`
 ///
 /// These fields are wrapped inside an `Arc` in the actual `ConcreteBaseAudioContext`.
-struct ConcreteBaseAudioContextInner {
-    /// sample rate in Hertz
-    sample_rate: f32,
-    /// max number of speaker output channels
-    max_channel_count: usize,
+struct LegacyGraphControl {
     /// provider for new AudioNodeIds
     audio_node_id_provider: AudioNodeIdProvider,
-    /// destination node's current channel count
-    destination_channel_config: ChannelConfig,
     /// message channel from control to render thread
     render_channel: RwLock<Sender<ControlMessage>>,
-    /// Private bounded-batch transport, retained for a later additive control API.
+    /// Private bounded-batch transport retained by legacy contexts during migration.
     _control_batch_sender: ControlBatchSender,
     /// Authoritative render-side acknowledgement for private control batches.
     control_batch_applied: ControlBatchApplied,
@@ -267,10 +262,32 @@ struct ConcreteBaseAudioContextInner {
     suspended_messages: Mutex<Option<Vec<ControlMessage>>>,
     /// control messages that cannot be sent immediately
     queued_messages: Mutex<Vec<ControlMessage>>,
-    /// number of frames played
-    frames_played: Arc<AtomicU64>,
     /// control msg to add the AudioListener, to be sent when the first panner is created
     queued_audio_listener_msgs: Mutex<Vec<ControlMessage>>,
+    /// Current audio graph connections (from node, output port, to node, input port)
+    connections: Mutex<HashSet<(AudioNodeId, usize, AudioNodeId, usize)>>,
+}
+
+// The whole base is already behind one Arc; boxing legacy state again would add an allocation to
+// every existing context merely to shrink this private discriminated field.
+#[allow(clippy::large_enum_variant)]
+enum ConcreteGraphControl {
+    Legacy(LegacyGraphControl),
+    /// Exact branded batch/id/lifetime capability; deliberately contains no raw render sender or
+    /// legacy ID provider. Only the Gain constructor is migrated at this private boundary.
+    Injected(InjectedNodeConstructor),
+}
+
+struct ConcreteBaseAudioContextInner {
+    /// sample rate in Hertz
+    sample_rate: f32,
+    /// max number of speaker output channels
+    max_channel_count: usize,
+    graph_control: ConcreteGraphControl,
+    /// destination node's current channel count
+    destination_channel_config: ChannelConfig,
+    /// number of frames played
+    frames_played: Arc<AtomicU64>,
     /// AudioListener fields
     listener_params: Option<AudioListenerParams>,
     /// Denotes if this AudioContext is offline or not
@@ -281,8 +298,6 @@ struct ConcreteBaseAudioContextInner {
     event_loop: EventLoop,
     /// Opaque control-side capability for events handled by the EventLoop.
     control_events: ControlEventDispatch,
-    /// Current audio graph connections (from node, output port, to node, input port)
-    connections: Mutex<HashSet<(AudioNodeId, usize, AudioNodeId, usize)>>,
 }
 
 impl BaseAudioContext for ConcreteBaseAudioContext {
@@ -322,8 +337,9 @@ impl ConcreteBaseAudioContext {
         )
     }
 
-    /// Private construction seam for a future injected context. The raw event sender is consumed
-    /// here and is never recoverable through the resulting base or capacity clones.
+    /// Event-injection seam used by the existing context migration. Graph construction remains
+    /// entirely legacy here; in particular the resulting base still owns a raw render sender and
+    /// legacy ID provider.
     #[allow(dead_code)] // selected by the pending private injected AudioContext constructor
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_injected(
@@ -374,21 +390,23 @@ impl ConcreteBaseAudioContext {
         let base_inner = ConcreteBaseAudioContextInner {
             sample_rate,
             max_channel_count,
-            render_channel: RwLock::new(render_channel),
-            _control_batch_sender: control_batch_sender,
-            control_batch_applied,
-            suspended_messages: Mutex::new(None),
-            queued_messages: Mutex::new(Vec::new()),
-            audio_node_id_provider,
+            graph_control: ConcreteGraphControl::Legacy(LegacyGraphControl {
+                audio_node_id_provider,
+                render_channel: RwLock::new(render_channel),
+                _control_batch_sender: control_batch_sender,
+                control_batch_applied,
+                suspended_messages: Mutex::new(None),
+                queued_messages: Mutex::new(Vec::new()),
+                queued_audio_listener_msgs: Mutex::new(Vec::new()),
+                connections: Mutex::new(HashSet::new()),
+            }),
             destination_channel_config: AudioNodeOptions::default().into(),
             frames_played,
-            queued_audio_listener_msgs: Mutex::new(Vec::new()),
             listener_params: None,
             offline,
             state,
             event_loop,
             control_events,
-            connections: Mutex::new(HashSet::new()),
         };
         let base = Self {
             inner: Arc::new(base_inner),
@@ -444,7 +462,7 @@ impl ConcreteBaseAudioContext {
 
         // Validate if the hardcoded node IDs line up
         debug_assert_eq!(
-            base.inner
+            base.legacy_graph()
                 .audio_node_id_provider
                 .id_inc
                 .load(Ordering::Relaxed),
@@ -459,13 +477,68 @@ impl ConcreteBaseAudioContext {
         base
     }
 
+    /// Private production boundary for concrete nodes built exclusively through the branded
+    /// injected transaction. It deliberately does not create destination/listener graph nodes and
+    /// cannot provide legacy graph mutation APIs. Destination and read-only context properties
+    /// remain callable, but listener creation, other node constructors, explicit connections, and
+    /// post-construction automation panic instead of falling back to a raw sender. A complete
+    /// injected AudioContext is deferred, and no public path can select this base in this slice.
+    #[allow(dead_code)] // exercised by private Gain integration tests in this slice
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_injected_node_construction_base(
+        sample_rate: f32,
+        max_channel_count: usize,
+        state: Arc<AtomicU8>,
+        frames_played: Arc<AtomicU64>,
+        constructor: InjectedNodeConstructor,
+        event_send: Sender<EventDispatch>,
+        event_loop: EventLoop,
+        offline: bool,
+    ) -> Self {
+        let control_events =
+            ControlEventDispatch::injected(event_send, constructor.admission_gate());
+        Self {
+            inner: Arc::new(ConcreteBaseAudioContextInner {
+                sample_rate,
+                max_channel_count,
+                graph_control: ConcreteGraphControl::Injected(constructor),
+                destination_channel_config: AudioNodeOptions::default().into(),
+                frames_played,
+                listener_params: None,
+                offline,
+                state,
+                event_loop,
+                control_events,
+            }),
+        }
+    }
+
+    fn legacy_graph(&self) -> &LegacyGraphControl {
+        match &self.inner.graph_control {
+            ConcreteGraphControl::Legacy(graph) => graph,
+            ConcreteGraphControl::Injected(_) => {
+                panic!("legacy graph mutation is unavailable on an injected construction base")
+            }
+        }
+    }
+
+    pub(crate) fn injected_node_constructor(&self) -> Option<&InjectedNodeConstructor> {
+        match &self.inner.graph_control {
+            ConcreteGraphControl::Legacy(_) => None,
+            ConcreteGraphControl::Injected(constructor) => Some(constructor),
+        }
+    }
+
     pub(crate) fn address(&self) -> usize {
         Arc::as_ptr(&self.inner) as usize
     }
 
     #[allow(dead_code)]
     pub(crate) fn applied_control_batch_sequence(&self) -> u64 {
-        self.inner.control_batch_applied.load()
+        match &self.inner.graph_control {
+            ConcreteGraphControl::Legacy(graph) => graph.control_batch_applied.load(),
+            ConcreteGraphControl::Injected(constructor) => constructor.applied_batch_sequence(),
+        }
     }
 
     /// Construct a new pair of [`AudioNode`] and [`AudioProcessor`]
@@ -477,8 +550,9 @@ impl ConcreteBaseAudioContext {
         f: F,
     ) -> T {
         // create a unique id for this node
-        let id = self.inner.audio_node_id_provider.get();
+        let id = self.legacy_graph().audio_node_id_provider.get();
         let registration = AudioContextRegistration {
+            injected_lifetime: None,
             id,
             context: self.clone(),
         };
@@ -498,8 +572,11 @@ impl ConcreteBaseAudioContext {
 
         // if this is the AudioListener or its params, do not add it to the graph just yet
         if id == LISTENER_NODE_ID || LISTENER_PARAM_IDS.contains(&id.0) {
-            let mut queued_audio_listener_msgs =
-                self.inner.queued_audio_listener_msgs.lock().unwrap();
+            let mut queued_audio_listener_msgs = self
+                .legacy_graph()
+                .queued_audio_listener_msgs
+                .lock()
+                .unwrap();
             queued_audio_listener_msgs.push(message);
         } else {
             self.send_control_msg(message);
@@ -515,9 +592,10 @@ impl ConcreteBaseAudioContext {
     /// emitted.
     pub(crate) fn send_control_msg(&self, msg: ControlMessage) {
         if self.state() != AudioContextState::Closed {
-            let sender = self.inner.render_channel.read().unwrap();
+            let graph = self.legacy_graph();
+            let sender = graph.render_channel.read().unwrap();
             // if the context is suspended, buffer the message and don't send it
-            if let Some(queued) = self.inner.suspended_messages.lock().unwrap().as_mut() {
+            if let Some(queued) = graph.suspended_messages.lock().unwrap().as_mut() {
                 queued.push(msg);
                 return;
             }
@@ -530,17 +608,19 @@ impl ConcreteBaseAudioContext {
     }
 
     pub(crate) fn suspend_control_msgs(&self, msg: ControlMessage) {
-        let sender = self.inner.render_channel.read().unwrap();
-        *self.inner.suspended_messages.lock().unwrap() = Some(Vec::new());
+        let graph = self.legacy_graph();
+        let sender = graph.render_channel.read().unwrap();
+        *graph.suspended_messages.lock().unwrap() = Some(Vec::new());
         if sender.send(msg).is_err() {
             log::warn!("Discarding control message - render thread is closed");
         }
     }
 
     pub(crate) fn resume_control_msgs(&self, msg: ControlMessage) {
-        let sender = self.inner.render_channel.read().unwrap();
+        let graph = self.legacy_graph();
+        let sender = graph.render_channel.read().unwrap();
         let messages = self
-            .inner
+            .legacy_graph()
             .suspended_messages
             .lock()
             .unwrap()
@@ -566,7 +646,7 @@ impl ConcreteBaseAudioContext {
             return;
         }
 
-        let mut suspended = self.inner.suspended_messages.lock().unwrap();
+        let mut suspended = self.legacy_graph().suspended_messages.lock().unwrap();
         let existing = suspended.get_or_insert_with(Vec::new);
         messages.append(existing);
         *existing = messages;
@@ -606,7 +686,7 @@ impl ConcreteBaseAudioContext {
     }
 
     pub(crate) fn lock_control_msg_sender(&self) -> RwLockWriteGuard<'_, Sender<ControlMessage>> {
-        self.inner.render_channel.write().unwrap()
+        self.legacy_graph().render_channel.write().unwrap()
     }
 
     pub(super) fn mark_node_dropped(&self, id: AudioNodeId) {
@@ -621,7 +701,7 @@ impl ConcreteBaseAudioContext {
         self.send_control_msg(message);
 
         // Clear the connection administration for this node, the node id may be recycled later
-        self.inner
+        self.legacy_graph()
             .connections
             .lock()
             .unwrap()
@@ -647,6 +727,7 @@ impl ConcreteBaseAudioContext {
         self.base().ensure_audio_listener_present();
 
         let mut ids = LISTENER_PARAM_IDS.map(|i| AudioContextRegistration {
+            injected_lifetime: None,
             id: AudioNodeId(i),
             context: self.clone(),
         });
@@ -709,7 +790,7 @@ impl ConcreteBaseAudioContext {
     /// of the Node with the given `id`
     fn resolve_queued_control_msgs(&self, id: AudioNodeId) {
         // resolve control messages that depend on this registration
-        let mut queued = self.inner.queued_messages.lock().unwrap();
+        let mut queued = self.legacy_graph().queued_messages.lock().unwrap();
         let mut i = 0; // waiting for Vec::drain_filter to stabilize
         while i < queued.len() {
             if matches!(&queued[i], ControlMessage::ConnectNode {to, ..} if *to == id) {
@@ -724,7 +805,7 @@ impl ConcreteBaseAudioContext {
     /// Connects the output of the `from` audio node to the input of the `to` audio node
     pub(crate) fn connect(&self, from: AudioNodeId, to: AudioNodeId, output: usize, input: usize) {
         let inserted = self
-            .inner
+            .legacy_graph()
             .connections
             .lock()
             .unwrap()
@@ -747,7 +828,7 @@ impl ConcreteBaseAudioContext {
     ///
     /// It is not performed immediately as the `AudioNode` is not registered at this point.
     pub(super) fn queue_audio_param_connect(&self, param: &AudioParam, audio_node: AudioNodeId) {
-        // no need to store these type of connections in self.inner.connections
+        // no need to store these type of connections in the legacy explicit mirror
 
         let message = ControlMessage::ConnectNode {
             from: param.registration().id(),
@@ -755,7 +836,11 @@ impl ConcreteBaseAudioContext {
             output: 0,
             input: usize::MAX, // audio params connect to the 'hidden' input port
         };
-        self.inner.queued_messages.lock().unwrap().push(message);
+        self.legacy_graph()
+            .queued_messages
+            .lock()
+            .unwrap()
+            .push(message);
     }
 
     /// Disconnects outputs of the audio node, possibly filtered by output node, input, output.
@@ -768,7 +853,7 @@ impl ConcreteBaseAudioContext {
     ) {
         // check if the node was connected, otherwise panic
         let mut has_disconnected = false;
-        let mut connections = self.inner.connections.lock().unwrap();
+        let mut connections = self.legacy_graph().connections.lock().unwrap();
         connections.retain(|&(c_from, c_output, c_to, c_input)| {
             let retain = c_from != from
                 || c_output != output.unwrap_or(c_output)
@@ -802,7 +887,11 @@ impl ConcreteBaseAudioContext {
 
     /// Add the [`AudioListener`] to the audio graph (if not already)
     pub(crate) fn ensure_audio_listener_present(&self) {
-        let mut queued_audio_listener_msgs = self.inner.queued_audio_listener_msgs.lock().unwrap();
+        let mut queued_audio_listener_msgs = self
+            .legacy_graph()
+            .queued_audio_listener_msgs
+            .lock()
+            .unwrap();
         let mut released = false;
         while let Some(message) = queued_audio_listener_msgs.pop() {
             // add the AudioListenerRenderer to the graph
@@ -850,8 +939,12 @@ mod tests {
     #[test]
     fn sink_replay_is_prepended_to_existing_suspended_fifo() {
         let context = OfflineAudioContext::new(1, 128, 48_000.);
-        *context.base().inner.suspended_messages.lock().unwrap() =
-            Some(vec![test_marker(3), test_marker(4)]);
+        *context
+            .base()
+            .legacy_graph()
+            .suspended_messages
+            .lock()
+            .unwrap() = Some(vec![test_marker(3), test_marker(4)]);
 
         context
             .base()
@@ -859,7 +952,7 @@ mod tests {
 
         let messages = context
             .base()
-            .inner
+            .legacy_graph()
             .suspended_messages
             .lock()
             .unwrap()
@@ -893,23 +986,59 @@ mod tests {
         let node2 = context.create_gain();
 
         // connection list starts empty
-        assert!(context.base().inner.connections.lock().unwrap().is_empty());
+        assert!(context
+            .base()
+            .legacy_graph()
+            .connections
+            .lock()
+            .unwrap()
+            .is_empty());
 
         node1.disconnect(); // never panic for plain disconnect calls
 
         node1.connect(&node2);
 
         // connection should be registered
-        assert_eq!(context.base().inner.connections.lock().unwrap().len(), 1);
+        assert_eq!(
+            context
+                .base()
+                .legacy_graph()
+                .connections
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
 
         node1.disconnect();
-        assert!(context.base().inner.connections.lock().unwrap().is_empty());
+        assert!(context
+            .base()
+            .legacy_graph()
+            .connections
+            .lock()
+            .unwrap()
+            .is_empty());
 
         node1.connect(&node2);
-        assert_eq!(context.base().inner.connections.lock().unwrap().len(), 1);
+        assert_eq!(
+            context
+                .base()
+                .legacy_graph()
+                .connections
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
 
         node1.disconnect_dest(&node2);
-        assert!(context.base().inner.connections.lock().unwrap().is_empty());
+        assert!(context
+            .base()
+            .legacy_graph()
+            .connections
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -933,7 +1062,13 @@ mod tests {
         context.base().mark_node_dropped(node1.registration().id());
 
         // dropping should clear connections administration
-        assert!(context.base().inner.connections.lock().unwrap().is_empty());
+        assert!(context
+            .base()
+            .legacy_graph()
+            .connections
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

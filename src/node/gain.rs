@@ -1,10 +1,12 @@
-use crate::context::{AudioContextRegistration, AudioParamId, BaseAudioContext};
-use crate::param::{AudioParam, AudioParamDescriptor};
+use crate::context::{
+    AudioContextRegistration, AudioParamId, BaseAudioContext, ConcreteBaseAudioContext,
+};
+use crate::param::{audio_param_raw_parts, AudioParam, AudioParamDescriptor};
 use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope,
 };
 
-use super::{AudioNode, AudioNodeOptions, ChannelConfig};
+use super::{AudioNode, AudioNodeOptions, ChannelConfig, ChannelCountMode, ChannelInterpretation};
 
 /// Options for constructing a [`GainNode`]
 // dictionary GainOptions : AudioNodeOptions {
@@ -99,6 +101,11 @@ impl GainNode {
     /// * `context` - audio context in which the audio node will live
     /// * `options` - initial value of the gain parameter and channel config
     pub fn new<C: BaseAudioContext>(context: &C, options: GainOptions) -> Self {
+        if context.base().injected_node_constructor().is_some() {
+            return Self::new_injected(context.base(), options);
+        }
+
+        // Keep the public legacy path and its four individual graph mutations unchanged.
         context.base().register(move |registration| {
             let param_opts = AudioParamDescriptor {
                 name: String::new(),
@@ -123,6 +130,69 @@ impl GainNode {
         })
     }
 
+    fn new_injected(context: &ConcreteBaseAudioContext, options: GainOptions) -> Self {
+        let transaction = context
+            .injected_node_constructor()
+            .expect("injected Gain selection requires an injected construction base")
+            .try_begin_gain()
+            .unwrap_or_else(|error| panic!("injected Gain admission failed: {error:?}"));
+
+        // All potentially panicking validation and payload construction happens after one exact
+        // admission. Unwind drops the transaction's slots and IDs before releasing admission.
+        let descriptor = AudioParamDescriptor {
+            name: String::new(),
+            min_value: f32::MIN,
+            max_value: f32::MAX,
+            default_value: 1.,
+            automation_rate: crate::param::AutomationRate::A,
+        };
+        let (param_raw_parts, param_processor) = audio_param_raw_parts(descriptor);
+        let initial_value = param_raw_parts.set_initial_value_for_injected(options.gain);
+        let channel_config: ChannelConfig = options.audio_node_options.into();
+        let param_channel_config: ChannelConfig = AudioNodeOptions {
+            channel_count: 1,
+            channel_count_mode: ChannelCountMode::Explicit,
+            channel_interpretation: ChannelInterpretation::Discrete,
+        }
+        .into();
+        let gain_id = transaction.gain_id();
+        let param_id = transaction.param_id();
+        let constructed = transaction
+            .commit(crate::context::InjectedGainPayload {
+                param_processor: Box::new(param_processor),
+                gain_processor: Box::new(GainRenderer {
+                    gain: AudioParamId::from_node_id(param_id),
+                }),
+                param_channel_config: param_channel_config.inner(),
+                gain_channel_config: channel_config.inner(),
+                initial_value,
+            })
+            .unwrap_or_else(|error| panic!("injected Gain construction failed: {error:?}"));
+        debug_assert_eq!(constructed.gain_id, gain_id);
+        debug_assert_eq!(constructed.param_id, param_id);
+        let _accepted_placement = constructed.outcome;
+
+        // Public handles are created only after the graph accepted the entire four-command batch
+        // and both exact lifetime slots were armed by its mandatory finalizer.
+        let param_registration = AudioContextRegistration::from_injected(
+            param_id,
+            context.clone(),
+            constructed.param_registration,
+        );
+        let registration = AudioContextRegistration::from_injected(
+            gain_id,
+            context.clone(),
+            constructed.gain_registration,
+        );
+        let gain = AudioParam::from_raw_parts(param_registration, param_raw_parts);
+
+        Self {
+            registration,
+            channel_config,
+            gain,
+        }
+    }
+
     /// Returns the gain `AudioParam`.
     ///
     /// The default value is `1.0` (pass-through). Setting `0.0` mutes the
@@ -136,8 +206,8 @@ impl GainNode {
     }
 }
 
-struct GainRenderer {
-    gain: AudioParamId,
+pub(crate) struct GainRenderer {
+    pub(crate) gain: AudioParamId,
 }
 
 impl AudioProcessor for GainRenderer {

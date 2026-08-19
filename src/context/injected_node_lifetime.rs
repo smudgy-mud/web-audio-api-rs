@@ -19,7 +19,8 @@ use super::injected_control::{
     InjectedControlProducer, InjectedNodeLifetimeBootstrap,
 };
 use super::injected_ids::{
-    InjectedGraphReclaimInit, InjectedNodeIdIdentity, InjectedNodeIdOwner, OwnedPendingNodeReclaim,
+    InjectedGraphReclaimInit, InjectedNodeIdAllocator, InjectedNodeIdIdentity, InjectedNodeIdOwner,
+    OwnedPendingNodeReclaim,
 };
 use super::AudioNodeId;
 
@@ -160,6 +161,8 @@ struct NodeLifetimeInner {
         )>,
     >,
     #[cfg(test)]
+    construction_arm_behavior: AtomicU8,
+    #[cfg(test)]
     reclaim_attach_hook: Mutex<
         Option<(
             crossbeam_channel::Sender<()>,
@@ -262,6 +265,8 @@ pub(crate) fn injected_node_lifetime_registry(
         #[cfg(test)]
         arm_publish_hook: Mutex::new(None),
         #[cfg(test)]
+        construction_arm_behavior: AtomicU8::new(0),
+        #[cfg(test)]
         reclaim_attach_hook: Mutex::new(None),
         #[cfg(test)]
         teardown_finalizer_behavior: AtomicU8::new(0),
@@ -320,6 +325,40 @@ pub(crate) struct NodeRegistrationFailure {
 }
 
 impl InjectedNodeLifetimeRegistrar {
+    /// Exact constructor branding: this registry was built from the same control transport and
+    /// node-id owner represented by these two weak construction capabilities.
+    pub(crate) fn matches_constructor(
+        &self,
+        control: &InjectedControlProducer,
+        allocator: &InjectedNodeIdAllocator,
+    ) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        inner.control_identity.ptr_eq(&control.identity())
+            && inner.node_id_identity.ptr_eq(&allocator.identity())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_construction_arm_for_test(&self, ordinal: u8) {
+        assert!(ordinal > 0 && ordinal < 0x80);
+        if let Some(inner) = self.inner.upgrade() {
+            inner
+                .construction_arm_behavior
+                .store(ordinal, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_construction_arm_for_test(&self, ordinal: u8) {
+        assert!(ordinal > 0 && ordinal < 0x80);
+        if let Some(inner) = self.inner.upgrade() {
+            inner
+                .construction_arm_behavior
+                .store(ordinal | 0x80, Ordering::Release);
+        }
+    }
+
     pub(crate) fn try_register(
         &self,
         id: AudioNodeId,
@@ -472,22 +511,25 @@ impl ProvisionalNodeRegistration {
         }
     }
 
-    pub(crate) fn into_registration(
-        mut self,
-    ) -> Result<InjectedNodeRegistration, NodeRegistrationError> {
+    pub(crate) fn ready_for_registration(&self) -> bool {
         if !self.armed.load(Ordering::Acquire) {
-            return Err(NodeRegistrationError::ProtocolViolation);
+            return false;
         }
-        if let Some(inner) = self.inner.upgrade() {
+        self.inner.upgrade().is_none_or(|inner| {
             let word = inner.slots[self.key.slot].word.load(Ordering::Acquire);
-            if generation(word) != self.key.generation.get()
-                || !matches!(
+            generation(word) == self.key.generation.get()
+                && matches!(
                     SlotPhase::from_word(word),
                     SlotPhase::Live | SlotPhase::Sealed
                 )
-            {
-                return Err(NodeRegistrationError::ProtocolViolation);
-            }
+        })
+    }
+
+    pub(crate) fn into_registration(
+        mut self,
+    ) -> Result<InjectedNodeRegistration, NodeRegistrationError> {
+        if !self.ready_for_registration() {
+            return Err(NodeRegistrationError::ProtocolViolation);
         }
         self.completed = true;
         Ok(InjectedNodeRegistration {
@@ -498,11 +540,34 @@ impl ProvisionalNodeRegistration {
 }
 
 impl NodeRegistrationArm<'_> {
-    pub(crate) fn arm(self) -> Result<(), AcceptedBatchFinalizeError> {
+    pub(crate) fn mark_accepted(self) {
         self.accepted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn arm_accepted(self) -> Result<(), AcceptedBatchFinalizeError> {
+        if !self.accepted.load(Ordering::Acquire) {
+            return Err(AcceptedBatchFinalizeError::Rejected);
+        }
         let Some(inner) = self.inner.upgrade() else {
             return Err(AcceptedBatchFinalizeError::Rejected);
         };
+        #[cfg(test)]
+        {
+            let behavior = inner.construction_arm_behavior.load(Ordering::Acquire);
+            if behavior != 0 {
+                let countdown = behavior & 0x7f;
+                if countdown == 1 {
+                    inner.construction_arm_behavior.store(0, Ordering::Release);
+                    if behavior & 0x80 != 0 {
+                        panic!("injected construction arm panic");
+                    }
+                    return Err(AcceptedBatchFinalizeError::Rejected);
+                }
+                inner
+                    .construction_arm_behavior
+                    .store((countdown - 1) | (behavior & 0x80), Ordering::Release);
+            }
+        }
         let _allocation = match inner.allocation.try_lock() {
             Ok(allocation) => allocation,
             Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
@@ -548,6 +613,22 @@ impl NodeRegistrationArm<'_> {
         result
             .map(|_| self.armed.store(true, Ordering::Release))
             .map_err(|_| AcceptedBatchFinalizeError::Rejected)
+    }
+
+    pub(crate) fn arm(self) -> Result<(), AcceptedBatchFinalizeError> {
+        self.mark_accepted();
+        self.arm_accepted()
+    }
+
+    /// Internal constructor protocol failure. Prefer an explicit quarantined slot; if structural
+    /// corruption is proven, this off-RT path serializes with allocation and quarantines both the
+    /// exact slot and the registry so later construction cannot proceed.
+    pub(crate) fn quarantine_accepted(self) {
+        self.mark_accepted();
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        teardown::quarantine_slot(&inner, self.key);
     }
 }
 
@@ -713,6 +794,35 @@ impl InjectedNodeLifetimeOwner {
             .expect("live node-lifetime owner retains its registry")
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_id_release_hook_for_test(
+        &self,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    ) {
+        self.node_ids
+            .as_ref()
+            .expect("live node-lifetime owner retains its id owner")
+            .set_release_hook_for_test(entered, release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn slot_phase_counts_for_test(&self) -> [usize; 6] {
+        let mut counts = [0; 6];
+        for slot in &self.inner().slots {
+            let index = match SlotPhase::from_word(slot.word.load(Ordering::Acquire)) {
+                SlotPhase::Vacant => 0,
+                SlotPhase::Provisional => 1,
+                SlotPhase::Live => 2,
+                SlotPhase::Requested => 3,
+                SlotPhase::Quarantined => 4,
+                _ => 5,
+            };
+            counts[index] += 1;
+        }
+        counts
+    }
+
     pub(crate) fn control_identity(&self) -> &InjectedControlIdentity {
         &self.inner().control_identity
     }
@@ -738,7 +848,7 @@ impl InjectedNodeLifetimeOwner {
     }
 
     #[cfg(test)]
-    fn set_arm_publish_hook(
+    pub(crate) fn set_arm_publish_hook(
         &self,
         entered: crossbeam_channel::Sender<()>,
         release: crossbeam_channel::Receiver<()>,
