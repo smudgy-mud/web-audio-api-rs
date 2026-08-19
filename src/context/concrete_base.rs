@@ -17,8 +17,9 @@ use crate::context::injected_node_lifetime::{
     BoundInjectedOutputRenderer, MagicInitializedInjectedOutputRenderer,
 };
 use crate::context::{
-    AdmissionError, AudioContextRegistration, AudioContextState, AudioNodeId, BaseAudioContext,
-    InjectedContextAdmissionGate, DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS,
+    AdmissionError, AudioContextRegistration, AudioContextState, AudioControlBatchReservation,
+    AudioNodeId, BaseAudioContext, InjectedContextAdmissionGate, DESTINATION_NODE_ID,
+    LISTENER_NODE_ID, LISTENER_PARAM_IDS,
 };
 use crate::events::{
     EventDispatch, EventHandler, EventLoop, EventType, InjectedControlEventDispatch,
@@ -475,13 +476,24 @@ impl ExactInjectedBaseBootstrap {
     pub(crate) fn try_build(
         self,
     ) -> Result<MagicInitializedInjectedOutputRenderer, ExactInjectedBaseBuildFailure> {
+        self.try_build_with_control_reservation(None)
+    }
+
+    #[allow(clippy::result_large_err)] // exact recovery returns every unique owner inline
+    pub(crate) fn try_build_with_control_reservation(
+        self,
+        control_reservation: Option<AudioControlBatchReservation>,
+    ) -> Result<MagicInitializedInjectedOutputRenderer, ExactInjectedBaseBuildFailure> {
         let (sample_rate, max_channel_count, frames_played) = self.renderer.injected_base_facts();
         let offline = false;
-        let magic = match self.constructor.try_construct_magic_graph(
-            sample_rate,
-            max_channel_count,
-            offline,
-        ) {
+        let magic = match self
+            .constructor
+            .try_construct_magic_graph_with_host_reservation(
+                sample_rate,
+                max_channel_count,
+                offline,
+                control_reservation,
+            ) {
             Ok(magic) => magic,
             Err(failure) if !failure.retryable => {
                 return Err(ExactInjectedBaseBuildFailure::Terminal {
