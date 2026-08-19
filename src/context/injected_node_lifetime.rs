@@ -27,7 +27,7 @@ use super::injected_ids::{
     OwnedPendingNodeReclaim,
 };
 use super::AudioNodeId;
-use crate::events::InjectedJoinableEventLoop;
+use crate::events::{InjectedEventIdentity, InjectedLifecycleEventLoop};
 use crate::output::{
     AudioOutputError, AudioOutputEventSink, AudioRenderCallback, AudioRenderFormat,
     AudioRenderOwner, EndpointShutdownConfirmed,
@@ -239,7 +239,7 @@ pub(crate) struct InjectedNodeLifetimeOwner {
 pub(crate) struct BoundInjectedOutputRenderer {
     renderer: ExactBoundInjectedRenderer,
     control: InjectedControlLifecycleOwner,
-    event_loop: InjectedJoinableEventLoop,
+    event_loop: InjectedLifecycleEventLoop,
 }
 
 /// Eventless B3a bootstrap seam. It is test-only and structurally cannot enter B3b lifecycle
@@ -267,13 +267,19 @@ pub(crate) struct InjectedOutputRenderOwner {
     render: Option<AudioRenderOwner>,
     node_lifetimes: Option<InjectedNodeLifetimeOwner>,
     control: Option<InjectedControlLifecycleOwner>,
+    event_identity: Option<InjectedEventIdentity>,
 }
 
 impl BoundInjectedOutputRenderer {
+    #[cfg(test)]
+    pub(crate) fn quarantine_prepublication_for_test(self) {
+        std::mem::forget(self);
+    }
+
     pub(crate) fn new(
         renderer: ExactBoundInjectedRenderer,
         control: InjectedControlLifecycleOwner,
-        event_loop: InjectedJoinableEventLoop,
+        event_loop: InjectedLifecycleEventLoop,
     ) -> Self {
         Self {
             renderer,
@@ -307,7 +313,7 @@ impl BoundInjectedOutputRenderer {
         (
             InjectedOutputRenderOwner,
             AudioRenderCallback,
-            crate::events::JoinableEventLoop,
+            InjectedLifecycleEventLoop,
         ),
         BoundInjectedOutputPairFailure,
     > {
@@ -322,9 +328,10 @@ impl BoundInjectedOutputRenderer {
                     render: Some(render),
                     node_lifetimes: Some(node_lifetimes),
                     control: Some(control),
+                    event_identity: Some(event_loop.producer_identity()),
                 },
                 callback,
-                event_loop.into_event_loop(),
+                event_loop,
             )),
             Err(ExactInjectedRenderPairFailure {
                 error,
@@ -379,6 +386,7 @@ impl TestBoundInjectedOutputRenderer {
                     render: Some(render),
                     node_lifetimes: Some(node_lifetimes),
                     control: Some(self.control),
+                    event_identity: None,
                 },
                 callback,
             )),
@@ -409,6 +417,7 @@ impl Drop for InjectedOutputRenderOwner {
         forget_option(&mut self.render);
         forget_option(&mut self.node_lifetimes);
         forget_option(&mut self.control);
+        self.event_identity.take();
     }
 }
 
@@ -439,6 +448,7 @@ pub(crate) struct InjectedOutputCloseRetirement {
     render: Option<AudioRenderOwner>,
     node_lifetimes: Option<InjectedNodeLifetimeOwner>,
     control: Option<ControlCloseRetirement>,
+    event_identity: Option<InjectedEventIdentity>,
 }
 
 #[must_use]
@@ -446,6 +456,7 @@ pub(crate) struct DrainedInjectedOutputClose {
     render: Option<AudioRenderOwner>,
     node_lifetimes: Option<InjectedNodeLifetimeOwner>,
     control: Option<DrainedControlClose>,
+    event_identity: Option<InjectedEventIdentity>,
 }
 
 pub(crate) struct InjectedOutputSealFailure {
@@ -453,6 +464,7 @@ pub(crate) struct InjectedOutputSealFailure {
     render: Option<AudioRenderOwner>,
     node_lifetimes: Option<InjectedNodeLifetimeOwner>,
     control: Option<DrainedControlClose>,
+    event_identity: Option<InjectedEventIdentity>,
 }
 
 pub(crate) struct InjectedOutputFinishFailure {
@@ -461,6 +473,7 @@ pub(crate) struct InjectedOutputFinishFailure {
     render: Option<AudioRenderOwner>,
     registry: Option<SealedNodeLifetimeRegistry>,
     degradation: ControlCloseDegradation,
+    event_identity: Option<InjectedEventIdentity>,
 }
 
 /// Submitted Close plus staged payloads which must be retired before either ordered or silent
@@ -481,6 +494,7 @@ pub(crate) struct SealedInjectedOutput {
     registry: Option<SealedNodeLifetimeRegistry>,
     close: Option<SubmittedControlClose>,
     degradation: ControlCloseDegradation,
+    event_identity: Option<InjectedEventIdentity>,
 }
 
 pub(crate) enum InjectedCloseObservation {
@@ -498,6 +512,7 @@ pub(crate) struct ReadyForInjectedPhysicalReclaim {
     close: Option<SubmittedControlClose>,
     degradation: ControlCloseDegradation,
     close_applied: bool,
+    event_identity: Option<InjectedEventIdentity>,
 }
 
 pub(crate) enum InjectedRenderReclaimOutcome {
@@ -518,6 +533,7 @@ pub(crate) struct ReclaimedInjectedGraph {
     proof: Option<WholeGraphRetired>,
     degradation: ControlCloseDegradation,
     close_applied: bool,
+    event_identity: Option<InjectedEventIdentity>,
 }
 
 pub(crate) enum InjectedNodeRetireOutcome {
@@ -530,6 +546,7 @@ pub(crate) struct RetiredInjectedGraph {
     nodes: WholeGraphNodeRetirement,
     degradation: ControlCloseDegradation,
     close_applied: bool,
+    event_identity: Option<InjectedEventIdentity>,
     retired: (),
 }
 
@@ -544,6 +561,12 @@ impl RetiredInjectedGraph {
 
     pub(crate) fn close_applied(&self) -> bool {
         self.close_applied
+    }
+
+    pub(crate) fn matches_event_identity(&self, identity: &InjectedEventIdentity) -> bool {
+        self.event_identity
+            .as_ref()
+            .is_some_and(|exact| exact.matches(identity))
     }
 }
 
@@ -585,6 +608,7 @@ impl InjectedOutputRenderOwner {
             render: self.render.take(),
             node_lifetimes: self.node_lifetimes.take(),
             control: Some(control),
+            event_identity: self.event_identity.take(),
         })
     }
 
@@ -614,6 +638,7 @@ impl InjectedOutputCloseRetirement {
             render: self.render.take(),
             node_lifetimes: self.node_lifetimes.take(),
             control: Some(control),
+            event_identity: self.event_identity.take(),
         }
     }
 }
@@ -636,6 +661,7 @@ impl DrainedInjectedOutputClose {
                     render: self.render.take(),
                     node_lifetimes: Some(owner),
                     control: self.control.take(),
+                    event_identity: self.event_identity.take(),
                 }));
             }
         };
@@ -646,6 +672,7 @@ impl DrainedInjectedOutputClose {
                     registry: Some(registry),
                     close: Some(transport.close),
                     degradation: transport.degradation,
+                    event_identity: self.event_identity.take(),
                 }),
                 payloads: Some(transport.payloads),
             }),
@@ -659,6 +686,7 @@ impl DrainedInjectedOutputClose {
                 render: self.render.take(),
                 registry: Some(registry),
                 degradation,
+                event_identity: self.event_identity.take(),
             })),
         }
     }
@@ -693,6 +721,7 @@ impl InjectedOutputFinishFailure {
                 registry: self.registry.take(),
                 close: None,
                 degradation: self.degradation,
+                event_identity: self.event_identity.take(),
             };
             Err(InjectedPayloadRetirementFailure {
                 sealed: Some(sealed),
@@ -704,6 +733,7 @@ impl InjectedOutputFinishFailure {
                 close: None,
                 degradation: self.degradation,
                 close_applied: false,
+                event_identity: self.event_identity.take(),
             })
         }
     }
@@ -730,6 +760,7 @@ impl SealedInjectedOutput {
                 close: None,
                 degradation: self.degradation,
                 close_applied: true,
+                event_identity: self.event_identity.take(),
             }),
             Err(ObserveControlCloseFailure::Pending(close)) => {
                 self.close = Some(close);
@@ -749,6 +780,7 @@ impl SealedInjectedOutput {
             close: self.close.take(),
             degradation: self.degradation,
             close_applied: false,
+            event_identity: self.event_identity.take(),
         }
     }
 
@@ -814,6 +846,7 @@ impl ReadyForInjectedPhysicalReclaim {
                     proof: Some(proof),
                     degradation: self.degradation,
                     close_applied: self.close_applied,
+                    event_identity: self.event_identity.take(),
                 })
             }
         }
@@ -829,6 +862,7 @@ impl ReclaimedInjectedGraph {
                 nodes,
                 degradation: self.degradation,
                 close_applied: self.close_applied,
+                event_identity: self.event_identity.take(),
                 retired: (),
             }),
             Err(WholeGraphNodeRetireFailure {
