@@ -1,11 +1,10 @@
-//! Bounded node-lifetime ownership foundation for a future injected context.
+//! Bounded node-lifetime ownership for the private injected context path.
 //!
-//! This foundation is deliberately not wired to `ConcreteBaseAudioContext`. Cloneable registrars
-//! and live registrations retain only a weak registry capability; a unique lifecycle-side owner
-//! holds the fixed slot storage, exact graph-reclaim owner, and authoritative wake receivers.
-//! No ordinary graph-control credit is retained for a node lifetime. Requested teardown is driven
-//! explicitly through bounded, retryable operations. B3b's private output lifecycle worker drives
-//! those operations automatically; wiring a public injected context remains deferred.
+//! The exact base uses cloneable registrars whose live registrations retain only a weak registry
+//! capability; a unique lifecycle-side owner holds the fixed slot storage, exact graph-reclaim
+//! owner, and authoritative wake receivers. No ordinary graph-control credit is retained for a
+//! node lifetime. Requested teardown is driven through bounded, retryable operations by the
+//! private output lifecycle worker. Public context construction remains deferred.
 
 #![allow(dead_code)]
 
@@ -242,6 +241,20 @@ pub(crate) struct BoundInjectedOutputRenderer {
     event_loop: InjectedLifecycleEventLoop,
 }
 
+/// Exact output renderer after permanent magic graph acceptance and pre-publication application.
+/// Only this type can enter the production injected output-start path.
+#[must_use]
+pub(crate) struct MagicInitializedInjectedOutputRenderer {
+    renderer: BoundInjectedOutputRenderer,
+    base: super::ConcreteBaseAudioContext,
+}
+
+pub(crate) struct MagicInitializedOutputPairFailure {
+    pub(crate) error: AudioOutputError,
+    pub(crate) renderer: MagicInitializedInjectedOutputRenderer,
+    pub(crate) events: AudioOutputEventSink,
+}
+
 /// Eventless B3a bootstrap seam. It is test-only and structurally cannot enter B3b lifecycle
 /// startup, whose bound type always owns the exact event-loop consumer.
 #[cfg(test)]
@@ -271,6 +284,17 @@ pub(crate) struct InjectedOutputRenderOwner {
 }
 
 impl BoundInjectedOutputRenderer {
+    pub(crate) fn injected_base_facts(&self) -> (f32, usize, Arc<std::sync::atomic::AtomicU64>) {
+        self.renderer.injected_base_facts()
+    }
+
+    pub(crate) fn matches_constructor(
+        &self,
+        constructor: &super::injected_node_construction::InjectedNodeConstructor,
+    ) -> bool {
+        self.renderer.matches_constructor(constructor)
+    }
+
     #[cfg(test)]
     pub(crate) fn quarantine_prepublication_for_test(self) {
         std::mem::forget(self);
@@ -303,9 +327,36 @@ impl BoundInjectedOutputRenderer {
         self.renderer.fail_reclaim_for_test();
     }
 
+    #[cfg(test)]
+    pub(crate) fn panic_magic_apply_for_test(&mut self) {
+        self.renderer.panic_magic_apply_for_test();
+    }
+
+    /// Applies the accepted magic envelope while the renderer is still uniquely control-owned.
+    pub(crate) fn apply_magic_before_publication(&mut self, required_sequence: u64) -> bool {
+        self.renderer
+            .apply_magic_before_publication(required_sequence)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn try_finish_magic_initialization(
+        self,
+        base: super::ConcreteBaseAudioContext,
+        magic: super::injected_magic_construction::MagicGraphInstalled,
+    ) -> Result<MagicInitializedInjectedOutputRenderer, (Self, super::ConcreteBaseAudioContext)>
+    {
+        if !self.renderer.matches_magic_graph(&magic) {
+            return Err((self, base));
+        }
+        Ok(MagicInitializedInjectedOutputRenderer {
+            renderer: self,
+            base,
+        })
+    }
+
     /// Installs callback+GC only after the exact event-loop consumer is inseparably bound.
     #[allow(clippy::result_large_err)]
-    pub(crate) fn try_into_audio_output_pair(
+    fn try_into_audio_output_pair(
         self,
         format: AudioRenderFormat,
         events: AudioOutputEventSink,
@@ -344,6 +395,68 @@ impl BoundInjectedOutputRenderer {
                     control,
                     event_loop,
                 },
+                events,
+            }),
+        }
+    }
+}
+
+impl MagicInitializedInjectedOutputRenderer {
+    pub(crate) const fn base(&self) -> &super::ConcreteBaseAudioContext {
+        &self.base
+    }
+
+    #[cfg(test)]
+    pub(crate) fn magic_bootstrap_shape_is_exact_for_test(&self) -> bool {
+        self.renderer
+            .renderer
+            .magic_bootstrap_shape_is_exact_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quarantine_prepublication_for_test(self) {
+        std::mem::forget(self);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_gc_spawn_for_test(&mut self) {
+        self.renderer.fail_next_gc_spawn_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnect_lifecycle_on_next_render_for_test(&mut self) {
+        self.renderer.disconnect_lifecycle_on_next_render_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_reclaim_for_test(&mut self) {
+        self.renderer.fail_reclaim_for_test();
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn try_into_audio_output_pair(
+        self,
+        format: AudioRenderFormat,
+        events: AudioOutputEventSink,
+    ) -> Result<
+        (
+            InjectedOutputRenderOwner,
+            AudioRenderCallback,
+            InjectedLifecycleEventLoop,
+            super::ConcreteBaseAudioContext,
+        ),
+        MagicInitializedOutputPairFailure,
+    > {
+        let Self { renderer, base } = self;
+        match renderer.try_into_audio_output_pair(format, events) {
+            Ok((owner, callback, event_loop)) => Ok((owner, callback, event_loop, base)),
+            Err(BoundInjectedOutputPairFailure {
+                error,
+                renderer,
+                events,
+            }) => Err(MagicInitializedOutputPairFailure {
+                error,
+                renderer: Self { renderer, base },
                 events,
             }),
         }
@@ -1543,6 +1656,10 @@ impl InjectedNodeLifetimeOwner {
 
     pub(crate) fn control_identity(&self) -> &InjectedControlIdentity {
         &self.inner().control_identity
+    }
+
+    pub(crate) fn node_id_identity(&self) -> &InjectedNodeIdIdentity {
+        &self.inner().node_id_identity
     }
 
     pub(crate) fn matches_graph_init(&self, graph: &InjectedGraphReclaimInit) -> bool {

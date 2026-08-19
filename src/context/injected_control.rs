@@ -1,9 +1,9 @@
-//! Private bounded graph-control transport for a future injected online context.
+//! Private bounded graph-control transport for the injected online-context path.
 //!
-//! This module is deliberately not wired to `ConcreteBaseAudioContext` yet. It separates a
-//! cloneable ordinary producer, a unique Close-only lifecycle owner, and a consuming render
-//! initializer. Suspend/Resume barrier wiring is explicitly deferred. No raw sender/receiver
-//! escapes, and this foundation does not claim full control quiescence.
+//! The exact private base and output lifecycle consume this transport. It separates a cloneable
+//! ordinary producer, a unique Close-only lifecycle owner, and a consuming render initializer.
+//! Public builder selection, broader node mutations, and Suspend/Resume barrier wiring remain
+//! deferred. No raw sender/receiver escapes.
 
 #![allow(dead_code)]
 
@@ -296,6 +296,33 @@ pub(crate) struct ExactInjectedRenderPairFailure {
 }
 
 impl ExactBoundInjectedRenderer {
+    pub(crate) fn injected_base_facts(&self) -> (f32, usize, Arc<AtomicU64>) {
+        self.renderer.injected_base_facts()
+    }
+
+    pub(crate) fn matches_constructor(
+        &self,
+        constructor: &super::injected_node_construction::InjectedNodeConstructor,
+    ) -> bool {
+        constructor.matches_control_identity(self.node_lifetimes.control_identity())
+            && constructor.matches_node_id_identity(self.node_lifetimes.node_id_identity())
+    }
+
+    pub(crate) fn matches_magic_graph(
+        &self,
+        magic: &super::injected_magic_construction::MagicGraphInstalled,
+    ) -> bool {
+        magic.matches(
+            self.node_lifetimes.control_identity(),
+            self.node_lifetimes.node_id_identity(),
+        )
+    }
+
+    pub(crate) fn apply_magic_before_publication(&mut self, required_sequence: u64) -> bool {
+        self.renderer
+            .apply_injected_magic_before_publication(required_sequence)
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_gc_spawn_for_test(&mut self) {
         self.renderer.fail_next_gc_spawn_for_test();
@@ -309,6 +336,16 @@ impl ExactBoundInjectedRenderer {
     #[cfg(test)]
     pub(crate) fn fail_reclaim_for_test(&mut self) {
         self.renderer.fail_reclaim_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_magic_apply_for_test(&mut self) {
+        self.renderer.panic_magic_apply_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn magic_bootstrap_shape_is_exact_for_test(&self) -> bool {
+        self.renderer.magic_bootstrap_shape_is_exact_for_test()
     }
 
     #[allow(clippy::result_large_err)] // failure returns the exact unboxed renderer and node owner
