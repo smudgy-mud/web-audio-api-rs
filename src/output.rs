@@ -1,11 +1,9 @@
 //! Host-supplied audio output contracts.
 //!
-//! This module is an additive API foundation. [`AudioContext`](crate::context::AudioContext)
-//! does not invoke these traits yet, and render-thread storage remains private. It includes the
-//! internal callback/owner retirement gate and joinable render-reclamation seam. The private B3b
-//! lifecycle controller now owns exact injected callback/endpoint retirement. A public
-//! `AudioContext` constructor, output-factory selection, and authoritative context receipt remain
-//! later integration work.
+//! [`AudioContext::builder`](crate::context::AudioContext::builder) accepts these contracts for an
+//! exact hosted context while render-thread storage and lifecycle proof types remain private. The
+//! system-device adapter remains separate; legacy constructors continue using their established
+//! backend path.
 
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
@@ -55,8 +53,8 @@ impl AudioOutputContextId {
 /// Neutral output facts supplied to an [`AudioOutputFactory`].
 ///
 /// A request is constructed only by this crate. Its fields describe a request; they are not proof
-/// of permission or resource admission. The embedding layer must perform those checks before
-/// future lifecycle integration invokes a factory.
+/// of permission or resource admission. The hosted builder validates these facts before invoking
+/// a factory.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct AudioOutputRequest {
@@ -70,16 +68,11 @@ pub struct AudioOutputRequest {
 }
 
 impl AudioOutputRequest {
-    #[allow(dead_code)] // public AudioContext output-factory wiring remains pending
-    pub(crate) fn new(
-        context_id: AudioOutputContextId,
-        sink_id: impl Into<String>,
+    pub(crate) fn validate_parts(
         requested_sample_rate: Option<f32>,
         number_of_channels: usize,
         latency_hint: AudioContextLatencyCategory,
-        render_size_hint: AudioContextRenderSizeCategory,
-        diagnostic_label: Option<String>,
-    ) -> Result<Self, AudioOutputError> {
+    ) -> Result<(), AudioOutputError> {
         if let Some(sample_rate) = requested_sample_rate {
             if !is_valid_sample_rate(sample_rate) {
                 return Err(AudioOutputError::new(
@@ -103,6 +96,19 @@ impl AudioOutputRequest {
                 ));
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn new(
+        context_id: AudioOutputContextId,
+        sink_id: impl Into<String>,
+        requested_sample_rate: Option<f32>,
+        number_of_channels: usize,
+        latency_hint: AudioContextLatencyCategory,
+        render_size_hint: AudioContextRenderSizeCategory,
+        diagnostic_label: Option<String>,
+    ) -> Result<Self, AudioOutputError> {
+        Self::validate_parts(requested_sample_rate, number_of_channels, latency_hint)?;
 
         Ok(Self {
             context_id,
@@ -115,7 +121,6 @@ impl AudioOutputRequest {
         })
     }
 
-    #[allow(dead_code)] // public AudioContext output-factory wiring remains pending
     pub(crate) fn validate_config(
         &self,
         config: &AudioOutputConfig,
@@ -492,7 +497,7 @@ impl AudioOutputEventSink {
         AudioOutputDeathReason::from_u8(self.state.death_reason.load(Ordering::Acquire))
     }
 
-    #[allow(dead_code)] // private lifecycle/test seam; public AudioContext wiring remains pending
+    #[allow(dead_code)] // hosted lifecycle and lower-level test seam
     pub(crate) fn bounded(capacity: usize) -> (Self, AudioOutputEventWatcher) {
         let (sender, receiver) = crossbeam_channel::bounded(capacity);
         let state = Arc::new(AudioOutputEventState::default());
@@ -548,7 +553,7 @@ const RENDER_GATE_ACTIVE: u8 = 1;
 const RENDER_GATE_CLOSED: u8 = 2;
 const RENDER_GATE_CLOSED_ACTIVE: u8 = RENDER_GATE_CLOSED | RENDER_GATE_ACTIVE;
 
-#[allow(dead_code)] // used by private B3b lifecycle; public AudioContext wiring is pending
+#[allow(dead_code)] // used by hosted and lower-level lifecycle paths
 trait AudioRenderDriver: Send + 'static {
     fn render_interleaved_f32(&mut self, output: &mut [f32]);
 
@@ -672,7 +677,7 @@ impl fmt::Debug for AudioRenderOwner {
     }
 }
 
-#[allow(dead_code)] // used by private B3b lifecycle; public AudioContext wiring is pending
+#[allow(dead_code)] // used by hosted and lower-level lifecycle paths
 impl AudioRenderOwner {
     pub(crate) fn begin_shutdown(&self) {
         if let Some(slot) = &self.slot {
@@ -761,7 +766,7 @@ impl Drop for AudioRenderOwner {
 pub(crate) struct EndpointShutdownConfirmed(());
 
 impl EndpointShutdownConfirmed {
-    #[allow(dead_code)] // constructed by private B3b; public AudioContext wiring is pending
+    #[allow(dead_code)] // constructed by hosted and lower-level lifecycle paths
     pub(crate) const fn new() -> Self {
         Self(())
     }
@@ -1002,7 +1007,8 @@ impl Drop for AudioRenderCallback {
 
 /// Factory for one independently owned logical output per audio context.
 ///
-/// This trait is object-safe. Context construction does not call it yet.
+/// This trait is object-safe and is consumed by
+/// [`AudioContext::builder`](crate::context::AudioContext::builder).
 pub trait AudioOutputFactory: Send + Sync + 'static {
     /// Validates the request, negotiates its logical configuration, and prepares endpoint-owned
     /// resources without starting a render callback.
@@ -1038,6 +1044,88 @@ pub trait PreparedAudioOutput: Send + 'static {
     /// Once this method returns, this endpoint cannot start a callback. The returned future only
     /// awaits cleanup already committed by this call.
     fn abort(self: Box<Self>) -> AudioOutputEndpointShutdown;
+}
+
+/// Single-use prepared endpoint whose negotiated configuration was observed, cloned, and
+/// validated exactly once before any exact graph or callback was constructed.
+///
+/// This remains crate-private so later lifecycle code cannot accidentally re-read a hostile
+/// [`PreparedAudioOutput::config`] implementation after the graph has been configured.
+pub(crate) struct ValidatedPreparedAudioOutput {
+    prepared: Box<dyn PreparedAudioOutput>,
+    config: AudioOutputConfig,
+}
+
+pub(crate) struct ValidatePreparedAudioOutputFailure {
+    pub(crate) error: AudioOutputError,
+    pub(crate) prepared: Box<dyn PreparedAudioOutput>,
+    pub(crate) panicked: bool,
+}
+
+pub(crate) struct ValidatePreparedAudioOutputConfigFailure {
+    pub(crate) error: AudioOutputError,
+    pub(crate) panicked: bool,
+}
+
+impl ValidatedPreparedAudioOutput {
+    fn inspect_once(
+        request: &AudioOutputRequest,
+        prepared: &dyn PreparedAudioOutput,
+    ) -> Result<AudioOutputConfig, ValidatePreparedAudioOutputConfigFailure> {
+        let config = match panic::catch_unwind(AssertUnwindSafe(|| prepared.config().clone())) {
+            Ok(config) => config,
+            Err(payload) => {
+                std::mem::forget(payload);
+                return Err(ValidatePreparedAudioOutputConfigFailure {
+                    error: AudioOutputError::new(
+                        AudioOutputErrorKind::BackendSpecific,
+                        "prepared output panicked while reporting its negotiated configuration",
+                    ),
+                    panicked: true,
+                });
+            }
+        };
+        request.validate_config(&config).map_err(|error| {
+            ValidatePreparedAudioOutputConfigFailure {
+                error,
+                panicked: false,
+            }
+        })?;
+        Ok(config)
+    }
+
+    pub(crate) fn try_new(
+        request: &AudioOutputRequest,
+        prepared: Box<dyn PreparedAudioOutput>,
+    ) -> Result<Self, ValidatePreparedAudioOutputFailure> {
+        let config = match Self::inspect_once(request, &*prepared) {
+            Ok(config) => config,
+            Err(failure) => {
+                return Err(ValidatePreparedAudioOutputFailure {
+                    error: failure.error,
+                    panicked: failure.panicked,
+                    prepared,
+                });
+            }
+        };
+        Ok(Self { prepared, config })
+    }
+
+    pub(crate) const fn config(&self) -> &AudioOutputConfig {
+        &self.config
+    }
+
+    pub(crate) fn into_parts(self) -> (Box<dyn PreparedAudioOutput>, AudioOutputConfig) {
+        (self.prepared, self.config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_prevalidated_for_test(
+        prepared: Box<dyn PreparedAudioOutput>,
+        config: AudioOutputConfig,
+    ) -> Self {
+        Self { prepared, config }
+    }
 }
 
 /// Running endpoint owner, separate from the render callback it installed.
@@ -1110,8 +1198,8 @@ impl Error for AudioOutputStartFailure {
 /// `Ok(())` certifies that the endpoint destroyed the [`AudioRenderCallback`] passed to `start`,
 /// no callback invocation remains in flight, and no future callback invocation can begin. (For a
 /// prepared endpoint that never received a callback, this condition is vacuous.) The future is
-/// intentionally not cloneable and does not certify context shutdown. A later crate-owned
-/// lifecycle controller will retain and poll it, then create an authoritative context receipt
+/// intentionally not cloneable and does not certify context shutdown. The crate-owned hosted
+/// lifecycle controller retains and polls it, then creates an authoritative context receipt
 /// only after render-state reclamation and context-thread joins are also confirmed.
 ///
 /// Each poll must be nonblocking. `Ok(())` additionally confirms retirement of endpoint-owned

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::num::NonZeroU64;
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -64,6 +64,8 @@ pub(crate) enum EventType {
     Message(AudioNodeId),
     Complete,
     AudioProcessing(AudioNodeId),
+    #[cfg(test)]
+    ForceExactThreadExit,
 }
 
 /// The Error Event interface
@@ -144,6 +146,14 @@ impl EventDispatch {
     pub(crate) fn control_batch_activity() -> Self {
         EventDispatch {
             type_: EventType::ControlBatchActivity,
+            payload: EventPayload::None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_exact_thread_exit_for_test() -> Self {
+        EventDispatch {
+            type_: EventType::ForceExactThreadExit,
             payload: EventPayload::None,
         }
     }
@@ -231,16 +241,22 @@ pub(crate) struct EventLoop {
     event_handlers: Arc<Mutex<HashMap<EventType, EventHandler>>>,
     event_activity_handler: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
     clear_handlers_on_confirmed_stop: bool,
+    exact_live_handler_panic: Arc<Mutex<Option<Box<dyn Any + Send + 'static>>>>,
 }
 
 /// Single-use setup authority for one injected context's exact event channel.
 ///
 /// The raw sender, receiver-owning thread, and identity cannot be separated. Only the injected
 /// render initializer may consume this value and derive the render, admitted-control, and
-/// lifecycle branches. No branch exposes a raw sender or receiver.
+/// lifecycle branches. No branch exposes a raw sender or receiver. The shared event-thread latch
+/// is authoritative once false; a producer which raced after reading true may leave one bounded
+/// record for confirmed post-join cleanup, while scheduled-source completion and context state
+/// remain authoritative independently of best-effort event delivery.
 pub(crate) struct InjectedEventDispatchSetup {
     sender: Sender<EventDispatch>,
     event_loop: JoinableEventLoop,
+    retirement_event_recv: Receiver<EventDispatch>,
+    event_thread_alive: Arc<AtomicBool>,
     handlers: Arc<Mutex<HashMap<EventType, EventHandler>>>,
     activity: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
     identity: Arc<()>,
@@ -360,6 +376,8 @@ pub(crate) struct InjectedControlEventDispatch {
     state: InjectedContextState,
     handlers: Arc<Mutex<HashMap<EventType, EventHandler>>>,
     activity: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
+    event_thread_id: std::thread::ThreadId,
+    event_thread_alive: Arc<AtomicBool>,
     #[cfg(test)]
     after_admission: Arc<Mutex<Option<Arc<AfterAdmissionObserver>>>>,
     #[cfg(test)]
@@ -367,6 +385,10 @@ pub(crate) struct InjectedControlEventDispatch {
 }
 
 impl InjectedControlEventDispatch {
+    pub(crate) const fn event_thread_id(&self) -> std::thread::ThreadId {
+        self.event_thread_id
+    }
+
     pub(crate) fn matches_gate(&self, gate: &InjectedContextAdmissionGate) -> bool {
         self.gate.ptr_eq(gate)
     }
@@ -407,6 +429,10 @@ impl InjectedControlEventDispatch {
         #[cfg(test)]
         if let Some(observer) = self.after_admission.lock().unwrap().clone() {
             observer();
+        }
+        if !self.event_thread_alive.load(Ordering::Acquire) {
+            drop(admission);
+            return Err(InjectedControlEventSendError::Disconnected);
         }
         let outcome = match self.sender.try_send(make_event()) {
             Ok(()) => Ok(()),
@@ -486,8 +512,16 @@ impl InjectedControlEventDispatch {
         &self,
         key: ExactEndedEventKey,
         callback: EventHandler,
-    ) -> Result<(), AdmissionError> {
-        let admission = self.gate.try_external_event()?;
+    ) -> Result<(), InjectedEventHandlerInstallError> {
+        let admission = self
+            .gate
+            .try_external_event()
+            .map_err(InjectedEventHandlerInstallError::Admission)?;
+        if !self.event_thread_alive.load(Ordering::Acquire) {
+            drop(admission);
+            drop(callback);
+            return Err(InjectedEventHandlerInstallError::EventThreadExited);
+        }
         let previous = self
             .handlers
             .lock()
@@ -509,23 +543,73 @@ impl InjectedControlEventDispatch {
         drop(previous);
     }
 
-    pub(crate) fn set_handler(&self, event: EventType, callback: EventHandler) {
-        self.handlers.lock().unwrap().insert(event, callback);
+    pub(crate) fn try_set_handler(
+        &self,
+        event: EventType,
+        callback: EventHandler,
+    ) -> Result<(), InjectedEventHandlerInstallError> {
+        let admission = self
+            .gate
+            .try_external_event()
+            .map_err(InjectedEventHandlerInstallError::Admission)?;
+        if !self.event_thread_alive.load(Ordering::Acquire) {
+            drop(admission);
+            drop(callback);
+            return Err(InjectedEventHandlerInstallError::EventThreadExited);
+        }
+        let previous = self
+            .handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(event, callback);
+        drop(admission);
+        drop(previous);
+        Ok(())
     }
 
     pub(crate) fn clear_handler(&self, event: EventType) {
-        self.handlers.lock().unwrap().remove(&event);
+        let previous = self
+            .handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&event);
+        drop(previous);
     }
 
-    pub(crate) fn set_activity_handler<F>(&self, callback: F)
+    pub(crate) fn try_set_activity_handler<F>(
+        &self,
+        callback: F,
+    ) -> Result<(), InjectedEventHandlerInstallError>
     where
         F: Fn() + Send + Sync + 'static,
     {
-        *self.activity.lock().unwrap() = Some(Arc::new(callback));
+        let callback = Arc::new(callback);
+        let admission = self
+            .gate
+            .try_external_event()
+            .map_err(InjectedEventHandlerInstallError::Admission)?;
+        if !self.event_thread_alive.load(Ordering::Acquire) {
+            drop(admission);
+            drop(callback);
+            return Err(InjectedEventHandlerInstallError::EventThreadExited);
+        }
+        let previous = self
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(callback);
+        drop(admission);
+        drop(previous);
+        Ok(())
     }
 
     pub(crate) fn clear_activity_handler(&self) {
-        self.activity.lock().unwrap().take();
+        let previous = self
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(previous);
     }
 
     #[cfg(test)]
@@ -547,8 +631,15 @@ pub(crate) enum InjectedControlEventSendError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedEventHandlerInstallError {
+    EventThreadExited,
+    Admission(AdmissionError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InjectedExactEndedHandlerError {
     Inactive,
+    EventThreadExited,
     Admission(AdmissionError),
 }
 
@@ -608,7 +699,14 @@ impl InjectedExactEndedEventTarget {
         }
         self.events
             .try_set_exact_ended_handler(self.key, callback)
-            .map_err(InjectedExactEndedHandlerError::Admission)
+            .map_err(|error| match error {
+                InjectedEventHandlerInstallError::EventThreadExited => {
+                    InjectedExactEndedHandlerError::EventThreadExited
+                }
+                InjectedEventHandlerInstallError::Admission(error) => {
+                    InjectedExactEndedHandlerError::Admission(error)
+                }
+            })
     }
 
     pub(crate) fn clear_handler(&self) {
@@ -619,8 +717,58 @@ impl InjectedExactEndedEventTarget {
 /// Sole event-consumer retirement authority paired with the exact injected state.
 pub(crate) struct InjectedLifecycleEventLoop {
     event_loop: Option<JoinableEventLoop>,
+    retirement_cleanup: Option<InjectedEventRetirementCleanup>,
     identity: Arc<()>,
     state: InjectedContextState,
+}
+
+/// Fail-closed post-join ownership of one exact event loop's retained callbacks and queue.
+///
+/// Confirmed graph retirement proves every producer quiescent. Once the event thread has also
+/// exited, this owner independently clears storage even when the thread exited before its normal
+/// stop path. Ordinary Drop quarantines the storage instead: no unconfirmed path may destroy
+/// callback or queued-payload resources while a producer could remain live.
+struct InjectedEventRetirementCleanup {
+    event_recv: Option<Receiver<EventDispatch>>,
+    handlers: Option<Arc<Mutex<HashMap<EventType, EventHandler>>>>,
+    activity: Option<Arc<Mutex<Option<Arc<EventActivityHandler>>>>>,
+}
+
+impl InjectedEventRetirementCleanup {
+    fn new(
+        event_recv: Receiver<EventDispatch>,
+        handlers: Arc<Mutex<HashMap<EventType, EventHandler>>>,
+        activity: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
+    ) -> Self {
+        Self {
+            event_recv: Some(event_recv),
+            handlers: Some(handlers),
+            activity: Some(activity),
+        }
+    }
+
+    fn retire_confirmed(mut self) -> Option<Box<dyn Any + Send + 'static>> {
+        let event_recv = self.event_recv.take().unwrap();
+        let handlers = self.handlers.take().unwrap();
+        let activity = self.activity.take().unwrap();
+        let mut first_panic = None;
+        clear_exact_event_storage(&event_recv, &handlers, &activity, &mut first_panic);
+        first_panic
+    }
+}
+
+impl Drop for InjectedEventRetirementCleanup {
+    fn drop(&mut self) {
+        if let Some(event_recv) = self.event_recv.take() {
+            std::mem::forget(event_recv);
+        }
+        if let Some(handlers) = self.handlers.take() {
+            std::mem::forget(handlers);
+        }
+        if let Some(activity) = self.activity.take() {
+            std::mem::forget(activity);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -673,10 +821,17 @@ impl InjectedLifecycleEventLoop {
         } else {
             event_loop.request_terminal_closed_stop();
         }
+        let joined = event_loop.join();
+        let cleanup_panic = if matches!(&joined, Err(EventLoopJoinError::CurrentThread)) {
+            None
+        } else {
+            self.retirement_cleanup.take().unwrap().retire_confirmed()
+        };
         Ok(InjectedConfirmedEventRetirement {
             state: outcome,
             graceful: effective_graceful,
-            joined: event_loop.join(),
+            joined,
+            cleanup_panic,
         })
     }
 }
@@ -685,6 +840,7 @@ pub(crate) struct InjectedConfirmedEventRetirement {
     pub(crate) state: InjectedTerminalStateOutcome,
     pub(crate) graceful: bool,
     pub(crate) joined: Result<EventLoopExit, EventLoopJoinError>,
+    pub(crate) cleanup_panic: Option<Box<dyn Any + Send + 'static>>,
 }
 
 impl Drop for InjectedLifecycleEventLoop {
@@ -740,10 +896,17 @@ impl InjectedEventDispatchSetup {
         let gate = control.event_admission_gate();
         let initially_suspended = control.initially_suspended();
         let state = InjectedContextState::new(initially_suspended);
+        let event_thread_id = self.event_loop.thread_id();
+        let retirement_cleanup = InjectedEventRetirementCleanup::new(
+            self.retirement_event_recv,
+            Arc::clone(&self.handlers),
+            Arc::clone(&self.activity),
+        );
         BoundInjectedEventDispatch {
             render: InjectedEventDispatchSender::from_event_setup(
                 self.sender.clone(),
                 Arc::clone(&self.identity),
+                Arc::clone(&self.event_thread_alive),
             ),
             control: InjectedControlEventDispatch {
                 sender: self.sender,
@@ -753,6 +916,8 @@ impl InjectedEventDispatchSetup {
                 state: state.clone(),
                 handlers: self.handlers,
                 activity: self.activity,
+                event_thread_id,
+                event_thread_alive: self.event_thread_alive,
                 #[cfg(test)]
                 after_admission: Arc::new(Mutex::new(None)),
                 #[cfg(test)]
@@ -760,6 +925,7 @@ impl InjectedEventDispatchSetup {
             },
             lifecycle: InjectedLifecycleEventLoop {
                 event_loop: Some(self.event_loop),
+                retirement_cleanup: Some(retirement_cleanup),
                 identity: self.identity,
                 state: state.clone(),
             },
@@ -777,7 +943,7 @@ enum EventLoopStop {
 
 /// Confirmed reason that a lifecycle-owned event-loop thread exited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // consumed by the private lifecycle; public AudioContext wiring is pending
+#[allow(dead_code)] // also retained for lower-level lifecycle failure tests
 pub(crate) enum EventLoopExit {
     /// Queued records were drained and one final `Closed` state change was dispatched.
     Graceful,
@@ -788,7 +954,7 @@ pub(crate) enum EventLoopExit {
 }
 
 /// Join failure for the lifecycle-owned event-loop thread.
-#[allow(dead_code)] // consumed by the private lifecycle; public AudioContext wiring is pending
+#[allow(dead_code)] // also retained for lower-level lifecycle failure tests
 pub(crate) enum EventLoopJoinError {
     /// Joining the current thread would deadlock.
     CurrentThread,
@@ -817,15 +983,16 @@ impl std::fmt::Debug for EventLoopJoinError {
 /// from this event thread remains or can begin. A successful join does not prove destruction of
 /// handlers or queued payloads retained by other [`EventLoop`] or receiver clones. This owner is
 /// `Send`, so a lifecycle worker may request stop and move it to a different thread for the join.
-#[allow(dead_code)] // consumed by the private lifecycle; public AudioContext wiring is pending
+#[allow(dead_code)] // also retained for lower-level lifecycle failure tests
 pub(crate) struct JoinableEventLoop {
     stop_send: crossbeam_channel::Sender<EventLoopStop>,
     join: Option<JoinHandle<Result<EventLoopExit, EventLoopJoinError>>>,
     stop_requested: bool,
+    event_thread_alive: Option<Arc<AtomicBool>>,
 }
 
 /// Creates the inseparable injected event setup without exposing a raw producer or consumer.
-#[allow(dead_code)] // selected by the pending private injected AudioContext constructor
+#[allow(dead_code)] // selected by the hosted builder and exact lifecycle tests
 pub(crate) fn injected_event_dispatch_setup() -> std::io::Result<InjectedEventDispatchSetup> {
     let (sender, receiver) = crossbeam_channel::bounded(INJECTED_EVENT_QUEUE_CAPACITY);
     let event_loop = EventLoop::new(receiver);
@@ -862,12 +1029,21 @@ fn finish_injected_event_dispatch_setup(
     event_loop: EventLoop,
 ) -> std::io::Result<InjectedEventDispatchSetup> {
     let identity = Arc::new(());
+    let retirement_event_recv = event_loop.event_recv.clone();
     let handlers = Arc::clone(&event_loop.event_handlers);
     let activity = Arc::clone(&event_loop.event_activity_handler);
     let event_loop = event_loop.run_joinable_exact()?;
+    let event_thread_alive = Arc::clone(
+        event_loop
+            .event_thread_alive
+            .as_ref()
+            .expect("exact joinable event loop owns an alive latch"),
+    );
     Ok(InjectedEventDispatchSetup {
         sender,
         event_loop,
+        retirement_event_recv,
+        event_thread_alive,
         handlers,
         activity,
         identity,
@@ -875,8 +1051,15 @@ fn finish_injected_event_dispatch_setup(
     })
 }
 
-#[allow(dead_code)] // consumed by private B3b lifecycle; public AudioContext wiring is pending
+#[allow(dead_code)] // consumed by hosted and lower-level lifecycle paths
 impl JoinableEventLoop {
+    fn thread_id(&self) -> std::thread::ThreadId {
+        self.join
+            .as_ref()
+            .expect("joinable event loop owns one thread handle")
+            .thread()
+            .id()
+    }
     /// Requests an ordered graceful stop.
     ///
     /// Render and control producers must already be quiescent. The event thread drains records
@@ -946,6 +1129,60 @@ impl Drop for JoinableEventLoop {
     }
 }
 
+fn remember_first_cleanup_panic(
+    first_panic: &mut Option<Box<dyn Any + Send + 'static>>,
+    payload: Box<dyn Any + Send + 'static>,
+) {
+    if first_panic.is_none() {
+        *first_panic = Some(payload);
+    } else {
+        std::mem::forget(payload);
+    }
+}
+
+fn clear_exact_event_storage(
+    event_recv: &Receiver<EventDispatch>,
+    event_handlers: &Arc<Mutex<HashMap<EventType, EventHandler>>>,
+    event_activity_handler: &Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
+    first_panic: &mut Option<Box<dyn Any + Send + 'static>>,
+) {
+    // Producer quiescence makes every remaining record dead. Contain each payload destructor so
+    // one hostile value cannot strand the rest or unwind through lifecycle ownership.
+    while let Ok(event) = event_recv.try_recv() {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(event)))
+        {
+            remember_first_cleanup_panic(first_panic, payload);
+        }
+    }
+
+    let mut handlers = {
+        let mut handlers = event_handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *handlers)
+    };
+    for (_, handler) in handlers.drain() {
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(handler)))
+        {
+            remember_first_cleanup_panic(first_panic, payload);
+        }
+    }
+    drop(handlers);
+
+    let activity = event_activity_handler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(activity) = activity {
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(activity)))
+        {
+            remember_first_cleanup_panic(first_panic, payload);
+        }
+    }
+}
+
 impl EventLoop {
     pub fn new(event_recv: Receiver<EventDispatch>) -> Self {
         Self {
@@ -953,6 +1190,29 @@ impl EventLoop {
             event_handlers: Default::default(),
             event_activity_handler: Default::default(),
             clear_handlers_on_confirmed_stop: false,
+            exact_live_handler_panic: Default::default(),
+        }
+    }
+
+    fn remember_exact_live_handler_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+        let mut first = self
+            .exact_live_handler_panic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if first.is_none() {
+            *first = Some(payload);
+        } else {
+            std::mem::forget(payload);
+        }
+    }
+
+    fn handle_exact_live_event(&self, event: EventDispatch) -> ControlFlow<()> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle_event(event))) {
+            Ok(result) => result,
+            Err(payload) => {
+                self.remember_exact_live_handler_panic(payload);
+                ControlFlow::Continue(())
+            }
         }
     }
 
@@ -1039,29 +1299,46 @@ impl EventLoop {
     /// Starts a lifecycle-owned event thread that can be stopped and explicitly joined.
     ///
     /// This is separate from [`Self::run_in_thread`], whose detached legacy behavior is preserved.
-    #[allow(dead_code)] // consumed by the private lifecycle; public AudioContext wiring is pending
+    #[allow(dead_code)] // consumed by hosted and lower-level lifecycle paths
     pub(crate) fn run_joinable(&self) -> std::io::Result<JoinableEventLoop> {
-        self.run_joinable_inner(false)
+        self.run_joinable_inner(false, None)
     }
 
     fn run_joinable_exact(&self) -> std::io::Result<JoinableEventLoop> {
-        self.run_joinable_inner(true)
+        let event_thread_alive = Arc::new(AtomicBool::new(true));
+        self.run_joinable_inner(true, Some(Arc::clone(&event_thread_alive)))
     }
 
     fn run_joinable_inner(
         &self,
         clear_handlers_on_confirmed_stop: bool,
+        event_thread_alive: Option<Arc<AtomicBool>>,
     ) -> std::io::Result<JoinableEventLoop> {
         let (stop_send, stop_recv) = crossbeam_channel::bounded(1);
         let mut event_loop = self.clone();
         event_loop.clear_handlers_on_confirmed_stop = clear_handlers_on_confirmed_stop;
+        let event_thread_alive_for_thread = event_thread_alive.clone();
         let join = std::thread::Builder::new()
             .name("web-audio-event-loop".to_owned())
-            .spawn(move || event_loop.run_with_stop(stop_recv))?;
+            .spawn(move || {
+                struct EventThreadAliveGuard(Option<Arc<AtomicBool>>);
+
+                impl Drop for EventThreadAliveGuard {
+                    fn drop(&mut self) {
+                        if let Some(alive) = &self.0 {
+                            alive.store(false, Ordering::Release);
+                        }
+                    }
+                }
+
+                let _alive = EventThreadAliveGuard(event_thread_alive_for_thread);
+                event_loop.run_with_stop(stop_recv)
+            })?;
         Ok(JoinableEventLoop {
             stop_send,
             join: Some(join),
             stop_requested: false,
+            event_thread_alive,
         })
     }
 
@@ -1101,10 +1378,20 @@ impl EventLoop {
                 recv(self.event_recv) -> event => {
                     match event {
                         Ok(event) => {
+                            #[cfg(test)]
+                            if matches!(&event.type_, EventType::ForceExactThreadExit) {
+                                return Err(EventLoopJoinError::Panicked(Box::new(
+                                    "forced exact event-thread exit",
+                                )));
+                            }
                             // A lossy real Closed record is not lifecycle authority. Coalesce it
                             // and keep draining until the reliable stop channel selects a mode.
                             if !event.is_closed_state_change() {
-                                let result = self.handle_event(event);
+                                let result = if self.clear_handlers_on_confirmed_stop {
+                                    self.handle_exact_live_event(event)
+                                } else {
+                                    self.handle_event(event)
+                                };
                                 debug_assert!(result.is_continue());
                             }
                         }
@@ -1118,6 +1405,11 @@ impl EventLoop {
     fn finish_stop(&self, stop: EventLoopStop) -> EventLoopExit {
         let clear_handlers =
             self.clear_handlers_on_confirmed_stop && !matches!(stop, EventLoopStop::Silent);
+        let mut first_panic = self
+            .exact_live_handler_panic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match stop {
             EventLoopStop::Silent => EventLoopExit::Silent,
             EventLoopStop::TerminalClosed => {
@@ -1154,9 +1446,16 @@ impl EventLoop {
                 EventLoopExit::Graceful
             }
         }));
-        let (exit, mut first_panic) = match dispatch {
-            Ok(exit) => (Some(exit), None),
-            Err(payload) => (None, Some(payload)),
+        let exit = match dispatch {
+            Ok(exit) => Some(exit),
+            Err(payload) => {
+                if first_panic.is_none() {
+                    first_panic = Some(payload);
+                } else {
+                    std::mem::forget(payload);
+                }
+                None
+            }
         };
 
         // Confirmed producer quiescence makes the event thread the final owner allowed to touch
@@ -1164,55 +1463,12 @@ impl EventLoop {
         // every dead exact callback before publishing thread retirement. Destructors run outside
         // the mutex; a hostile destructor panic is reported by JoinableEventLoop::join.
         if clear_handlers {
-            // A queued handler or the final Closed handler may have panicked before the dispatch
-            // closure drained the channel. Producer quiescence makes the remaining records dead;
-            // contain each payload destructor independently so one panic cannot strand the rest.
-            while let Ok(event) = self.event_recv.try_recv() {
-                if let Err(payload) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(event)))
-                {
-                    if first_panic.is_none() {
-                        first_panic = Some(payload);
-                    } else {
-                        std::mem::forget(payload);
-                    }
-                }
-            }
-            let mut handlers = {
-                let mut handlers = self
-                    .event_handlers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                std::mem::take(&mut *handlers)
-            };
-            for (_, handler) in handlers.drain() {
-                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drop(handler);
-                })) {
-                    if first_panic.is_none() {
-                        first_panic = Some(payload);
-                    } else {
-                        std::mem::forget(payload);
-                    }
-                }
-            }
-            drop(handlers);
-            let activity = self
-                .event_activity_handler
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(activity) = activity {
-                if let Err(payload) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(activity)))
-                {
-                    if first_panic.is_none() {
-                        first_panic = Some(payload);
-                    } else {
-                        std::mem::forget(payload);
-                    }
-                }
-            }
+            clear_exact_event_storage(
+                &self.event_recv,
+                &self.event_handlers,
+                &self.event_activity_handler,
+                &mut first_panic,
+            );
         }
         if let Some(payload) = first_panic {
             std::panic::resume_unwind(payload);
@@ -1244,6 +1500,7 @@ impl EventLoop {
 mod tests {
     use std::cell::Cell;
     use std::num::NonZeroU64;
+    use std::panic::{self, AssertUnwindSafe};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1571,6 +1828,8 @@ mod tests {
             state: InjectedContextState::new_for_test(false),
             handlers: Arc::new(Mutex::new(HashMap::new())),
             activity: Arc::new(Mutex::new(None)),
+            event_thread_id: std::thread::current().id(),
+            event_thread_alive: Arc::new(AtomicBool::new(true)),
             after_admission: Arc::new(Mutex::new(None)),
             nonce_source_for_test: Arc::new(Mutex::new(None)),
         };
@@ -1601,6 +1860,94 @@ mod tests {
         release_send.send(()).unwrap();
         replace.join().unwrap().unwrap();
         assert!(drained_before_old_drop);
+    }
+
+    #[test]
+    fn exact_generic_clear_destroys_reentrant_and_panicking_callbacks_off_lock() {
+        struct ReenterOnDrop {
+            control: InjectedControlEventDispatch,
+            activity: bool,
+        }
+
+        impl Drop for ReenterOnDrop {
+            fn drop(&mut self) {
+                if self.activity {
+                    self.control.clear_handler(EventType::StateChange);
+                } else {
+                    self.control.clear_activity_handler();
+                }
+            }
+        }
+
+        struct PanicOnDrop;
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("hostile exact callback destructor");
+            }
+        }
+
+        let gate = InjectedContextAdmissionGate::new();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let control = InjectedControlEventDispatch {
+            sender,
+            identity: Arc::new(()),
+            context_nonce: Arc::new(AtomicU64::new(1)),
+            gate,
+            state: InjectedContextState::new_for_test(false),
+            handlers: Arc::new(Mutex::new(HashMap::new())),
+            activity: Arc::new(Mutex::new(None)),
+            event_thread_id: std::thread::current().id(),
+            event_thread_alive: Arc::new(AtomicBool::new(true)),
+            after_admission: Arc::new(Mutex::new(None)),
+            nonce_source_for_test: Arc::new(Mutex::new(None)),
+        };
+
+        control
+            .try_set_handler(EventType::StateChange, EventHandler::Once(Box::new(|_| {})))
+            .unwrap();
+        let reenter = ReenterOnDrop {
+            control: control.clone(),
+            activity: true,
+        };
+        control
+            .try_set_handler(
+                EventType::SinkChange,
+                EventHandler::Once(Box::new(move |_| {
+                    let _ = &reenter;
+                })),
+            )
+            .unwrap();
+        control.clear_handler(EventType::SinkChange);
+
+        let reenter = ReenterOnDrop {
+            control: control.clone(),
+            activity: false,
+        };
+        control
+            .try_set_activity_handler(move || {
+                let _ = &reenter;
+            })
+            .unwrap();
+        control.clear_activity_handler();
+
+        let panic_probe = PanicOnDrop;
+        control
+            .try_set_handler(
+                EventType::SinkChange,
+                EventHandler::Once(Box::new(move |_| {
+                    let _ = &panic_probe;
+                })),
+            )
+            .unwrap();
+        assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+            control.clear_handler(EventType::SinkChange);
+        }))
+        .is_err());
+        // The map mutex was released before the hostile destructor ran, so it remains usable.
+        control
+            .try_set_handler(EventType::SinkChange, EventHandler::Once(Box::new(|_| {})))
+            .unwrap();
+        control.clear_handler(EventType::SinkChange);
     }
 
     #[test]

@@ -60,6 +60,14 @@ pub use offline::*;
 mod online;
 pub use online::*;
 
+mod hosted;
+pub use hosted::{
+    AudioContextBuildError, AudioContextBuildErrorKind, AudioContextBuilder,
+    AudioContextLifecycleError, AudioContextShutdownIssue, AudioContextShutdownIssueKind,
+    AudioContextShutdownMode, AudioContextShutdownOutcome, AudioContextShutdownReceipt,
+    AudioContextShutdownReport, AudioContextStateChangeOutcome, AudioContextStateChangeReceipt,
+};
+
 mod output_lifecycle;
 
 #[cfg(test)]

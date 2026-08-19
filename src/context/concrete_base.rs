@@ -218,7 +218,7 @@ impl ControlEventDispatch {
         outcome
     }
 
-    #[allow(dead_code)] // selected by pending private injected-context assembly
+    #[allow(dead_code)] // selected by hosted and lower-level exact assembly
     fn exact(events: InjectedControlEventDispatch) -> Self {
         Self {
             mode: ControlEventDispatchMode::Exact(events),
@@ -373,13 +373,13 @@ struct ConcreteBaseAudioContextInner {
     control_events: ControlEventDispatch,
 }
 
-#[allow(dead_code)] // exact variant is selected by pending private injected-context assembly
+#[allow(dead_code)] // exact variant is selected by hosted assembly
 enum ConcreteContextState {
     Legacy(Arc<AtomicU8>),
     Injected,
 }
 
-#[allow(dead_code)] // exact variant is selected by pending private injected-context assembly
+#[allow(dead_code)] // exact variant is selected by hosted assembly
 enum ConcreteEventHandlers {
     Legacy(EventLoop),
     Injected(InjectedControlEventDispatch),
@@ -857,9 +857,9 @@ impl ConcreteBaseAudioContext {
     /// Private production boundary for concrete nodes built exclusively through the branded
     /// injected transaction. It deliberately does not create destination/listener graph nodes and
     /// cannot provide legacy graph mutation APIs. Destination and read-only context properties
-    /// remain callable, but listener creation, other node constructors, explicit connections, and
-    /// post-construction automation panic instead of falling back to a raw sender. A complete
-    /// injected AudioContext is deferred, and no public path can select this base in this slice.
+    /// remain callable, but unsupported node constructors and broad automation panic instead of
+    /// falling back to a raw sender. The public hosted builder selects the fully magic-initialized
+    /// form of this base; this raw constructor remains test-only.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_injected_node_construction_base(
@@ -895,8 +895,18 @@ impl ConcreteBaseAudioContext {
         match &self.inner.graph_control {
             ConcreteGraphControl::Legacy(graph) => graph,
             ConcreteGraphControl::Injected(_) => {
-                panic!("legacy graph mutation is unavailable on an injected construction base")
+                panic!(
+                    "NotSupportedError - this operation is unavailable on an exact hosted AudioContext"
+                )
             }
+        }
+    }
+
+    pub(crate) fn reject_exact_channel_config_mutation(&self) {
+        if matches!(self.inner.graph_control, ConcreteGraphControl::Injected(_)) {
+            panic!(
+                "NotSupportedError - channel configuration mutation is unavailable on an exact hosted AudioContext"
+            );
         }
     }
 
@@ -912,6 +922,11 @@ impl ConcreteBaseAudioContext {
             ConcreteEventHandlers::Legacy(_) => None,
             ConcreteEventHandlers::Injected(events) => Some(events),
         }
+    }
+
+    pub(crate) fn injected_event_thread_id(&self) -> Option<std::thread::ThreadId> {
+        self.injected_events()
+            .map(InjectedControlEventDispatch::event_thread_id)
     }
 
     pub(crate) fn try_begin_injected_oscillator(
@@ -1088,7 +1103,13 @@ impl ConcreteBaseAudioContext {
             ConcreteEventHandlers::Legacy(event_loop) => {
                 event_loop.set_activity_handler(callback);
             }
-            ConcreteEventHandlers::Injected(events) => events.set_activity_handler(callback),
+            ConcreteEventHandlers::Injected(events) => {
+                if let Err(error) = events.try_set_activity_handler(callback) {
+                    panic!(
+                        "InvalidStateError - exact event activity handler admission failed: {error:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -1456,7 +1477,11 @@ impl ConcreteBaseAudioContext {
     pub(crate) fn set_event_handler(&self, event: EventType, callback: EventHandler) {
         match &self.inner.event_handlers {
             ConcreteEventHandlers::Legacy(event_loop) => event_loop.set_handler(event, callback),
-            ConcreteEventHandlers::Injected(events) => events.set_handler(event, callback),
+            ConcreteEventHandlers::Injected(events) => {
+                if let Err(error) = events.try_set_handler(event, callback) {
+                    panic!("InvalidStateError - exact event handler admission failed: {error:?}");
+                }
+            }
         }
     }
 

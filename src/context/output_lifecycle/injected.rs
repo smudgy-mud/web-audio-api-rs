@@ -3,9 +3,15 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread::JoinHandle;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_PRESPAWN_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_PRESPAWN_TRANSFER_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 use super::*;
 use crate::context::injected_admission::GraphControlAdmission;
@@ -24,9 +30,279 @@ use crate::events::{
     InjectedConfirmedEventRetirement, InjectedLifecycleEventLoop, InjectedTerminalStateOutcome,
 };
 use crate::message::GraphLifecycleTransition;
-use crate::output::{AudioOutputEventSink, AudioOutputStartFailure, PreparedAudioOutput};
+use crate::output::{
+    AudioOutputEventSink, AudioOutputStartFailure, PreparedAudioOutput,
+    ValidatedPreparedAudioOutput,
+};
 
 const OPEN_DRIVE_BUDGET: usize = 32;
+
+struct PreSpawnedLifecycleWorker {
+    job_send: Option<Sender<Box<dyn FnOnce() + Send + 'static>>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl PreSpawnedLifecycleWorker {
+    fn try_new() -> io::Result<Self> {
+        let (job_send, job_recv) =
+            crossbeam_channel::bounded::<Box<dyn FnOnce() + Send + 'static>>(1);
+        let worker = thread::Builder::new()
+            .name("web-audio-output-lifecycle".to_owned())
+            .spawn(move || {
+                if let Ok(job) = job_recv.recv() {
+                    job();
+                }
+            })?;
+        Ok(Self {
+            job_send: Some(job_send),
+            worker: Mutex::new(Some(worker)),
+        })
+    }
+}
+
+impl LifecycleWorkerSpawner for PreSpawnedLifecycleWorker {
+    fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) -> io::Result<JoinHandle<()>> {
+        #[cfg(test)]
+        if FAIL_NEXT_PRESPAWN_TRANSFER_FOR_TEST.replace(false) {
+            drop(job);
+            return Err(io::Error::other(
+                "forced pre-spawned lifecycle ownership-transfer failure",
+            ));
+        }
+        let Some(job_send) = self.job_send.as_ref() else {
+            return Err(io::Error::other(
+                "pre-spawned lifecycle worker already consumed",
+            ));
+        };
+        job_send.send(job).map_err(|error| {
+            // The job owns only empty bootstrap receivers; exact resources remain with the
+            // caller until its subsequent bootstrap send succeeds.
+            drop(error.0);
+            io::Error::other("pre-spawned lifecycle worker retired before job transfer")
+        })?;
+        self.worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| io::Error::other("pre-spawned lifecycle worker handle was consumed"))
+    }
+}
+
+impl Drop for PreSpawnedLifecycleWorker {
+    fn drop(&mut self) {
+        self.job_send.take();
+        if let Some(worker) = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Empty lifecycle-thread owner created before a host factory is invoked or a callback can start.
+pub(crate) struct InjectedOutputWorkerBootstrap {
+    spawner: PreSpawnedLifecycleWorker,
+}
+
+impl InjectedOutputWorkerBootstrap {
+    pub(crate) fn try_new() -> io::Result<Self> {
+        #[cfg(test)]
+        if FAIL_NEXT_PRESPAWN_FOR_TEST.replace(false) {
+            return Err(io::Error::other(
+                "forced pre-spawn lifecycle worker failure",
+            ));
+        }
+        Ok(Self {
+            spawner: PreSpawnedLifecycleWorker::try_new()?,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_spawn_for_test() {
+        FAIL_NEXT_PRESPAWN_FOR_TEST.set(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_transfer_for_test() {
+        FAIL_NEXT_PRESPAWN_TRANSFER_FOR_TEST.set(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_fallback_spawn_for_test() {
+        super::fail_next_thread_spawn_for_test();
+    }
+
+    pub(crate) fn start(
+        self,
+        prepared: ValidatedPreparedAudioOutput,
+        renderer: MagicInitializedInjectedOutputRenderer,
+        events: AudioOutputEventSink,
+        output_events: AudioOutputEventWatcher,
+    ) -> Result<InjectedOutputStart, Box<InjectedOutputStartFailure>> {
+        start_validated_injected_output_with_spawner(
+            prepared,
+            renderer,
+            events,
+            output_events,
+            &self.spawner,
+        )
+    }
+
+    pub(crate) fn abort_prepared(
+        self,
+        prepared: Box<dyn PreparedAudioOutput>,
+    ) -> OutputShutdownReceipt {
+        match start_prepared_abort_worker(prepared, &self.spawner) {
+            Ok(receipt) => receipt,
+            Err(prepared) => match start_prepared_abort_worker(prepared, &ThreadSpawner) {
+                Ok(receipt) => receipt,
+                Err(prepared) => {
+                    // No executor exists which can safely poll a potentially hostile shutdown
+                    // future. Retain the Prepared owner permanently rather than running ordinary
+                    // Drop, and publish an honest terminal observation immediately.
+                    std::mem::forget(prepared);
+                    let (completer, receipt) = shutdown_receipt_pair();
+                    completer.complete(OutputShutdownOutcome::Unconfirmed {
+                        failure: OutputShutdownIssue::new(
+                            OutputShutdownIssueKind::WorkerSpawnFailed,
+                            "no lifecycle worker was available to abort prepared output",
+                        ),
+                        event_issue: None,
+                    });
+                    receipt
+                }
+            },
+        }
+    }
+}
+
+fn start_prepared_abort_worker(
+    prepared: Box<dyn PreparedAudioOutput>,
+    spawner: &dyn LifecycleWorkerSpawner,
+) -> Result<OutputShutdownReceipt, Box<dyn PreparedAudioOutput>> {
+    let (bootstrap_send, bootstrap_recv) = crossbeam_channel::bounded(1);
+    let (completer, receipt) = shutdown_receipt_pair();
+    let job = Box::new(move || prepared_abort_worker(bootstrap_recv, completer));
+    let _worker = match spawner.spawn(job) {
+        Ok(worker) => worker,
+        Err(_) => return Err(prepared),
+    };
+    match bootstrap_send.send(prepared) {
+        Ok(()) => Ok(receipt),
+        Err(error) => Err(error.0),
+    }
+}
+
+fn prepared_abort_worker(
+    bootstrap: Receiver<Box<dyn PreparedAudioOutput>>,
+    completer: OutputShutdownCompleter,
+) {
+    let outcome = match bootstrap.recv() {
+        Ok(prepared) => match panic::catch_unwind(AssertUnwindSafe(|| prepared.abort())) {
+            Ok(shutdown) => match drive_prepared_abort(shutdown) {
+                PreparedAbortDriveOutcome::Confirmed => {
+                    OutputShutdownOutcome::Confirmed(OutputShutdownReport {
+                        mode: OutputShutdownMode::Silent,
+                        endpoint_death: None,
+                        reclaim_issue: None,
+                        event_issue: None,
+                    })
+                }
+                PreparedAbortDriveOutcome::Rejected(error) => OutputShutdownOutcome::Unconfirmed {
+                    failure: issue_from_audio_error(
+                        OutputShutdownIssueKind::EndpointRejectedShutdown,
+                        error,
+                    ),
+                    event_issue: None,
+                },
+                PreparedAbortDriveOutcome::Panicked => OutputShutdownOutcome::Unconfirmed {
+                    failure: OutputShutdownIssue::new(
+                        OutputShutdownIssueKind::EndpointFuturePanicked,
+                        "prepared output abort future panicked",
+                    ),
+                    event_issue: None,
+                },
+            },
+            Err(payload) => {
+                quarantine_panic_payload(payload);
+                OutputShutdownOutcome::Unconfirmed {
+                    failure: OutputShutdownIssue::new(
+                        OutputShutdownIssueKind::EndpointMethodPanicked,
+                        "prepared output panicked while committing abort",
+                    ),
+                    event_issue: None,
+                }
+            }
+        },
+        Err(_) => OutputShutdownOutcome::ControllerTerminated,
+    };
+    completer.complete(outcome);
+}
+
+struct PreparedAbortWake {
+    ready: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Wake for PreparedAbortWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let (ready, notify) = &*self.ready;
+        *ready
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        notify.notify_one();
+    }
+}
+
+enum PreparedAbortDriveOutcome {
+    Confirmed,
+    Rejected(crate::output::AudioOutputError),
+    Panicked,
+}
+
+fn drive_prepared_abort(
+    mut shutdown: crate::output::AudioOutputEndpointShutdown,
+) -> PreparedAbortDriveOutcome {
+    let ready = Arc::new((Mutex::new(false), Condvar::new()));
+    let waker = Waker::from(Arc::new(PreparedAbortWake {
+        ready: Arc::clone(&ready),
+    }));
+    let mut context = Context::from_waker(&waker);
+    loop {
+        let poll = panic::catch_unwind(AssertUnwindSafe(|| {
+            Pin::new(&mut shutdown).poll(&mut context)
+        }));
+        match poll {
+            Ok(Poll::Ready(Ok(()))) => return PreparedAbortDriveOutcome::Confirmed,
+            Ok(Poll::Ready(Err(error))) => {
+                std::mem::forget(shutdown);
+                return PreparedAbortDriveOutcome::Rejected(error);
+            }
+            Err(payload) => {
+                std::mem::forget(shutdown);
+                quarantine_panic_payload(payload);
+                return PreparedAbortDriveOutcome::Panicked;
+            }
+            Ok(Poll::Pending) => {}
+        }
+        let (flag, notify) = &*ready;
+        let mut flag = flag
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*flag {
+            flag = notify
+                .wait(flag)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *flag = false;
+    }
+}
 
 /// Event-loop authority defaults to quarantine on every unexpected unwind. Only paths which have
 /// independently proved producer quiescence may extract it and request/join a stop.
@@ -159,6 +435,8 @@ struct InjectedLifecycleRequestGate {
     phase: AtomicU8,
     serialize: Mutex<()>,
     wake: crossbeam_channel::Sender<()>,
+    #[cfg(test)]
+    after_serialize: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
 }
 
 impl InjectedLifecycleRequestGate {
@@ -207,6 +485,18 @@ pub(crate) struct InjectedOutputStateControl {
 }
 
 impl InjectedOutputStateControl {
+    #[cfg(test)]
+    pub(crate) fn set_after_serialize_for_test(
+        &self,
+        observer: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) {
+        *self
+            .request_gate
+            .after_serialize
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+    }
+
     pub(crate) fn suspend(&self) -> Result<InjectedStateChangeReceipt, InjectedControlError> {
         self.request(crate::context::AudioContextState::Suspended)
     }
@@ -224,6 +514,17 @@ impl InjectedOutputStateControl {
             Err(TryLockError::WouldBlock) => return Err(InjectedControlError::Contended),
             Err(TryLockError::Poisoned(_)) => return Err(InjectedControlError::Poisoned),
         };
+        #[cfg(test)]
+        let observer = self
+            .request_gate
+            .after_serialize
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some(observer) = observer {
+            observer();
+        }
         let (completer, receipt) = state_change_receipt_pair();
         if self.request_gate.load() != ShutdownLatchState::Open {
             drop(serialization);
@@ -326,6 +627,17 @@ impl InjectedOutputStartFailure {
         &self.issue
     }
 
+    pub(crate) fn startup_error(&self) -> Option<&AudioOutputError> {
+        match self.resources.as_ref()? {
+            InjectedStartFailureResources::Partial { start_failure, .. } => {
+                Some(start_failure.error())
+            }
+            InjectedStartFailureResources::Prepared { .. }
+            | InjectedStartFailureResources::Running { .. }
+            | InjectedStartFailureResources::Uncertain { .. } => None,
+        }
+    }
+
     pub(crate) fn into_parts(
         mut self,
     ) -> (
@@ -381,6 +693,110 @@ impl InjectedOutputStartFailure {
         };
         (self.issue.clone(), resources, self.abandoned_worker.take())
     }
+
+    /// Recovers a failed pre-spawn/bootstrap transfer and hands the exact owner set to a fresh
+    /// lifecycle worker. If no worker can be created, the returned observation is explicitly
+    /// unconfirmed and the exact resources retain their existing fail-closed Drop behavior.
+    pub(crate) fn recover_with_fallback(self: Box<Self>) -> OutputShutdownReceipt {
+        let (issue, parts, abandoned_worker) = (*self).into_parts();
+        // A rejected bootstrap worker never received exact resources. Detaching its handle avoids
+        // making public construction wait for scheduler progress on an irrelevant empty thread.
+        drop(abandoned_worker);
+        match parts {
+            InjectedOutputStartFailureParts::Prepared {
+                prepared,
+                renderer,
+                events,
+                output_events,
+            } => {
+                let abort_started = match start_prepared_abort_worker(prepared, &ThreadSpawner) {
+                    Ok(receipt) => {
+                        drop(receipt);
+                        true
+                    }
+                    Err(prepared) => {
+                        std::mem::forget(prepared);
+                        false
+                    }
+                };
+                // No callback was published, but there is no renderer drive capable of applying
+                // exact Close. Retain that open proof domain and report it honestly as unconfirmed.
+                std::mem::forget(renderer);
+                drop(events);
+                drop(output_events);
+                ready_unconfirmed_receipt(OutputShutdownIssue::new(
+                    OutputShutdownIssueKind::BootstrapFailed,
+                    if abort_started {
+                        "prepared output abort was transferred, but the unstarted exact graph was quarantined"
+                    } else {
+                        "prepared output and unstarted exact graph were quarantined after lifecycle transfer failure"
+                    },
+                ))
+            }
+            InjectedOutputStartFailureParts::Running {
+                endpoint,
+                owner,
+                base,
+                output_events,
+                event_loop,
+            } => match start_running(
+                endpoint,
+                owner,
+                base,
+                output_events,
+                event_loop,
+                &ThreadSpawner,
+            ) {
+                Ok(controller) => controller.shutdown_silently(),
+                Err(failure) => {
+                    drop(failure);
+                    ready_unconfirmed_receipt(issue)
+                }
+            },
+            InjectedOutputStartFailureParts::Partial {
+                start_failure,
+                owner,
+                output_events,
+                event_loop,
+            } => {
+                let (startup_error, endpoint_shutdown) = start_failure.into_parts();
+                match start_partial(
+                    startup_error,
+                    endpoint_shutdown,
+                    owner,
+                    output_events,
+                    event_loop,
+                    &ThreadSpawner,
+                ) {
+                    Ok(cleanup) => cleanup.receipt(),
+                    Err(failure) => {
+                        drop(failure);
+                        ready_unconfirmed_receipt(issue)
+                    }
+                }
+            }
+            InjectedOutputStartFailureParts::Uncertain {
+                owner,
+                output_events,
+                event_loop,
+            } => match start_uncertain(owner, output_events, event_loop, &ThreadSpawner) {
+                Ok(cleanup) => cleanup.receipt(),
+                Err(failure) => {
+                    drop(failure);
+                    ready_unconfirmed_receipt(issue)
+                }
+            },
+        }
+    }
+}
+
+fn ready_unconfirmed_receipt(failure: OutputShutdownIssue) -> OutputShutdownReceipt {
+    let (completer, receipt) = shutdown_receipt_pair();
+    completer.complete(OutputShutdownOutcome::Unconfirmed {
+        failure,
+        event_issue: None,
+    });
+    receipt
 }
 
 fn quarantine_open_owner(owner: InjectedOutputRenderOwner) {
@@ -556,6 +972,23 @@ impl Drop for InjectedPartialResources {
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn start_validated_injected_output(
+    prepared: ValidatedPreparedAudioOutput,
+    renderer: MagicInitializedInjectedOutputRenderer,
+    events: AudioOutputEventSink,
+    output_events: AudioOutputEventWatcher,
+) -> Result<InjectedOutputStart, Box<InjectedOutputStartFailure>> {
+    start_validated_injected_output_with_spawner(
+        prepared,
+        renderer,
+        events,
+        output_events,
+        &ThreadSpawner,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_injected_output(
     prepared: Box<dyn PreparedAudioOutput>,
     renderer: MagicInitializedInjectedOutputRenderer,
@@ -565,6 +998,7 @@ pub(crate) fn start_injected_output(
     start_injected_output_with_spawner(prepared, renderer, events, output_events, &ThreadSpawner)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn start_injected_output_with_spawner(
     prepared: Box<dyn PreparedAudioOutput>,
@@ -573,21 +1007,8 @@ fn start_injected_output_with_spawner(
     output_events: AudioOutputEventWatcher,
     spawner: &dyn LifecycleWorkerSpawner,
 ) -> Result<InjectedOutputStart, Box<InjectedOutputStartFailure>> {
-    if !events.matches_watcher(&output_events) {
-        return Err(prepared_failure(
-            OutputShutdownIssue::new(
-                OutputShutdownIssueKind::BootstrapFailed,
-                "injected output event sink and watcher do not match",
-            ),
-            prepared,
-            renderer,
-            events,
-            output_events,
-        ));
-    }
-
-    let format = match panic::catch_unwind(AssertUnwindSafe(|| prepared.config().format())) {
-        Ok(format) => format,
+    let config = match panic::catch_unwind(AssertUnwindSafe(|| prepared.config().clone())) {
+        Ok(config) => config,
         Err(payload) => {
             quarantine_panic_payload(payload);
             return Err(prepared_failure(
@@ -602,6 +1023,37 @@ fn start_injected_output_with_spawner(
             ));
         }
     };
+    start_validated_injected_output_with_spawner(
+        ValidatedPreparedAudioOutput::from_prevalidated_for_test(prepared, config),
+        renderer,
+        events,
+        output_events,
+        spawner,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_validated_injected_output_with_spawner(
+    prepared: ValidatedPreparedAudioOutput,
+    renderer: MagicInitializedInjectedOutputRenderer,
+    events: AudioOutputEventSink,
+    output_events: AudioOutputEventWatcher,
+    spawner: &dyn LifecycleWorkerSpawner,
+) -> Result<InjectedOutputStart, Box<InjectedOutputStartFailure>> {
+    let format = prepared.config().format();
+    let (prepared, _config) = prepared.into_parts();
+    if !events.matches_watcher(&output_events) {
+        return Err(prepared_failure(
+            OutputShutdownIssue::new(
+                OutputShutdownIssueKind::BootstrapFailed,
+                "injected output event sink and watcher do not match",
+            ),
+            prepared,
+            renderer,
+            events,
+            output_events,
+        ));
+    }
 
     let (owner, callback, event_loop, base) =
         match renderer.try_into_audio_output_pair(format, events.clone()) {
@@ -691,6 +1143,8 @@ fn start_running(
         phase: AtomicU8::new(ShutdownLatchState::Open as u8),
         serialize: Mutex::new(()),
         wake: request_wake,
+        #[cfg(test)]
+        after_serialize: Mutex::new(None),
     });
     let worker_request_gate = Arc::clone(&request_gate);
     let (bootstrap_send, bootstrap_recv) = crossbeam_channel::bounded(1);
@@ -2189,21 +2643,31 @@ fn finish_reclaimed_graph(
     } else {
         EventLoopExit::TerminalClosed
     };
-    let retirement = event_retirement_from_join(retirement.joined, expected_exit);
-    if !retirement.retired {
+    let cleanup_panic = retirement.cleanup_panic;
+    let mut event_retirement = event_retirement_from_join(retirement.joined, expected_exit);
+    if let Some(payload) = cleanup_panic {
+        quarantine_panic_payload(payload);
+        event_retirement.issue.get_or_insert_with(|| {
+            OutputShutdownIssue::new(
+                OutputShutdownIssueKind::EventDeliveryDegraded,
+                "exact event callback cleanup panicked after event-thread retirement",
+            )
+        });
+    }
+    if !event_retirement.retired {
         return OutputShutdownOutcome::Unconfirmed {
             failure: OutputShutdownIssue::new(
                 OutputShutdownIssueKind::EventThreadUnretired,
                 "injected lifecycle worker could not retire its event thread",
             ),
-            event_issue: retirement.issue,
+            event_issue: event_retirement.issue,
         };
     }
     OutputShutdownOutcome::Confirmed(OutputShutdownReport {
         mode: request.mode,
         endpoint_death: request.endpoint_death,
         reclaim_issue: issue,
-        event_issue: retirement.issue,
+        event_issue: event_retirement.issue,
     })
 }
 
