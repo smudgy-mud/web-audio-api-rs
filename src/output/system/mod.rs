@@ -3,6 +3,8 @@
 //! This module deliberately does not reuse `crate::io`: the legacy backends construct and own a
 //! second `RenderThread`, while hosted contexts hand an endpoint one exact `AudioRenderCallback`.
 
+#[cfg(all(feature = "cpal", not(feature = "cubeb")))]
+mod cpal;
 mod none;
 
 use std::cell::UnsafeCell;
@@ -24,7 +26,7 @@ use super::{
 const BRIDGE_OPEN: u8 = 0;
 const BRIDGE_ACTIVE: u8 = 1;
 const BRIDGE_CLOSED: u8 = 2;
-const BRIDGE_CLOSED_ACTIVE: u8 = BRIDGE_CLOSED | BRIDGE_ACTIVE;
+const BRIDGE_SUSPENDED: u8 = 4;
 
 /// The future-facing system factory remains crate-private until every feature-selected physical
 /// backend has the same callback and thread-retirement proof as the silent endpoint.
@@ -46,10 +48,18 @@ impl AudioOutputFactory for SystemAudioOutput {
             return none::prepare(request);
         }
 
-        Err(AudioOutputError::new(
-            AudioOutputErrorKind::NotSupported,
-            "physical hosted system output is not enabled in this private foundation",
-        ))
+        #[cfg(all(feature = "cpal", not(feature = "cubeb")))]
+        {
+            cpal::prepare(request)
+        }
+
+        #[cfg(not(all(feature = "cpal", not(feature = "cubeb"))))]
+        {
+            Err(AudioOutputError::new(
+                AudioOutputErrorKind::NotSupported,
+                "physical hosted system output is not enabled in this private foundation",
+            ))
+        }
     }
 }
 
@@ -95,13 +105,36 @@ impl SystemRenderBridge {
         self.gate.fetch_or(BRIDGE_CLOSED, Ordering::AcqRel);
     }
 
+    fn suspend(&self) {
+        self.gate.fetch_or(BRIDGE_SUSPENDED, Ordering::AcqRel);
+    }
+
+    fn resume(&self) {
+        let mut current = self.gate.load(Ordering::Acquire);
+        loop {
+            if current & BRIDGE_CLOSED != 0 {
+                return;
+            }
+            match self.gate.compare_exchange_weak(
+                current,
+                current & !BRIDGE_SUSPENDED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     fn events(&self) -> AudioOutputEventSink {
         self.events.clone()
     }
 
     fn try_retire(this: Arc<Self>) -> Result<(), Arc<Self>> {
         this.close();
-        if this.gate.load(Ordering::Acquire) != BRIDGE_CLOSED {
+        let gate = this.gate.load(Ordering::Acquire);
+        if gate & (BRIDGE_CLOSED | BRIDGE_ACTIVE) != BRIDGE_CLOSED {
             return Err(this);
         }
         let bridge = Arc::try_unwrap(this)?;
@@ -128,6 +161,39 @@ impl fmt::Debug for SystemRenderAccess {
 }
 
 impl SystemRenderAccess {
+    fn is_closed(&self) -> bool {
+        self.bridge
+            .upgrade()
+            .is_none_or(|bridge| bridge.gate.load(Ordering::Acquire) & BRIDGE_CLOSED != 0)
+    }
+
+    fn suspend(&self) {
+        if let Some(bridge) = self.bridge.upgrade() {
+            bridge.suspend();
+        }
+    }
+
+    fn resume(&self) {
+        if let Some(bridge) = self.bridge.upgrade() {
+            bridge.resume();
+        }
+    }
+
+    fn close(&self) {
+        if let Some(bridge) = self.bridge.upgrade() {
+            bridge.close();
+        }
+    }
+
+    fn report_endpoint_death(&self, reason: AudioOutputDeathReason) {
+        if let Some(bridge) = self.bridge.upgrade() {
+            let previous = bridge.gate.fetch_or(BRIDGE_CLOSED, Ordering::AcqRel);
+            if previous & BRIDGE_CLOSED == 0 {
+                let _ = bridge.events.report_endpoint_death(reason);
+            }
+        }
+    }
+
     /// Invokes one already-bounded, nonempty, channel-aligned logical callback.
     fn render_interleaved_f32(&self, output: &mut [f32]) -> AudioRenderStatus {
         let Some(bridge) = self.bridge.upgrade() else {
@@ -135,32 +201,34 @@ impl SystemRenderAccess {
             return AudioRenderStatus::Stop;
         };
 
-        match bridge.gate.compare_exchange(
-            BRIDGE_OPEN,
-            BRIDGE_ACTIVE,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {}
-            Err(BRIDGE_CLOSED | BRIDGE_CLOSED_ACTIVE) => {
+        let mut current = bridge.gate.load(Ordering::Acquire);
+        loop {
+            if current & BRIDGE_CLOSED != 0 {
                 output.fill(0.);
                 return AudioRenderStatus::Stop;
             }
-            Err(BRIDGE_ACTIVE) => {
-                bridge.close();
+            if current & BRIDGE_SUSPENDED != 0 {
                 output.fill(0.);
-                let _ = bridge
-                    .events
-                    .report_endpoint_death(AudioOutputDeathReason::BackendFailure);
+                return AudioRenderStatus::Continue;
+            }
+            if current & BRIDGE_ACTIVE != 0 {
+                let previous = bridge.gate.fetch_or(BRIDGE_CLOSED, Ordering::AcqRel);
+                output.fill(0.);
+                if previous & BRIDGE_CLOSED == 0 {
+                    let _ = bridge
+                        .events
+                        .report_endpoint_death(AudioOutputDeathReason::BackendFailure);
+                }
                 return AudioRenderStatus::Stop;
             }
-            Err(_) => {
-                bridge.close();
-                output.fill(0.);
-                let _ = bridge
-                    .events
-                    .report_endpoint_death(AudioOutputDeathReason::BackendFailure);
-                return AudioRenderStatus::Stop;
+            match bridge.gate.compare_exchange_weak(
+                current,
+                current | BRIDGE_ACTIVE,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
             }
         }
 
@@ -188,7 +256,7 @@ impl Drop for BridgeActive<'_> {
             .bridge
             .gate
             .fetch_and(!BRIDGE_ACTIVE, Ordering::Release);
-        debug_assert!(matches!(previous, BRIDGE_ACTIVE | BRIDGE_CLOSED_ACTIVE));
+        debug_assert!(previous & BRIDGE_ACTIVE != 0);
     }
 }
 
