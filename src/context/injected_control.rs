@@ -751,6 +751,7 @@ impl InjectedControlRenderInit {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // exact single-owner event authority stays inline; Legacy is test-only
 enum InjectedRenderEvents {
     #[cfg(test)]
     Legacy {

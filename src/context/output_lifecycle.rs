@@ -1,15 +1,20 @@
 //! Private ownership controller for an injected audio output.
 //!
-//! No `AudioContext` constructor uses this foundation yet. It deliberately leaves legacy backend
-//! ownership untouched until the surrounding context can prove producer quiescence.
+//! The hosted `AudioContext` builder uses this controller for caller-supplied logical outputs.
+//! Legacy backend ownership remains separate and unchanged.
 
-#![allow(dead_code)] // production wiring begins with the pending injected AudioContext constructor
+#![allow(dead_code)] // lower-level failure owners remain available to the focused lifecycle tests
 
 mod injected;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use injected::start_injected_output;
 #[allow(unused_imports)] // public context wiring follows this private lifecycle slice
 pub(crate) use injected::{
-    start_injected_output, InjectedOutputLifecycleController, InjectedOutputStart,
-    InjectedOutputStartFailure, InjectedOutputStartFailureParts,
+    start_validated_injected_output, InjectedOutputLifecycleController, InjectedOutputStart,
+    InjectedOutputStartFailure, InjectedOutputStartFailureParts, InjectedOutputStateControl,
+    InjectedOutputWorkerBootstrap, InjectedStateChangeFailure, InjectedStateChangeOutcome,
+    InjectedStateChangeReceipt,
 };
 
 use std::any::Any;
@@ -36,8 +41,8 @@ use crate::output::{
 ///
 /// Graceful event retirement is illegal without this proof. The controller-owned renderer may
 /// still emit graph/drop records while it is reclaimed; that is why graceful event-loop stop is
-/// requested only after renderer reclamation. The eventual context integration will construct
-/// this marker after retiring every producer not owned by the controller.
+/// requested only after renderer reclamation. The hosted context constructs this marker after
+/// retiring every producer not owned by the controller.
 #[derive(Debug)]
 pub(crate) struct EventProducersQuiesced(());
 
@@ -153,7 +158,7 @@ type CompletionReceiver = oneshot::Receiver<OutputShutdownOutcome>;
 
 /// Cloneable, cancellation-proof observer for injected-output retirement.
 ///
-/// No current `AudioContext` method returns this type. The eventual contract completes only after
+/// The public hosted-context receipt maps this contract after
 /// endpoint callback acknowledgement, Arc proof and renderer/GC reclamation, followed by event
 /// thread stop and join. It excludes surviving node/base/receiver clones, queued payloads left by
 /// silent stop, and factory-global mixer resources. Registered-waker storage is O(the maximum
@@ -227,8 +232,25 @@ trait LifecycleWorkerSpawner {
 
 struct ThreadSpawner;
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_THREAD_SPAWN_FOR_TEST: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+fn fail_next_thread_spawn_for_test() {
+    FAIL_NEXT_THREAD_SPAWN_FOR_TEST.set(true);
+}
+
 impl LifecycleWorkerSpawner for ThreadSpawner {
     fn spawn(&self, job: Box<dyn FnOnce() + Send + 'static>) -> io::Result<JoinHandle<()>> {
+        #[cfg(test)]
+        if FAIL_NEXT_THREAD_SPAWN_FOR_TEST.replace(false) {
+            drop(job);
+            return Err(io::Error::other("forced fallback lifecycle worker failure"));
+        }
         thread::Builder::new()
             .name("web-audio-output-lifecycle".to_owned())
             .spawn(job)
