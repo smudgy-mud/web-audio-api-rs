@@ -164,7 +164,7 @@ struct LifetimeSlot {
     payload: Mutex<SlotPayload>,
 }
 
-struct NodeLifetimeInner {
+pub(super) struct NodeLifetimeInner {
     phase: AtomicU8,
     allocation: Mutex<()>,
     slots: Box<[LifetimeSlot]>,
@@ -229,8 +229,47 @@ struct NodeLifetimeInner {
     >,
 }
 
+impl NodeLifetimeInner {
+    pub(super) fn matches_connection_brands(
+        &self,
+        control: &InjectedControlIdentity,
+        node_ids: &InjectedNodeIdIdentity,
+    ) -> bool {
+        self.control_identity.ptr_eq(control) && self.node_id_identity.ptr_eq(node_ids)
+    }
+
+    pub(super) fn connection_registry(&self) -> &Arc<InjectedConnectionRegistryInner> {
+        &self.connections
+    }
+
+    pub(super) fn connection_registration_is_live(
+        &self,
+        id: AudioNodeId,
+        stamp: InjectedNodeRegistrationStamp,
+    ) -> bool {
+        if stamp.id != id {
+            return false;
+        }
+        let Some(slot) = self.slots.get(stamp.slot) else {
+            return false;
+        };
+        let word = slot.word.load(Ordering::Acquire);
+        slot.id.load(Ordering::Acquire) == id.0
+            && generation(word) == stamp.generation.get()
+            && SlotPhase::from_word(word) == SlotPhase::Live
+            && !has_reclaim(word)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RegistrationKey {
+    slot: usize,
+    generation: NonZeroU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct InjectedNodeRegistrationStamp {
+    pub(super) id: AudioNodeId,
     slot: usize,
     generation: NonZeroU64,
 }
@@ -1235,6 +1274,10 @@ pub(crate) struct NodeRegistrationFailure {
 }
 
 impl InjectedNodeLifetimeRegistrar {
+    pub(super) fn registry_identity(&self) -> Weak<NodeLifetimeInner> {
+        Weak::clone(&self.inner)
+    }
+
     #[cfg(test)]
     pub(crate) fn hold_active_registry_upgrade_for_test(
         &self,
@@ -1408,6 +1451,7 @@ impl InjectedNodeLifetimeRegistrar {
         drop(_allocation);
         Ok(ProvisionalNodeRegistration {
             inner: Arc::downgrade(&inner),
+            id,
             key: RegistrationKey {
                 slot: slot_index,
                 generation: NonZeroU64::new(next_generation).unwrap(),
@@ -1422,6 +1466,7 @@ impl InjectedNodeLifetimeRegistrar {
 #[must_use = "a provisional registration must be armed after accepted construction or cancelled"]
 pub(crate) struct ProvisionalNodeRegistration {
     inner: Weak<NodeLifetimeInner>,
+    id: AudioNodeId,
     key: RegistrationKey,
     completed: bool,
     accepted: AtomicBool,
@@ -1442,6 +1487,40 @@ impl ProvisionalNodeRegistration {
             inner: Weak::clone(&self.inner),
             key: self.key,
         }
+    }
+
+    pub(super) fn stamp(&self) -> InjectedNodeRegistrationStamp {
+        InjectedNodeRegistrationStamp {
+            id: self.id,
+            slot: self.key.slot,
+            generation: self.key.generation,
+        }
+    }
+
+    pub(super) fn replace_cleanup_before_acceptance(
+        &self,
+        cleanup: Box<dyn InjectedNodeReclaimCleanup>,
+    ) -> Result<Box<dyn InjectedNodeReclaimCleanup>, Box<dyn InjectedNodeReclaimCleanup>> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Err(cleanup);
+        };
+        let slot = &inner.slots[self.key.slot];
+        let mut payload = match slot.payload.try_lock() {
+            Ok(payload) => payload,
+            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => return Err(cleanup),
+        };
+        let expected = slot_word(self.key.generation.get(), SlotPhase::Provisional, false);
+        if self.accepted.load(Ordering::Acquire)
+            || self.armed.load(Ordering::Acquire)
+            || slot.word.load(Ordering::Acquire) != expected
+            || payload.reclaim.is_some()
+        {
+            return Err(cleanup);
+        }
+        let Some(previous) = payload.cleanup.replace(cleanup) else {
+            return Err(payload.cleanup.take().unwrap());
+        };
+        Ok(previous)
     }
 
     /// Copy ordering token suitable for B1's accepted-batch finalizer. It temporarily upgrades
@@ -1478,6 +1557,7 @@ impl ProvisionalNodeRegistration {
         self.completed = true;
         Ok(InjectedNodeRegistration {
             inner: Weak::clone(&self.inner),
+            id: self.id,
             key: self.key,
         })
     }
@@ -1679,12 +1759,24 @@ impl Drop for ProvisionalNodeRegistration {
 
 pub(crate) struct InjectedNodeRegistration {
     inner: Weak<NodeLifetimeInner>,
+    id: AudioNodeId,
     key: RegistrationKey,
 }
 
 impl InjectedNodeRegistration {
     pub(crate) fn matches_identity(&self, identity: &InjectedNodeRegistrationIdentity) -> bool {
         Weak::ptr_eq(&self.inner, &identity.inner) && self.key == identity.key
+    }
+
+    pub(super) fn matches_connection_stamp(
+        &self,
+        registry: &Weak<NodeLifetimeInner>,
+        stamp: InjectedNodeRegistrationStamp,
+    ) -> bool {
+        Weak::ptr_eq(&self.inner, registry)
+            && self.id == stamp.id
+            && self.key.slot == stamp.slot
+            && self.key.generation == stamp.generation
     }
 }
 
@@ -2241,7 +2333,6 @@ mod tests {
     use std::thread::{self, ThreadId};
 
     use super::*;
-    use crate::context::injected_connections::InjectedHostExplicitConnection;
     use crate::context::injected_control::{
         injected_control_channel, InjectedControlLifecycleOwner, InjectedControlRenderInit,
     };
@@ -2429,6 +2520,7 @@ mod tests {
         assert_eq!(generation(current), 2);
         let stale = InjectedNodeRegistration {
             inner: Weak::clone(&foundation.registrar.inner),
+            id: AudioNodeId(7),
             key: stale_key,
         };
         drop(stale);
@@ -3009,11 +3101,7 @@ mod tests {
     fn embedded_connection_registry_seals_and_clears_residuals_with_degradation_report() {
         let mut foundation = Foundation::new(1, 100);
         let connections = &foundation.owner.as_ref().unwrap().inner().connections;
-        connections.push_residual_for_test(InjectedHostExplicitConnection {
-            edge: (AudioNodeId(11), 0, AudioNodeId(0), 0),
-            source_generation: 1,
-            destination_generation: 0,
-        });
+        connections.push_residual_for_test();
         connections.fail_closed_protocol();
         let poisoned = panic::catch_unwind(AssertUnwindSafe(|| {
             connections.poison_serializer_for_test();

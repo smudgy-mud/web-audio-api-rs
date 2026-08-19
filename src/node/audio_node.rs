@@ -279,9 +279,9 @@ pub trait AudioNode {
             input
         );
 
-        self.context().connect(
-            self.registration().id(),
-            dest.registration().id(),
+        self.context().connect_registrations(
+            self.registration(),
+            dest.registration(),
             output,
             input,
         );
@@ -291,7 +291,7 @@ pub trait AudioNode {
     /// Disconnects all outgoing connections from the AudioNode.
     fn disconnect(&self) {
         self.context()
-            .disconnect(self.registration().id(), None, None, None);
+            .disconnect_registrations(self.registration(), None, None, None);
     }
 
     /// Disconnects all outputs of the AudioNode that go to a specific destination AudioNode.
@@ -307,10 +307,10 @@ pub trait AudioNode {
             "InvalidAccessError - Attempting to disconnect nodes from different contexts"
         );
 
-        self.context().disconnect(
-            self.registration().id(),
+        self.context().disconnect_registrations(
+            self.registration(),
             None,
-            Some(dest.registration().id()),
+            Some(dest.registration()),
             None,
         );
     }
@@ -329,7 +329,7 @@ pub trait AudioNode {
         );
 
         self.context()
-            .disconnect(self.registration().id(), Some(output), None, None);
+            .disconnect_registrations(self.registration(), Some(output), None, None);
     }
 
     /// Disconnects a specific output of the AudioNode to a specific destination AudioNode
@@ -352,10 +352,10 @@ pub trait AudioNode {
             output
         );
 
-        self.context().disconnect(
-            self.registration().id(),
+        self.context().disconnect_registrations(
+            self.registration(),
             Some(output),
-            Some(dest.registration().id()),
+            Some(dest.registration()),
             None,
         );
     }
@@ -393,10 +393,10 @@ pub trait AudioNode {
             input
         );
 
-        self.context().disconnect(
-            self.registration().id(),
+        self.context().disconnect_registrations(
+            self.registration(),
             Some(output),
-            Some(dest.registration().id()),
+            Some(dest.registration()),
             Some(input),
         );
     }

@@ -11,6 +11,7 @@ use std::{
 use futures::executor;
 
 use super::*;
+use crate::context::injected_connections::InjectedConnectionOperationOutcome;
 use crate::context::injected_control::{
     injected_control_channel, BoundInjectedRenderer, InjectedConcreteEventBinding,
     InjectedControlLifecycleOwner,
@@ -32,7 +33,7 @@ use crate::events::{
 };
 use crate::message::ControlMessage;
 use crate::node::{
-    ChannelConfigInner, ChannelCountMode, ChannelInterpretation, GainNode, GainOptions,
+    AudioNode, ChannelConfigInner, ChannelCountMode, ChannelInterpretation, GainNode, GainOptions,
 };
 use crate::output::{
     AudioOutputConfig, AudioOutputDeathReason, AudioOutputErrorKind, AudioRenderCallback,
@@ -1510,6 +1511,75 @@ fn suspended_exact_gain_values_flush_fifo_before_b4c_resume_ack() {
         confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
         OutputShutdownMode::Graceful
     );
+}
+
+#[test]
+fn suspended_exact_connect_then_disconnect_stage_and_flush_fifo_before_resume_ack() {
+    let fixture = lifecycle_fixture();
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let state = controller.state_control();
+    assert_eq!(
+        wait_state(state.suspend().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    let applied_before = base.applied_control_batch_sequence();
+
+    let source = GainNode::new(&base, GainOptions::default());
+    let destination = GainNode::new(&base, GainOptions::default());
+    let source_cap = source
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_cap = destination
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let constructor = base.injected_node_constructor().unwrap();
+    assert_eq!(
+        constructor
+            .connect_exact(&source_cap, &destination_cap, 0, 0)
+            .unwrap(),
+        InjectedConnectionOperationOutcome::Committed(
+            crate::context::injected_control::CommitControlOutcome::Staged
+        )
+    );
+    assert_eq!(constructor.connection_edge_count_for_test(), 1);
+    assert_eq!(
+        constructor
+            .disconnect_exact(&source_cap, None, Some(&destination_cap), None)
+            .unwrap(),
+        InjectedConnectionOperationOutcome::Committed(
+            crate::context::injected_control::CommitControlOutcome::Staged
+        )
+    );
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    assert_eq!(base.applied_control_batch_sequence(), applied_before);
+
+    assert_eq!(
+        wait_state(state.resume().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    assert!(base.applied_control_batch_sequence() >= applied_before + 4);
+    assert_eq!(base.state(), AudioContextState::Running);
+    drop((source, destination));
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.reclaim_issue().is_none());
 }
 
 #[test]
