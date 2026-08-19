@@ -1296,10 +1296,11 @@ mod tests {
     use crate::context::DESTINATION_NODE_ID;
     use crate::context::{
         AudioContextBuildErrorKind, AudioContextShutdownIssueKind, AudioContextShutdownMode,
-        AudioContextShutdownOutcome, AudioContextStateChangeOutcome, AudioNodeId,
+        AudioContextShutdownOutcome, AudioContextStateChangeOutcome,
+        AudioControlBatchReservationProvider, AudioNodeId,
     };
     use crate::message::ControlBatchSender;
-    use crate::node::{AudioNode, AudioScheduledSourceNode};
+    use crate::node::{AudioNode, AudioNodeDisconnectSelector, AudioScheduledSourceNode};
     use crate::node::{ChannelCountMode, ChannelInterpretation};
     use crate::output::{
         audio_render_thread_pair, AudioOutputConfig, AudioOutputContextId,
@@ -1320,6 +1321,15 @@ mod tests {
             value,
             log: Arc::clone(log),
         }
+    }
+
+    fn panic_message(result: std::thread::Result<()>) -> String {
+        let payload = result.expect_err("operation unexpectedly succeeded");
+        payload
+            .downcast_ref::<&'static str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_owned())
     }
 
     const INJECTED_TEST_RATE: f32 = 48_000.;
@@ -1901,6 +1911,356 @@ mod tests {
         assert!(rejected.is_err());
         assert!(rejected_dropped.load(AtomicOrdering::Acquire));
         assert!(rejected_commands_dropped.load(AtomicOrdering::Acquire));
+    }
+
+    #[test]
+    fn hosted_param_and_connection_reservations_follow_exact_nonempty_batches() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, AtomicOrdering::Release);
+            }
+        }
+
+        fn provider(
+            expected: usize,
+            called: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+        ) -> AudioControlBatchReservationProvider {
+            AudioControlBatchReservationProvider::new(move |command_count| {
+                assert_eq!(command_count, expected);
+                called.store(true, AtomicOrdering::Release);
+                Some(AudioControlBatchReservation::new(DropProbe(dropped)))
+            })
+        }
+
+        let (suspend_release, suspend_wait) = crossbeam_channel::bounded(1);
+        let mut factory = InjectedTestFactory::new(false);
+        factory.suspend_release = Some(suspend_wait);
+        let factory = Arc::new(factory);
+        let probe = Arc::clone(&factory.probe);
+        let context = AudioContext::builder(factory)
+            .initially_suspended(true)
+            .build()
+            .unwrap();
+
+        let deadline = Instant::now() + INJECTED_TEST_TIMEOUT;
+        while probe.suspend_calls.load(AtomicOrdering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "initial suspension never entered"
+            );
+            thread::yield_now();
+        }
+
+        let gain = context.create_gain();
+        let oscillator = context.create_oscillator();
+        let destination = context.destination();
+
+        let param_dropped = Arc::new(AtomicBool::new(false));
+        gain.gain().set_value_with_control_reservation(
+            0.5,
+            AudioControlBatchReservation::new(DropProbe(Arc::clone(&param_dropped))),
+        );
+
+        let first_called = Arc::new(AtomicBool::new(false));
+        let first_dropped = Arc::new(AtomicBool::new(false));
+        oscillator.connect_from_output_to_input_with_control_reservation(
+            &gain,
+            0,
+            0,
+            provider(1, Arc::clone(&first_called), Arc::clone(&first_dropped)),
+        );
+        assert!(first_called.load(AtomicOrdering::Acquire));
+
+        let duplicate_called = Arc::new(AtomicBool::new(false));
+        oscillator.connect_from_output_to_input_with_control_reservation(
+            &gain,
+            0,
+            0,
+            AudioControlBatchReservationProvider::new({
+                let duplicate_called = Arc::clone(&duplicate_called);
+                move |_| {
+                    duplicate_called.store(true, AtomicOrdering::Release);
+                    None
+                }
+            }),
+        );
+        assert!(!duplicate_called.load(AtomicOrdering::Acquire));
+
+        let second_called = Arc::new(AtomicBool::new(false));
+        let second_dropped = Arc::new(AtomicBool::new(false));
+        oscillator.connect_from_output_to_input_with_control_reservation(
+            &destination,
+            0,
+            0,
+            provider(1, Arc::clone(&second_called), Arc::clone(&second_dropped)),
+        );
+        assert!(second_called.load(AtomicOrdering::Acquire));
+
+        let disconnect_called = Arc::new(AtomicBool::new(false));
+        let disconnect_dropped = Arc::new(AtomicBool::new(false));
+        oscillator.disconnect_with_control_reservation(
+            AudioNodeDisconnectSelector::All,
+            provider(
+                2,
+                Arc::clone(&disconnect_called),
+                Arc::clone(&disconnect_dropped),
+            ),
+        );
+        assert!(disconnect_called.load(AtomicOrdering::Acquire));
+
+        let no_match_called = Arc::new(AtomicBool::new(false));
+        oscillator.disconnect_with_control_reservation(
+            AudioNodeDisconnectSelector::All,
+            AudioControlBatchReservationProvider::new({
+                let no_match_called = Arc::clone(&no_match_called);
+                move |_| {
+                    no_match_called.store(true, AtomicOrdering::Release);
+                    None
+                }
+            }),
+        );
+        assert!(!no_match_called.load(AtomicOrdering::Acquire));
+
+        assert!(!param_dropped.load(AtomicOrdering::Acquire));
+        assert!(!first_dropped.load(AtomicOrdering::Acquire));
+        assert!(!second_dropped.load(AtomicOrdering::Acquire));
+        assert!(!disconnect_dropped.load(AtomicOrdering::Acquire));
+
+        suspend_release.send(()).unwrap();
+        assert_eq!(
+            context.request_resume().unwrap().wait(),
+            AudioContextStateChangeOutcome::Applied
+        );
+        while !param_dropped.load(AtomicOrdering::Acquire)
+            || !first_dropped.load(AtomicOrdering::Acquire)
+            || !second_dropped.load(AtomicOrdering::Acquire)
+            || !disconnect_dropped.load(AtomicOrdering::Acquire)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "accepted mutation reservation was not reclaimed"
+            );
+            thread::yield_now();
+        }
+
+        assert!(matches!(
+            context.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+    }
+
+    #[test]
+    fn hosted_connection_reservation_refusal_is_nonterminal_and_preserves_edges() {
+        fn accepted_provider(
+            expected: usize,
+            called: Arc<AtomicBool>,
+        ) -> AudioControlBatchReservationProvider {
+            AudioControlBatchReservationProvider::new(move |command_count| {
+                assert_eq!(command_count, expected);
+                called.store(true, AtomicOrdering::Release);
+                Some(AudioControlBatchReservation::new(()))
+            })
+        }
+
+        let context = AudioContext::builder(Arc::new(InjectedTestFactory::new(false)))
+            .build()
+            .unwrap();
+        let oscillator = context.create_oscillator();
+        let gain = context.create_gain();
+        let destination = context.destination();
+
+        let rejected_connect_called = Arc::new(AtomicBool::new(false));
+        let rejection = panic_message(std::panic::catch_unwind(AssertUnwindSafe({
+            let rejected_connect_called = Arc::clone(&rejected_connect_called);
+            || {
+                oscillator.connect_from_output_to_input_with_control_reservation(
+                    &gain,
+                    0,
+                    0,
+                    AudioControlBatchReservationProvider::new(move |command_count| {
+                        assert_eq!(command_count, 1);
+                        rejected_connect_called.store(true, AtomicOrdering::Release);
+                        None
+                    }),
+                );
+            }
+        })));
+        assert!(rejection.contains("QuotaExceededError"));
+        assert!(rejected_connect_called.load(AtomicOrdering::Acquire));
+
+        // Refusal happened before commit and did not terminalize the graph: this is a new edge,
+        // so the accepted provider must run rather than being discarded as a duplicate.
+        let first_connect_called = Arc::new(AtomicBool::new(false));
+        oscillator.connect_from_output_to_input_with_control_reservation(
+            &gain,
+            0,
+            0,
+            accepted_provider(1, Arc::clone(&first_connect_called)),
+        );
+        assert!(first_connect_called.load(AtomicOrdering::Acquire));
+
+        let second_connect_called = Arc::new(AtomicBool::new(false));
+        oscillator.connect_from_output_to_input_with_control_reservation(
+            &destination,
+            0,
+            0,
+            accepted_provider(1, Arc::clone(&second_connect_called)),
+        );
+        assert!(second_connect_called.load(AtomicOrdering::Acquire));
+
+        let rejected_disconnect_called = Arc::new(AtomicBool::new(false));
+        let rejection = panic_message(std::panic::catch_unwind(AssertUnwindSafe({
+            let rejected_disconnect_called = Arc::clone(&rejected_disconnect_called);
+            || {
+                oscillator.disconnect_with_control_reservation(
+                    AudioNodeDisconnectSelector::All,
+                    AudioControlBatchReservationProvider::new(move |command_count| {
+                        assert_eq!(command_count, 2);
+                        rejected_disconnect_called.store(true, AtomicOrdering::Release);
+                        None
+                    }),
+                );
+            }
+        })));
+        assert!(rejection.contains("QuotaExceededError"));
+        assert!(rejected_disconnect_called.load(AtomicOrdering::Acquire));
+
+        // A refused broad disconnect leaves both represented edges in the mirror. Duplicate
+        // connects therefore remain zero-command operations and discard their providers unused.
+        let duplicate_gain_called = Arc::new(AtomicBool::new(false));
+        oscillator.connect_from_output_to_input_with_control_reservation(
+            &gain,
+            0,
+            0,
+            AudioControlBatchReservationProvider::new({
+                let duplicate_gain_called = Arc::clone(&duplicate_gain_called);
+                move |_| {
+                    duplicate_gain_called.store(true, AtomicOrdering::Release);
+                    None
+                }
+            }),
+        );
+        let duplicate_destination_called = Arc::new(AtomicBool::new(false));
+        oscillator.connect_from_output_to_input_with_control_reservation(
+            &destination,
+            0,
+            0,
+            AudioControlBatchReservationProvider::new({
+                let duplicate_destination_called = Arc::clone(&duplicate_destination_called);
+                move |_| {
+                    duplicate_destination_called.store(true, AtomicOrdering::Release);
+                    None
+                }
+            }),
+        );
+        assert!(!duplicate_gain_called.load(AtomicOrdering::Acquire));
+        assert!(!duplicate_destination_called.load(AtomicOrdering::Acquire));
+
+        let accepted_disconnect_called = Arc::new(AtomicBool::new(false));
+        oscillator.disconnect_with_control_reservation(
+            AudioNodeDisconnectSelector::All,
+            accepted_provider(2, Arc::clone(&accepted_disconnect_called)),
+        );
+        assert!(accepted_disconnect_called.load(AtomicOrdering::Acquire));
+
+        assert!(matches!(
+            context.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+    }
+
+    #[test]
+    fn hosted_param_reservation_is_released_when_closed_rejects_mutation() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, AtomicOrdering::Release);
+            }
+        }
+
+        let context = AudioContext::builder(Arc::new(InjectedTestFactory::new(false)))
+            .build()
+            .unwrap();
+        let gain = context.create_gain();
+        let initial_value = gain.gain().value();
+        assert!(matches!(
+            context.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let rejection = panic_message(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            gain.gain().set_value_with_control_reservation(
+                0.25,
+                AudioControlBatchReservation::new(DropProbe(Arc::clone(&dropped))),
+            );
+        })));
+        assert!(rejection.contains("InvalidStateError"));
+        assert!(dropped.load(AtomicOrdering::Acquire));
+        assert_eq!(gain.gain().value(), initial_value);
+    }
+
+    #[test]
+    fn hosted_connection_provider_panic_fails_closed_before_later_reservation() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, AtomicOrdering::Release);
+            }
+        }
+
+        let context = AudioContext::builder(Arc::new(InjectedTestFactory::new(false)))
+            .build()
+            .unwrap();
+        let oscillator = context.create_oscillator();
+        let gain = context.create_gain();
+        let panic_probe_dropped = Arc::new(AtomicBool::new(false));
+
+        let failure = std::panic::catch_unwind(AssertUnwindSafe({
+            let panic_probe_dropped = Arc::clone(&panic_probe_dropped);
+            || {
+                oscillator.connect_from_output_to_input_with_control_reservation(
+                    &gain,
+                    0,
+                    0,
+                    AudioControlBatchReservationProvider::new(move |command_count| {
+                        let _probe = DropProbe(panic_probe_dropped);
+                        assert_eq!(command_count, 1);
+                        panic!("forced host reservation provider panic");
+                    }),
+                );
+            }
+        }));
+        assert!(failure.is_err());
+        assert!(panic_probe_dropped.load(AtomicOrdering::Acquire));
+
+        let later_provider_called = Arc::new(AtomicBool::new(false));
+        let later = std::panic::catch_unwind(AssertUnwindSafe({
+            let later_provider_called = Arc::clone(&later_provider_called);
+            || {
+                oscillator.connect_from_output_to_input_with_control_reservation(
+                    &gain,
+                    0,
+                    0,
+                    AudioControlBatchReservationProvider::new(move |_| {
+                        later_provider_called.store(true, AtomicOrdering::Release);
+                        Some(AudioControlBatchReservation::new(()))
+                    }),
+                );
+            }
+        }));
+        assert!(later.is_err());
+        assert!(!later_provider_called.load(AtomicOrdering::Acquire));
+
+        assert!(matches!(
+            context.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
     }
 
     #[test]

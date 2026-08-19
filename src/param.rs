@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arrayvec::ArrayVec;
 
-use crate::context::{AudioContextRegistration, InjectedAudioParamMutation};
+use crate::context::{
+    AudioContextRegistration, AudioControlBatchReservation, InjectedAudioParamMutation,
+};
 use crate::node::{
     AudioNode, AudioNodeOptions, ChannelConfig, ChannelCountMode, ChannelInterpretation,
 };
@@ -523,22 +525,53 @@ impl AudioParam {
     /// bounded mutation because it is closing, saturated, or terminally degraded.
     pub fn set_value(&self, value: f32) -> &Self {
         if self.is_exact_context() {
-            let mutation = self.injected_mutation.as_ref().unwrap_or_else(|| {
-                panic!(
-                    "NotSupportedError - this exact injected AudioParam has no runtime mutation capability"
-                )
-            });
-            let value = InjectedAudioParamValue::new(value);
-            let clamped = value
-                .get()
-                .clamp(self.raw_parts.min_value, self.raw_parts.max_value);
-            let result = mutation.try_set_value(value, clamped);
-            result.unwrap_or_else(|error| {
-                panic!("InvalidStateError - injected AudioParam value update failed: {error:?}")
-            });
-            return self;
+            return self.set_value_injected(value, None);
         }
         self.send_event(self.set_value_raw(value))
+    }
+
+    /// Sets an exact hosted parameter value while attaching host accounting to the submitted
+    /// one-command batch.
+    ///
+    /// The reservation remains owned by the command while it is staged, queued, applied, or
+    /// awaiting off-render-thread reclamation. Rejected submission releases it during rollback.
+    /// This operation is available only for parameters created by an exact hosted context.
+    ///
+    /// # Panics
+    ///
+    /// Panics for non-finite values, for a legacy or unsupported parameter, or when the hosted
+    /// control transaction is rejected or terminally degraded.
+    pub fn set_value_with_control_reservation(
+        &self,
+        value: f32,
+        reservation: AudioControlBatchReservation,
+    ) -> &Self {
+        assert!(
+            self.is_exact_context(),
+            "NotSupportedError - control reservations require an exact hosted AudioParam"
+        );
+        self.set_value_injected(value, Some(reservation))
+    }
+
+    fn set_value_injected(
+        &self,
+        value: f32,
+        reservation: Option<AudioControlBatchReservation>,
+    ) -> &Self {
+        let mutation = self.injected_mutation.as_ref().unwrap_or_else(|| {
+            panic!(
+                "NotSupportedError - this exact injected AudioParam has no runtime mutation capability"
+            )
+        });
+        let value = InjectedAudioParamValue::new(value);
+        let clamped = value
+            .get()
+            .clamp(self.raw_parts.min_value, self.raw_parts.max_value);
+        let result = mutation.try_set_value(value, clamped, reservation);
+        result.unwrap_or_else(|error| {
+            panic!("InvalidStateError - injected AudioParam value update failed: {error:?}")
+        });
+        self
     }
 
     fn set_value_raw(&self, value: f32) -> AudioParamEvent {

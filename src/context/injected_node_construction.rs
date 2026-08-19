@@ -30,8 +30,8 @@ use super::injected_node_lifetime::{
     ProvisionalNodeRegistration,
 };
 use super::{
-    AudioContextRegistration, AudioControlBatchReservation, AudioNodeId,
-    AudioNodeLifetimeReservation, SharedAudioNodeLifetimeReservation,
+    AudioContextRegistration, AudioControlBatchReservation, AudioControlBatchReservationProvider,
+    AudioNodeId, AudioNodeLifetimeReservation, SharedAudioNodeLifetimeReservation,
 };
 use crate::events::{ExactEndedEventKey, InjectedExactEndedEventTarget};
 use crate::message::ControlMessage;
@@ -1507,6 +1507,27 @@ impl InjectedNodeConstructor {
             destination,
             output,
             input,
+            None,
+        )
+    }
+
+    pub(crate) fn connect_exact_with_host_reservation(
+        &self,
+        source: &InjectedConnectionEndpoint,
+        destination: &InjectedConnectionEndpoint,
+        output: usize,
+        input: usize,
+        host_reservation: AudioControlBatchReservationProvider,
+    ) -> Result<InjectedConnectionOperationOutcome, InjectedConnectionOperationError> {
+        InjectedConnectionRegistryInner::connect(
+            &self.control,
+            &self.allocator.identity(),
+            &self.lifetimes.registry_identity(),
+            source,
+            destination,
+            output,
+            input,
+            Some(host_reservation),
         )
     }
 
@@ -1521,6 +1542,23 @@ impl InjectedNodeConstructor {
             &self.lifetimes.registry_identity(),
             source,
             selector,
+            None,
+        )
+    }
+
+    pub(crate) fn disconnect_exact_with_host_reservation(
+        &self,
+        source: &InjectedConnectionEndpoint,
+        selector: InjectedDisconnectSelector<'_>,
+        host_reservation: AudioControlBatchReservationProvider,
+    ) -> Result<InjectedConnectionOperationOutcome, InjectedConnectionOperationError> {
+        InjectedConnectionRegistryInner::disconnect(
+            &self.control,
+            &self.allocator.identity(),
+            &self.lifetimes.registry_identity(),
+            source,
+            selector,
+            Some(host_reservation),
         )
     }
 }
@@ -1635,6 +1673,7 @@ impl InjectedAudioParamMutation {
         &self,
         value: InjectedAudioParamValue,
         clamped: f32,
+        host_reservation: Option<AudioControlBatchReservation>,
     ) -> Result<CommitControlOutcome, InjectedAudioParamMutationError> {
         let result = {
             #[cfg(test)]
@@ -1645,10 +1684,13 @@ impl InjectedAudioParamMutation {
                 .serializer
                 .lock()
                 .map_err(|_| InjectedAudioParamMutationError::SerializerPoisoned)?;
-            let reservation = self
-                .control
-                .try_begin_audio_param_value()
-                .map_err(InjectedAudioParamMutationError::Control)?;
+            let reservation = match host_reservation {
+                Some(host_reservation) => self
+                    .control
+                    .try_begin_audio_param_value_with_host_reservation(host_reservation),
+                None => self.control.try_begin_audio_param_value(),
+            }
+            .map_err(InjectedAudioParamMutationError::Control)?;
             let expected_bits = value.get().to_bits();
             let prepared = reservation.prepare(self.param_id, value);
             let mirror = &self.mirror;

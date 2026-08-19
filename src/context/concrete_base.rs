@@ -18,8 +18,8 @@ use crate::context::injected_node_lifetime::{
 };
 use crate::context::{
     AdmissionError, AudioContextRegistration, AudioContextState, AudioControlBatchReservation,
-    AudioNodeId, BaseAudioContext, InjectedContextAdmissionGate, DESTINATION_NODE_ID,
-    LISTENER_NODE_ID, LISTENER_PARAM_IDS,
+    AudioControlBatchReservationProvider, AudioNodeId, BaseAudioContext,
+    InjectedContextAdmissionGate, DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS,
 };
 use crate::events::{
     EventDispatch, EventHandler, EventLoop, EventType, InjectedControlEventDispatch,
@@ -646,6 +646,9 @@ fn finish_exact_connection(
             panic!(
                 "NotSupportedError - exact connection capacity of {MAX_INJECTED_EXPLICIT_CONNECTIONS} edges exceeded"
             )
+        }
+        Err(InjectedConnectionOperationError::HostReservationRejected) => {
+            panic!("QuotaExceededError - host control-batch reservation was rejected")
         }
         Err(InjectedConnectionOperationError::Unconnected) => {
             panic!("InvalidAccessError - attempting to disconnect unconnected nodes")
@@ -1358,6 +1361,32 @@ impl ConcreteBaseAudioContext {
         }
     }
 
+    pub(crate) fn connect_registrations_with_control_reservation(
+        &self,
+        from: &AudioContextRegistration,
+        to: &AudioContextRegistration,
+        output: usize,
+        input: usize,
+        provider: AudioControlBatchReservationProvider,
+    ) {
+        match &self.inner.graph_control {
+            ConcreteGraphControl::Legacy(_) => {
+                drop(provider);
+                panic!(
+                    "NotSupportedError - control reservations require an exact hosted AudioContext"
+                );
+            }
+            ConcreteGraphControl::Injected(constructor) => {
+                let from = exact_connection_endpoint(from);
+                let to = exact_connection_endpoint(to);
+                finish_exact_connection(
+                    constructor
+                        .connect_exact_with_host_reservation(from, to, output, input, provider),
+                );
+            }
+        }
+    }
+
     /// Schedule a connection of an `AudioParam` to the `AudioNode` it belongs to
     ///
     /// It is not performed immediately as the `AudioNode` is not registered at this point.
@@ -1458,6 +1487,54 @@ impl ConcreteBaseAudioContext {
                     }
                 };
                 finish_exact_connection(constructor.disconnect_exact(from, selector));
+            }
+        }
+    }
+
+    pub(crate) fn disconnect_registrations_with_control_reservation(
+        &self,
+        from: &AudioContextRegistration,
+        output: Option<usize>,
+        to: Option<&AudioContextRegistration>,
+        input: Option<usize>,
+        provider: AudioControlBatchReservationProvider,
+    ) {
+        match &self.inner.graph_control {
+            ConcreteGraphControl::Legacy(_) => {
+                drop(provider);
+                panic!(
+                    "NotSupportedError - control reservations require an exact hosted AudioContext"
+                );
+            }
+            ConcreteGraphControl::Injected(constructor) => {
+                let from = exact_connection_endpoint(from);
+                let to = to.map(exact_connection_endpoint);
+                let selector = match (output, to, input) {
+                    (None, None, None) => InjectedDisconnectSelector::All,
+                    (None, Some(destination), None) => {
+                        InjectedDisconnectSelector::Destination(destination)
+                    }
+                    (Some(output), None, None) => InjectedDisconnectSelector::Output(output),
+                    (Some(output), Some(destination), None) => {
+                        InjectedDisconnectSelector::DestinationOutput {
+                            destination,
+                            output,
+                        }
+                    }
+                    (Some(output), Some(destination), Some(input)) => {
+                        InjectedDisconnectSelector::Exact {
+                            destination,
+                            output,
+                            input,
+                        }
+                    }
+                    (None, None, Some(_)) | (Some(_), None, Some(_)) | (None, Some(_), Some(_)) => {
+                        panic!("InvalidStateError - illegal exact disconnect selector")
+                    }
+                };
+                finish_exact_connection(
+                    constructor.disconnect_exact_with_host_reservation(from, selector, provider),
+                );
             }
         }
     }

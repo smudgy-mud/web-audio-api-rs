@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 
-use crate::context::{AudioContextRegistration, ConcreteBaseAudioContext};
+use crate::context::{
+    AudioContextRegistration, AudioControlBatchReservationProvider, ConcreteBaseAudioContext,
+};
 use crate::events::{ErrorEvent, EventHandler, EventPayload, EventType};
 use crate::message::ControlMessage;
 
@@ -222,6 +224,51 @@ impl From<AudioNodeOptions> for ChannelConfig {
     }
 }
 
+/// A closed selector for one resource-accounted `AudioNode::disconnect` operation.
+///
+/// This mirrors the legal Web Audio disconnect overloads without exposing independently
+/// swappable optional fields to an exact hosted graph transaction.
+pub enum AudioNodeDisconnectSelector<'a> {
+    /// Disconnect every outgoing edge.
+    All,
+    /// Disconnect every edge to one destination.
+    Destination(&'a dyn AudioNode),
+    /// Disconnect every edge from one output.
+    Output(usize),
+    /// Disconnect edges from one output to one destination.
+    DestinationOutput {
+        destination: &'a dyn AudioNode,
+        output: usize,
+    },
+    /// Disconnect one exact output-to-input edge.
+    Exact {
+        destination: &'a dyn AudioNode,
+        output: usize,
+        input: usize,
+    },
+}
+
+impl std::fmt::Debug for AudioNodeDisconnectSelector<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => formatter.write_str("All"),
+            Self::Destination(_) => formatter.write_str("Destination(..)"),
+            Self::Output(output) => formatter.debug_tuple("Output").field(output).finish(),
+            Self::DestinationOutput { output, .. } => formatter
+                .debug_struct("DestinationOutput")
+                .field("destination", &"..")
+                .field("output", output)
+                .finish(),
+            Self::Exact { output, input, .. } => formatter
+                .debug_struct("Exact")
+                .field("destination", &"..")
+                .field("output", output)
+                .field("input", input)
+                .finish(),
+        }
+    }
+}
+
 /// This interface represents audio sources, the audio destination, and intermediate processing
 /// modules.
 ///
@@ -294,6 +341,50 @@ pub trait AudioNode {
             output,
             input,
         );
+        dest
+    }
+
+    /// Connects two exact hosted nodes and acquires host accounting for the command only when the
+    /// connection is not already represented.
+    ///
+    /// The provider is invoked with `1` after context and port validation under the graph's
+    /// serializer. It is dropped unused for a duplicate edge. This method is intended for hosted
+    /// embedders that account bounded control work; ordinary contexts should use
+    /// [`Self::connect_from_output_to_input`].
+    ///
+    /// # Panics
+    ///
+    /// Panics for a legacy context, invalid endpoint or port, rejected host reservation, or a
+    /// terminal exact transaction failure.
+    fn connect_from_output_to_input_with_control_reservation<'a>(
+        &self,
+        dest: &'a dyn AudioNode,
+        output: usize,
+        input: usize,
+        provider: AudioControlBatchReservationProvider,
+    ) -> &'a dyn AudioNode {
+        assert!(
+            self.context() == dest.context(),
+            "InvalidAccessError - Attempting to connect nodes from different contexts",
+        );
+        assert!(
+            self.number_of_outputs() > output,
+            "IndexSizeError - output port {} is out of bounds",
+            output
+        );
+        assert!(
+            dest.number_of_inputs() > input,
+            "IndexSizeError - input port {} is out of bounds",
+            input
+        );
+        self.context()
+            .connect_registrations_with_control_reservation(
+                self.registration(),
+                dest.registration(),
+                output,
+                input,
+                provider,
+            );
         dest
     }
 
@@ -408,6 +499,86 @@ pub trait AudioNode {
             Some(dest.registration()),
             Some(input),
         );
+    }
+
+    /// Disconnects exact hosted edges selected by a closed overload while attaching host
+    /// accounting to the resulting non-empty command batch.
+    ///
+    /// The provider is invoked once with the exact number of represented edges removed. It is
+    /// dropped unused for `All` or `Output` selectors that match no edge. Destination-bearing
+    /// selectors retain the ordinary `InvalidAccessError` no-match behavior.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a legacy context, cross-context or invalid ports, a destination-bearing
+    /// no-match, rejected host reservation, or a terminal exact transaction failure.
+    fn disconnect_with_control_reservation(
+        &self,
+        selector: AudioNodeDisconnectSelector<'_>,
+        provider: AudioControlBatchReservationProvider,
+    ) {
+        let (output, destination, input) = match selector {
+            AudioNodeDisconnectSelector::All => (None, None, None),
+            AudioNodeDisconnectSelector::Destination(destination) => {
+                assert!(
+                    self.context() == destination.context(),
+                    "InvalidAccessError - Attempting to disconnect nodes from different contexts"
+                );
+                (None, Some(destination.registration()), None)
+            }
+            AudioNodeDisconnectSelector::Output(output) => {
+                assert!(
+                    self.number_of_outputs() > output,
+                    "IndexSizeError - output port {} is out of bounds",
+                    output
+                );
+                (Some(output), None, None)
+            }
+            AudioNodeDisconnectSelector::DestinationOutput {
+                destination,
+                output,
+            } => {
+                assert!(
+                    self.context() == destination.context(),
+                    "InvalidAccessError - Attempting to disconnect nodes from different contexts"
+                );
+                assert!(
+                    self.number_of_outputs() > output,
+                    "IndexSizeError - output port {} is out of bounds",
+                    output
+                );
+                (Some(output), Some(destination.registration()), None)
+            }
+            AudioNodeDisconnectSelector::Exact {
+                destination,
+                output,
+                input,
+            } => {
+                assert!(
+                    self.context() == destination.context(),
+                    "InvalidAccessError - Attempting to disconnect nodes from different contexts"
+                );
+                assert!(
+                    self.number_of_outputs() > output,
+                    "IndexSizeError - output port {} is out of bounds",
+                    output
+                );
+                assert!(
+                    destination.number_of_inputs() > input,
+                    "IndexSizeError - input port {} is out of bounds",
+                    input
+                );
+                (Some(output), Some(destination.registration()), Some(input))
+            }
+        };
+        self.context()
+            .disconnect_registrations_with_control_reservation(
+                self.registration(),
+                output,
+                destination,
+                input,
+                provider,
+            );
     }
 
     /// The number of inputs feeding into the AudioNode. For source nodes, this will be 0.
