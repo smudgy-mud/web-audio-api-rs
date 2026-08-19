@@ -12,6 +12,7 @@ impl InjectedNodeLifetimeOwner {
         let slot = &inner.slots[key.slot];
         let id = AudioNodeId(slot.id.load(Ordering::Acquire));
         let mut word = slot.word.load(Ordering::Acquire);
+        let prior_phase;
         loop {
             if generation(word) != key.generation.get()
                 || !has_reclaim(word)
@@ -31,7 +32,10 @@ impl InjectedNodeLifetimeOwner {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    prior_phase = SlotPhase::from_word(word);
+                    break;
+                }
                 Err(observed) => word = observed,
             }
         }
@@ -55,6 +59,24 @@ impl InjectedNodeLifetimeOwner {
 
         match panic::catch_unwind(AssertUnwindSafe(|| cleanup.reconcile(id))) {
             Ok(Ok(())) => {}
+            Ok(Err(NodeReclaimCleanupError::RetryContended)) => {
+                if self.restore_reconcile_retry(&inner, key, prior_phase, cleanup, reclaim) {
+                    let _ = inner.request_wake.try_send(());
+                    return NodeLifetimeDriveOutcome::Retry {
+                        id,
+                        reason: NodeLifetimeRetryReason::Contended,
+                    };
+                }
+                let _allocation = inner
+                    .allocation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                quarantine_registry_locked(&inner);
+                return NodeLifetimeDriveOutcome::Quarantined {
+                    id: Some(id),
+                    reason: NodeLifetimeQuarantineReason::ProtocolViolation,
+                };
+            }
             Ok(Err(_)) => {
                 self.retain_reconcile_failure(&inner, key, Some(cleanup), reclaim);
                 return NodeLifetimeDriveOutcome::Quarantined {
@@ -154,6 +176,62 @@ impl InjectedNodeLifetimeOwner {
         }
         drop(allocation);
         NodeLifetimeDriveOutcome::Reconciled { id }
+    }
+
+    fn restore_reconcile_retry(
+        &mut self,
+        inner: &Arc<NodeLifetimeInner>,
+        key: RegistrationKey,
+        prior_phase: SlotPhase,
+        cleanup: Box<dyn InjectedNodeReclaimCleanup>,
+        reclaim: OwnedPendingNodeReclaim,
+    ) -> bool {
+        debug_assert!(matches!(
+            prior_phase,
+            SlotPhase::Requested | SlotPhase::AwaitingReclaim
+        ));
+        let slot = &inner.slots[key.slot];
+        let mut payload = slot
+            .payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expected = slot_word(key.generation.get(), SlotPhase::Reconciling, true);
+        if slot.word.load(Ordering::Acquire) != expected
+            || payload.cleanup.is_some()
+            || payload.reclaim.is_some()
+        {
+            std::mem::forget(cleanup);
+            if self.orphan_reclaim.is_none() {
+                self.orphan_reclaim = Some(reclaim);
+            } else {
+                std::mem::forget(reclaim);
+            }
+            return false;
+        }
+        payload.cleanup = Some(cleanup);
+        payload.reclaim = Some(reclaim);
+        if slot
+            .word
+            .compare_exchange(
+                expected,
+                slot_word(key.generation.get(), prior_phase, true),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            true
+        } else {
+            let cleanup = payload.cleanup.take().unwrap();
+            let reclaim = payload.reclaim.take().unwrap();
+            std::mem::forget(cleanup);
+            if self.orphan_reclaim.is_none() {
+                self.orphan_reclaim = Some(reclaim);
+            } else {
+                std::mem::forget(reclaim);
+            }
+            false
+        }
     }
 
     fn retain_reconcile_failure(

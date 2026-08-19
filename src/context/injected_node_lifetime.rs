@@ -13,6 +13,9 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 
+use super::injected_connections::{
+    InjectedConnectionRegistryInner, InjectedConnectionRegistryRetirement,
+};
 use super::injected_control::{
     AcceptedBatchFinalizeError, BeginControlCloseFailure, BeginControlStateTransition,
     ControlCloseDegradation, ControlCloseRetirement, ControlStateBoundary, ControlStateObservation,
@@ -125,6 +128,9 @@ impl RegistryPhase {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NodeReclaimCleanupError {
+    /// A live off-thread host serializer is temporarily held. The lifecycle driver must retain
+    /// the exact cleanup and reclaim token and retry without quarantining the registration.
+    RetryContended,
     Rejected,
 }
 
@@ -135,6 +141,16 @@ pub(crate) enum NodeReclaimCleanupError {
 /// reporting a final rejected cleanup.
 pub(crate) trait InjectedNodeReclaimCleanup: Send {
     fn reconcile(&mut self, id: AudioNodeId) -> Result<(), NodeReclaimCleanupError>;
+
+    /// Whole-graph retirement runs only after the outer lifetime registry is uniquely owned.
+    /// Concrete incident-edge cleanup may override this when ordinary reconciliation depends on
+    /// a Weak registry which is nevertheless retained by the moved outer owner.
+    fn reconcile_after_whole_graph(
+        &mut self,
+        id: AudioNodeId,
+    ) -> Result<(), NodeReclaimCleanupError> {
+        self.reconcile(id)
+    }
 }
 
 struct SlotPayload {
@@ -155,6 +171,9 @@ struct NodeLifetimeInner {
     request_wake: crossbeam_channel::Sender<()>,
     control_identity: InjectedControlIdentity,
     node_id_identity: InjectedNodeIdIdentity,
+    /// Sole strong owner of the exact explicit host registry. Base and endpoint capabilities may
+    /// upgrade only the outer lifetime Arc; incident cleanup alone receives a Weak nested handle.
+    connections: Arc<InjectedConnectionRegistryInner>,
     #[cfg(test)]
     registration_publish_hook: Mutex<
         Option<(
@@ -1150,6 +1169,7 @@ pub(crate) fn injected_node_lifetime_registry(
         request_wake,
         control_identity: control.identity(),
         node_id_identity: node_ids.identity(),
+        connections: InjectedConnectionRegistryInner::new(),
         #[cfg(test)]
         registration_publish_hook: Mutex::new(None),
         #[cfg(test)]
@@ -1939,7 +1959,8 @@ impl InjectedNodeLifetimeOwner {
             .allocation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut degraded = registry_quarantined;
+        let connection_degraded = inner.connections.seal_after_control_drain();
+        let mut degraded = registry_quarantined || connection_degraded;
         for slot in &inner.slots {
             loop {
                 let word = slot.word.load(Ordering::Acquire);
@@ -2094,7 +2115,9 @@ impl SealedNodeLifetimeRegistry {
             };
             if let Some(mut cleanup) = cleanup {
                 cleanup_count += 1;
-                match panic::catch_unwind(AssertUnwindSafe(|| cleanup.reconcile(id))) {
+                match panic::catch_unwind(AssertUnwindSafe(|| {
+                    cleanup.reconcile_after_whole_graph(id)
+                })) {
                     Ok(Ok(())) => cleanup_panicked |= !panic_safe_drop(cleanup),
                     Ok(Err(_)) => {
                         cleanup_rejected = true;
@@ -2130,12 +2153,18 @@ impl SealedNodeLifetimeRegistry {
         self.request_wake.take();
         self.control.take();
         drop(node_ids);
-        drop(inner);
+        // Outer Arc uniqueness proved that no endpoint/base host operation survives. Slot cleanup
+        // has now dropped every temporary nested upgrade, so a first-time nested ownership
+        // failure is structural and must be reported rather than retried under a new Arc identity.
+        let NodeLifetimeInner { connections, .. } = inner;
+        let connection_registry =
+            InjectedConnectionRegistryInner::retire_after_slot_cleanup(connections);
         Ok(WholeGraphNodeRetirement {
             cleanup_count,
             cleanup_panicked,
             cleanup_rejected,
             reclaim_brand_mismatch,
+            connection_registry,
             pre_retirement_degraded: self.degraded,
         })
     }
@@ -2197,8 +2226,11 @@ pub(crate) struct WholeGraphNodeRetirement {
     pub(crate) cleanup_panicked: bool,
     pub(crate) cleanup_rejected: bool,
     pub(crate) reclaim_brand_mismatch: bool,
+    pub(crate) connection_registry: InjectedConnectionRegistryRetirement,
     /// Degradation already recorded while the registry was open or sealed. Callers must also
-    /// include the cleanup and brand-mismatch fields when computing the final context outcome.
+    /// include the cleanup and brand-mismatch fields plus
+    /// `connection_registry.{protocol_failed, serializer_poison_recovered,
+    /// ownership_mismatch}` when computing the final context outcome.
     pub(crate) pre_retirement_degraded: bool,
 }
 
@@ -2209,6 +2241,7 @@ mod tests {
     use std::thread::{self, ThreadId};
 
     use super::*;
+    use crate::context::injected_connections::InjectedHostExplicitConnection;
     use crate::context::injected_control::{
         injected_control_channel, InjectedControlLifecycleOwner, InjectedControlRenderInit,
     };
@@ -2970,6 +3003,52 @@ mod tests {
         assert_eq!(report.cleanup_count, 1);
         assert_eq!(reconciled.lock().unwrap()[0], (AudioNodeId(7), thread_id));
         assert_eq!(dropped.lock().unwrap().as_slice(), &[thread_id]);
+    }
+
+    #[test]
+    fn embedded_connection_registry_seals_and_clears_residuals_with_degradation_report() {
+        let mut foundation = Foundation::new(1, 100);
+        let connections = &foundation.owner.as_ref().unwrap().inner().connections;
+        connections.push_residual_for_test(InjectedHostExplicitConnection {
+            edge: (AudioNodeId(11), 0, AudioNodeId(0), 0),
+            source_generation: 1,
+            destination_generation: 0,
+        });
+        connections.fail_closed_protocol();
+        let poisoned = panic::catch_unwind(AssertUnwindSafe(|| {
+            connections.poison_serializer_for_test();
+        }));
+        assert!(poisoned.is_err());
+        if let Err(payload) = poisoned {
+            std::mem::forget(payload);
+        }
+
+        let sealed = foundation.seal();
+        assert!(sealed.degraded());
+        let proof = WholeGraphRetired::for_test(&sealed);
+        let report = sealed.retire_after_whole_graph(proof).ok().unwrap();
+        assert_eq!(report.connection_registry.residual_edges_cleared, 1);
+        assert!(report.connection_registry.protocol_failed);
+        assert!(report.connection_registry.serializer_poison_recovered);
+        assert!(!report.connection_registry.ownership_mismatch);
+    }
+
+    #[test]
+    fn nested_connection_registry_ownership_mismatch_is_quarantined_and_reported() {
+        let mut foundation = Foundation::new(1, 100);
+        let foreign_strong = Arc::clone(&foundation.owner.as_ref().unwrap().inner().connections);
+
+        let sealed = foundation.seal();
+        let proof = WholeGraphRetired::for_test(&sealed);
+        let report = sealed.retire_after_whole_graph(proof).ok().unwrap();
+        assert_eq!(report.connection_registry.residual_edges_cleared, 0);
+        assert!(report.connection_registry.protocol_failed);
+        assert!(!report.connection_registry.serializer_poison_recovered);
+        assert!(report.connection_registry.ownership_mismatch);
+
+        // Retirement deliberately retained a quarantined strong owner rather than rebuilding the
+        // nested Arc under a new identity. Releasing this test clone cannot make that owner usable.
+        drop(foreign_strong);
     }
 
     #[test]
