@@ -14,6 +14,7 @@ use arrayvec::ArrayVec;
 use super::injected_connections::{
     InjectedConnectionEndpoint, InjectedConnectionEndpointKind, InjectedConnectionOperationError,
     InjectedConnectionOperationOutcome, InjectedConnectionRegistryInner,
+    InjectedDisconnectSelector,
 };
 use super::injected_control::{
     AcceptedBatchFinalizeFailure, CommitControlOutcome, CommitWithFinalizeFailure,
@@ -324,8 +325,11 @@ impl InjectedNodeConstructor {
             .edge_count_for_test()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)] // selected only by h2b's public overload dispatch
+    #[cfg(test)]
+    pub(crate) fn connection_transport_accounting_for_test(&self) -> (usize, usize, usize, usize) {
+        self.control.accounting()
+    }
+
     pub(crate) fn connect_exact(
         &self,
         source: &InjectedConnectionEndpoint,
@@ -344,22 +348,17 @@ impl InjectedNodeConstructor {
         )
     }
 
-    #[allow(dead_code)] // selected only by h2b's public overload dispatch
     pub(crate) fn disconnect_exact(
         &self,
         source: &InjectedConnectionEndpoint,
-        output: Option<usize>,
-        destination: Option<&InjectedConnectionEndpoint>,
-        input: Option<usize>,
+        selector: InjectedDisconnectSelector<'_>,
     ) -> Result<InjectedConnectionOperationOutcome, InjectedConnectionOperationError> {
         InjectedConnectionRegistryInner::disconnect(
             &self.control,
             &self.allocator.identity(),
             &self.lifetimes.registry_identity(),
             source,
-            output,
-            destination,
-            input,
+            selector,
         )
     }
 }
