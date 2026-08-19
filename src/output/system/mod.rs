@@ -1,10 +1,12 @@
-//! Private system-output foundation.
+//! System output endpoint adapters.
 //!
 //! This module deliberately does not reuse `crate::io`: the legacy backends construct and own a
 //! second `RenderThread`, while hosted contexts hand an endpoint one exact `AudioRenderCallback`.
 
 #[cfg(all(feature = "cpal", not(feature = "cubeb")))]
 mod cpal;
+#[cfg(feature = "cubeb")]
+mod cubeb;
 mod none;
 
 use std::cell::UnsafeCell;
@@ -28,13 +30,37 @@ const BRIDGE_ACTIVE: u8 = 1;
 const BRIDGE_CLOSED: u8 = 2;
 const BRIDGE_SUSPENDED: u8 = 4;
 
-/// The future-facing system factory remains crate-private until every feature-selected physical
-/// backend has the same callback and thread-retirement proof as the silent endpoint.
+/// Factory for an independently owned system output endpoint.
+///
+/// The sink identifier `"none"` always selects the joinable silent endpoint and requires no
+/// physical-audio feature. Otherwise Cubeb is selected when the `cubeb` feature is enabled; CPAL
+/// is selected when `cpal` is enabled without `cubeb`. A physical sink is unsupported when neither
+/// feature is enabled. This additive hosted path does not alter the backend used by
+/// [`AudioContext::new`](crate::context::AudioContext::new) or its legacy sink-switching behavior.
+///
+/// Use it with [`AudioContext::builder`](crate::context::AudioContext::builder):
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use web_audio_api::context::{AudioContext, AudioContextOptions};
+/// use web_audio_api::output::SystemAudioOutput;
+///
+/// let context = AudioContext::builder(Arc::new(SystemAudioOutput::new()))
+///     .options(AudioContextOptions {
+///         sink_id: "none".into(),
+///         ..AudioContextOptions::default()
+///     })
+///     .build()?;
+/// # context.close_sync();
+/// # Ok::<(), web_audio_api::context::AudioContextBuildError>(())
+/// ```
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SystemAudioOutput;
+pub struct SystemAudioOutput;
 
 impl SystemAudioOutput {
-    pub(crate) const fn new() -> Self {
+    /// Constructs a stateless system-output factory.
+    #[must_use]
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -48,16 +74,21 @@ impl AudioOutputFactory for SystemAudioOutput {
             return none::prepare(request);
         }
 
+        #[cfg(feature = "cubeb")]
+        {
+            cubeb::prepare(request)
+        }
+
         #[cfg(all(feature = "cpal", not(feature = "cubeb")))]
         {
             cpal::prepare(request)
         }
 
-        #[cfg(not(all(feature = "cpal", not(feature = "cubeb"))))]
+        #[cfg(not(any(feature = "cpal", feature = "cubeb")))]
         {
             Err(AudioOutputError::new(
                 AudioOutputErrorKind::NotSupported,
-                "physical hosted system output is not enabled in this private foundation",
+                "physical hosted system output requires the Cubeb or CPAL feature",
             ))
         }
     }
@@ -839,5 +870,36 @@ mod tests {
             AudioContextShutdownOutcome::Confirmed(_)
         ));
         assert_eq!(running.state(), AudioContextState::Closed);
+    }
+
+    #[cfg(not(any(feature = "cpal", feature = "cubeb")))]
+    #[test]
+    fn public_system_factory_reports_physical_output_unsupported_without_features() {
+        let request = AudioOutputRequest::new(
+            AudioOutputContextId::new(2).unwrap(),
+            String::new(),
+            Some(48_000.),
+            2,
+            AudioContextLatencyCategory::Interactive,
+            AudioContextRenderSizeCategory::Default,
+            None,
+        )
+        .unwrap();
+        let error = match SystemAudioOutput::new().prepare(&request) {
+            Ok(_) => panic!("featureless physical system output unexpectedly prepared"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), AudioOutputErrorKind::NotSupported);
+        assert!(error.message().contains("Cubeb or CPAL"));
+
+        // The feature-independent silent sink remains a fully public hosted output.
+        let context = AudioContext::builder(Arc::new(SystemAudioOutput::new()))
+            .options(AudioContextOptions {
+                sink_id: "none".into(),
+                ..AudioContextOptions::default()
+            })
+            .build()
+            .unwrap();
+        executor::block_on(context.close());
     }
 }
