@@ -1386,10 +1386,21 @@ fn bounded_state_event_failure_is_terminal_and_silently_closes() {
         wait_state(controller.state_control().suspend().unwrap()),
         InjectedStateChangeOutcome::Failed(InjectedStateChangeFailure::EventDelivery)
     );
-    assert_eq!(base.state(), AudioContextState::Suspended);
+    // The failed event enqueue first publishes Suspended, then authoritatively latches Silent
+    // teardown. Receipt completion and physical retirement run consecutively, so the shared state
+    // may already have reached absorbing Closed by the time this observing thread resumes.
+    assert!(matches!(
+        base.state(),
+        AudioContextState::Suspended | AudioContextState::Closed
+    ));
     handler_release_send.send(()).unwrap();
     let report = confirmed(wait_receipt(shutdown));
     assert_eq!(report.mode(), OutputShutdownMode::Silent);
+    assert_eq!(
+        report.reclaim_issue().unwrap().kind(),
+        OutputShutdownIssueKind::EventDeliveryDegraded
+    );
+    assert!(report.event_issue().is_none());
     assert_eq!(base.state(), AudioContextState::Closed);
 }
 
