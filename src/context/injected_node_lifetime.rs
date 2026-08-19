@@ -46,7 +46,14 @@ pub(crate) use teardown::{
 #[cfg(test)]
 mod teardown_tests;
 
-pub(crate) const DEFAULT_NODE_LIFETIME_CAPACITY: usize = 256;
+/// Fixed ordinary-node lifetime capacity for one hosted graph.
+///
+/// An exact Oscillator owns three ordinary slots (oscillator, frequency, and
+/// detune). Keeping at least 257 simultaneously live scheduled sources is
+/// required to prove that terminal completion remains authoritative when the
+/// separate 256-record event queue is saturated.
+pub(crate) const DEFAULT_NODE_LIFETIME_CAPACITY: usize = 1024;
+const _: () = assert!(DEFAULT_NODE_LIFETIME_CAPACITY >= 3 * 257);
 
 const PHASE_BITS: u32 = 4;
 const RECLAIMED_BIT: u64 = 1 << PHASE_BITS;

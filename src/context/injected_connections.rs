@@ -32,6 +32,10 @@ use crate::message::ControlMessage;
 pub(crate) const MAX_INJECTED_EXPLICIT_CONNECTIONS: usize = 256;
 
 /// Magic nodes 0 through 10 plus every concurrently represented ordinary lifetime slot.
+///
+/// This is intentionally independent of the smaller explicit-edge ceiling: a
+/// graph may retain many disconnected scheduled sources without representing
+/// an explicit connection for each one.
 pub(crate) const MAX_INJECTED_GRAPH_NODES: usize =
     11 + super::injected_node_lifetime::DEFAULT_NODE_LIFETIME_CAPACITY;
 
