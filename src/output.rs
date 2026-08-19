@@ -1024,6 +1024,9 @@ pub trait PreparedAudioOutput: Send + 'static {
     fn config(&self) -> &AudioOutputConfig;
 
     /// Installs the context render callback and starts endpoint ownership.
+    ///
+    /// On success the returned endpoint is logically running. A context whose graph begins
+    /// suspended must reconcile that native endpoint state through its lifecycle owner.
     fn start(
         self: Box<Self>,
         callback: AudioRenderCallback,

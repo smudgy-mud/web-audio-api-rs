@@ -66,6 +66,7 @@ pub(crate) enum OutputShutdownMode {
 pub(crate) enum OutputShutdownIssueKind {
     EndpointMethodPanicked,
     EndpointFuturePanicked,
+    EndpointStateTransitionFailed,
     EndpointRejectedShutdown,
     CallbackRetained,
     RenderReclaimDegraded,

@@ -28,7 +28,7 @@ use crate::context::{
 use crate::events::{
     injected_event_dispatch_setup, injected_event_dispatch_setup_bounded_for_test,
     injected_event_dispatch_setup_with_handlers, EventDispatch, EventHandler, EventLoopExit,
-    EventType, InjectedEventDispatchSetup, InjectedLifecycleEventLoop,
+    EventPayload, EventType, InjectedEventDispatchSetup, InjectedLifecycleEventLoop,
 };
 use crate::message::ControlMessage;
 use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
@@ -225,9 +225,17 @@ struct PumpControl {
     release: AtomicBool,
     stop: AtomicBool,
     resume_count: AtomicUsize,
+    suspend_count: AtomicUsize,
     render_count: AtomicUsize,
     shutdown_called: AtomicBool,
     resume_panics: AtomicBool,
+    resume_errors: AtomicBool,
+    suspend_panics: AtomicBool,
+    suspend_errors: AtomicBool,
+    resume_blocked: AtomicBool,
+    resume_entered: AtomicBool,
+    suspend_blocked: AtomicBool,
+    suspend_entered: AtomicBool,
     shutdown_behavior: AtomicU8,
     future_drop_ran: AtomicBool,
 }
@@ -239,9 +247,17 @@ impl PumpControl {
             release: AtomicBool::new(released),
             stop: AtomicBool::new(false),
             resume_count: AtomicUsize::new(0),
+            suspend_count: AtomicUsize::new(0),
             render_count: AtomicUsize::new(0),
             shutdown_called: AtomicBool::new(false),
             resume_panics: AtomicBool::new(false),
+            resume_errors: AtomicBool::new(false),
+            suspend_panics: AtomicBool::new(false),
+            suspend_errors: AtomicBool::new(false),
+            resume_blocked: AtomicBool::new(false),
+            resume_entered: AtomicBool::new(false),
+            suspend_blocked: AtomicBool::new(false),
+            suspend_entered: AtomicBool::new(false),
             shutdown_behavior: AtomicU8::new(0),
             future_drop_ran: AtomicBool::new(false),
         })
@@ -279,8 +295,18 @@ struct PumpEndpoint {
 
 impl RunningAudioOutput for PumpEndpoint {
     fn resume(&mut self) -> Result<(), AudioOutputError> {
+        self.control.resume_entered.store(true, Ordering::Release);
+        while self.control.resume_blocked.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
         if self.control.resume_panics.load(Ordering::Acquire) {
             panic!("test endpoint resume panic");
+        }
+        if self.control.resume_errors.load(Ordering::Acquire) {
+            return Err(AudioOutputError::new(
+                AudioOutputErrorKind::BackendSpecific,
+                "test endpoint resume error",
+            ));
         }
         self.control.resume_count.fetch_add(1, Ordering::AcqRel);
         self.control.running.store(true, Ordering::Release);
@@ -288,6 +314,20 @@ impl RunningAudioOutput for PumpEndpoint {
     }
 
     fn suspend(&mut self) -> Result<(), AudioOutputError> {
+        self.control.suspend_entered.store(true, Ordering::Release);
+        while self.control.suspend_blocked.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if self.control.suspend_panics.load(Ordering::Acquire) {
+            panic!("test endpoint suspend panic");
+        }
+        if self.control.suspend_errors.load(Ordering::Acquire) {
+            return Err(AudioOutputError::new(
+                AudioOutputErrorKind::BackendSpecific,
+                "test endpoint suspend error",
+            ));
+        }
+        self.control.suspend_count.fetch_add(1, Ordering::AcqRel);
         self.control.running.store(false, Ordering::Release);
         Ok(())
     }
@@ -602,6 +642,23 @@ fn wait_receipt(receipt: OutputShutdownReceipt) -> OutputShutdownOutcome {
     });
     recv.recv_timeout(TIMEOUT)
         .expect("injected lifecycle receipt timed out")
+}
+
+fn wait_state(receipt: InjectedStateChangeReceipt) -> InjectedStateChangeOutcome {
+    let (send, recv) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = send.send(executor::block_on(receipt));
+    });
+    recv.recv_timeout(TIMEOUT)
+        .expect("injected state-change receipt timed out")
+}
+
+fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while !predicate() {
+        assert!(std::time::Instant::now() < deadline, "{message}");
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn confirmed(outcome: OutputShutdownOutcome) -> OutputShutdownReport {
@@ -1132,7 +1189,9 @@ fn exact_base_cannot_publish_closed_before_physical_retirement() {
 
 #[test]
 fn suspended_graceful_close_resumes_once_and_retires_exact_graph() {
-    let control = PumpControl::new(true, true);
+    // Prepared::start publishes a logically Running endpoint even though the exact graph starts
+    // suspended. The lifecycle worker must reconcile native suspension autonomously.
+    let control = PumpControl::new(false, true);
     let fixture = lifecycle_fixture_with_suspension(true, false);
     let base = fixture.take_exact_base();
     assert_eq!(base.state(), AudioContextState::Suspended);
@@ -1150,14 +1209,680 @@ fn suspended_graceful_close_resumes_once_and_retires_exact_graph() {
     };
     assert_eq!(controller.base().address(), base.address());
 
+    wait_until(
+        || control.suspend_count.load(Ordering::Acquire) == 1,
+        "initial native suspension was not reconciled",
+    );
+    assert!(!control.running.load(Ordering::Acquire));
+
     let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
     assert_eq!(report.mode(), OutputShutdownMode::Graceful);
     assert_eq!(control.resume_count.load(Ordering::Acquire), 1);
+    assert_eq!(control.suspend_count.load(Ordering::Acquire), 1);
     assert!(control.render_count.load(Ordering::Acquire) > 0);
     assert!(control.shutdown_called.load(Ordering::Acquire));
     assert!(report.reclaim_issue().is_none());
     assert!(report.event_issue().is_none());
     assert_eq!(base.state(), AudioContextState::Closed);
+}
+
+#[test]
+fn suspended_graceful_close_resume_error_is_uncertain_and_never_calls_shutdown() {
+    let fixture = lifecycle_fixture_with_event_setup(
+        true,
+        false,
+        8,
+        injected_event_dispatch_setup().unwrap(),
+    );
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    wait_until(
+        || control.suspend_count.load(Ordering::Acquire) == 1,
+        "initial native suspension did not complete",
+    );
+    assert_eq!(base.state(), AudioContextState::Suspended);
+    control.resume_errors.store(true, Ordering::Release);
+
+    let OutputShutdownOutcome::Unconfirmed { failure, .. } =
+        wait_receipt(controller.shutdown_gracefully())
+    else {
+        panic!("failed Close-observability resume must leave endpoint ownership uncertain");
+    };
+    assert_eq!(
+        failure.kind(),
+        OutputShutdownIssueKind::EndpointStateTransitionFailed
+    );
+    assert!(!control.shutdown_called.load(Ordering::Acquire));
+}
+
+#[test]
+fn running_suspend_resume_orders_exact_state_events_and_native_endpoint() {
+    let (state_send, state_recv) = mpsc::channel();
+    let setup = injected_event_dispatch_setup_with_handlers(move |event_loop| {
+        event_loop.set_handler(
+            EventType::StateChange,
+            EventHandler::Multiple(Box::new(move |payload| {
+                if let EventPayload::AudioContextState(state) = payload {
+                    let _ = state_send.send(state);
+                }
+            })),
+        );
+    })
+    .unwrap();
+    let fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let state = controller.state_control();
+    wait_until(
+        || control.render_count.load(Ordering::Acquire) > 2,
+        "running callback did not render",
+    );
+
+    assert_eq!(
+        wait_state(state.suspend().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    assert_eq!(base.state(), AudioContextState::Suspended);
+    assert_eq!(control.suspend_count.load(Ordering::Acquire), 1);
+    assert!(!control.running.load(Ordering::Acquire));
+    assert_eq!(
+        state_recv.recv_timeout(TIMEOUT).unwrap(),
+        AudioContextState::Suspended
+    );
+    let halted = control.render_count.load(Ordering::Acquire);
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(control.render_count.load(Ordering::Acquire), halted);
+
+    assert_eq!(
+        wait_state(state.resume().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    assert_eq!(base.state(), AudioContextState::Running);
+    assert_eq!(control.resume_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        state_recv.recv_timeout(TIMEOUT).unwrap(),
+        AudioContextState::Running
+    );
+    wait_until(
+        || control.render_count.load(Ordering::Acquire) > halted,
+        "resumed callback did not render",
+    );
+
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+    assert_eq!(base.state(), AudioContextState::Closed);
+}
+
+#[test]
+fn bounded_state_event_failure_is_terminal_and_silently_closes() {
+    let (handler_entered_send, handler_entered) = crossbeam_channel::bounded(1);
+    let (handler_release_send, handler_release) = crossbeam_channel::bounded(1);
+    let setup = injected_event_dispatch_setup_bounded_for_test(1, move |events| {
+        events.set_handler(
+            EventType::SinkChange,
+            EventHandler::Once(Box::new(move |_| {
+                handler_entered_send.send(()).unwrap();
+                handler_release.recv().unwrap();
+            })),
+        );
+    })
+    .unwrap();
+    let fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    assert_eq!(base.send_event_with(EventDispatch::sink_change), Ok(()));
+    handler_entered.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(
+        base.send_event_with(EventDispatch::control_batch_activity),
+        Ok(())
+    );
+
+    let shutdown = controller.receipt();
+    assert_eq!(
+        wait_state(controller.state_control().suspend().unwrap()),
+        InjectedStateChangeOutcome::Failed(InjectedStateChangeFailure::EventDelivery)
+    );
+    assert_eq!(base.state(), AudioContextState::Suspended);
+    handler_release_send.send(()).unwrap();
+    let report = confirmed(wait_receipt(shutdown));
+    assert_eq!(report.mode(), OutputShutdownMode::Silent);
+    assert_eq!(base.state(), AudioContextState::Closed);
+}
+
+#[test]
+fn resume_flushes_all_staged_graph_work_before_state_ack() {
+    let fixture = lifecycle_fixture();
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let state = controller.state_control();
+    assert_eq!(
+        wait_state(state.suspend().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    let applied_before = base.applied_control_batch_sequence();
+    let first_gain = base
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap()
+        .commit(gain_payload())
+        .unwrap();
+    let second_gain = base
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap()
+        .commit(gain_payload())
+        .unwrap();
+    assert_eq!(base.applied_control_batch_sequence(), applied_before);
+
+    control.resume_blocked.store(true, Ordering::Release);
+    let resumed = state.resume().unwrap();
+    wait_until(
+        || control.resume_entered.load(Ordering::Acquire),
+        "native resume was not invoked before staged flush",
+    );
+    assert_eq!(base.state(), AudioContextState::Suspended);
+    assert_eq!(base.applied_control_batch_sequence(), applied_before);
+    control.resume_blocked.store(false, Ordering::Release);
+    assert_eq!(wait_state(resumed), InjectedStateChangeOutcome::Applied);
+    assert!(base.applied_control_batch_sequence() > applied_before);
+    assert_eq!(base.state(), AudioContextState::Running);
+    assert!(base.applied_control_batch_sequence() >= applied_before + 2);
+    drop(first_gain);
+    drop(second_gain);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn dropped_caller_does_not_cancel_and_duplicate_requests_coalesce() {
+    let fixture = lifecycle_fixture();
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let state = controller.state_control();
+    drop(state.suspend().unwrap());
+    let duplicate = state.suspend().unwrap();
+    wait_until(
+        || base.state() == AudioContextState::Suspended,
+        "dropped Suspend caller cancelled native work",
+    );
+    assert_eq!(wait_state(duplicate), InjectedStateChangeOutcome::Unchanged);
+    assert_eq!(control.suspend_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        wait_state(state.resume().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    assert_eq!(control.resume_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn close_supersedes_stalled_state_barrier_and_uses_next_sequence() {
+    let fixture = lifecycle_fixture();
+    let control = PumpControl::new(false, false);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let state = controller.state_control();
+    let state_receipt = state.suspend().unwrap();
+    thread::sleep(Duration::from_millis(20));
+    let shutdown = controller.shutdown_gracefully();
+    control.release.store(true, Ordering::Release);
+    assert_eq!(
+        wait_state(state_receipt),
+        InjectedStateChangeOutcome::SupersededByShutdown
+    );
+    assert_eq!(
+        confirmed(wait_receipt(shutdown)).mode(),
+        OutputShutdownMode::Graceful
+    );
+    assert!(control.shutdown_called.load(Ordering::Acquire));
+    assert_eq!(
+        wait_state(state.resume().unwrap()),
+        InjectedStateChangeOutcome::Closed
+    );
+}
+
+#[test]
+fn endpoint_suspend_error_is_uncertain_and_never_reenters_shutdown() {
+    let fixture = lifecycle_fixture();
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    control.suspend_errors.store(true, Ordering::Release);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let shutdown = controller.receipt();
+    assert_eq!(
+        wait_state(controller.state_control().suspend().unwrap()),
+        InjectedStateChangeOutcome::Failed(InjectedStateChangeFailure::EndpointUncertain)
+    );
+    let OutputShutdownOutcome::Unconfirmed { failure, .. } = wait_receipt(shutdown) else {
+        panic!("endpoint transition error must not mint graph proof");
+    };
+    assert_eq!(
+        failure.kind(),
+        OutputShutdownIssueKind::EndpointStateTransitionFailed
+    );
+    assert!(!control.shutdown_called.load(Ordering::Acquire));
+    assert_eq!(base.state(), AudioContextState::Suspended);
+}
+
+#[test]
+fn suspend_event_and_ack_precede_native_call_and_close_latches_during_block() {
+    let (state_send, state_recv) = mpsc::sync_channel(1);
+    let setup = injected_event_dispatch_setup_with_handlers(move |events| {
+        events.set_handler(
+            EventType::StateChange,
+            EventHandler::Multiple(Box::new(move |payload| {
+                if let EventPayload::AudioContextState(state) = payload {
+                    let _ = state_send.send(state);
+                }
+            })),
+        );
+    })
+    .unwrap();
+    let fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    control.suspend_blocked.store(true, Ordering::Release);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let state_receipt = controller.state_control().suspend().unwrap();
+    wait_until(
+        || control.suspend_entered.load(Ordering::Acquire),
+        "native suspend was not reached",
+    );
+    assert_eq!(base.state(), AudioContextState::Suspended);
+    assert_eq!(
+        state_recv.recv_timeout(TIMEOUT).unwrap(),
+        AudioContextState::Suspended
+    );
+
+    let shutdown = controller.shutdown_silently();
+    control.suspend_blocked.store(false, Ordering::Release);
+    assert_eq!(
+        wait_state(state_receipt),
+        InjectedStateChangeOutcome::SupersededByShutdown
+    );
+    assert_eq!(
+        confirmed(wait_receipt(shutdown)).mode(),
+        OutputShutdownMode::Silent
+    );
+    assert!(control.shutdown_called.load(Ordering::Acquire));
+}
+
+#[test]
+fn opposing_state_requests_are_fifo_serialized() {
+    let (state_send, state_recv) = mpsc::channel();
+    let setup = injected_event_dispatch_setup_with_handlers(move |events| {
+        events.set_handler(
+            EventType::StateChange,
+            EventHandler::Multiple(Box::new(move |payload| {
+                if let EventPayload::AudioContextState(state) = payload {
+                    let _ = state_send.send(state);
+                }
+            })),
+        );
+    })
+    .unwrap();
+    let fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let state = controller.state_control();
+    let suspend = state.suspend().unwrap();
+    let resume = state.resume().unwrap();
+    assert_eq!(wait_state(suspend), InjectedStateChangeOutcome::Applied);
+    assert_eq!(wait_state(resume), InjectedStateChangeOutcome::Applied);
+    assert_eq!(
+        state_recv.recv_timeout(TIMEOUT).unwrap(),
+        AudioContextState::Suspended
+    );
+    assert_eq!(
+        state_recv.recv_timeout(TIMEOUT).unwrap(),
+        AudioContextState::Running
+    );
+    assert_eq!(control.suspend_count.load(Ordering::Acquire), 1);
+    assert_eq!(control.resume_count.load(Ordering::Acquire), 1);
+    assert_eq!(base.state(), AudioContextState::Running);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn state_request_queue_full_cannot_block_out_of_band_close() {
+    let fixture = lifecycle_fixture();
+    let control = PumpControl::new(false, true);
+    control.suspend_blocked.store(true, Ordering::Release);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let state = controller.state_control();
+    let first = state.suspend().unwrap();
+    wait_until(
+        || control.suspend_entered.load(Ordering::Acquire),
+        "first state request did not enter native suspend",
+    );
+    let mut queued = Vec::new();
+    for index in 0..STATE_REQUEST_CAPACITY {
+        queued.push(if index % 2 == 0 {
+            state.resume().unwrap()
+        } else {
+            state.suspend().unwrap()
+        });
+    }
+    assert_eq!(
+        state.resume().err(),
+        Some(InjectedControlError::LogicalCommandCredits)
+    );
+    let shutdown = controller.shutdown_silently();
+    control.suspend_blocked.store(false, Ordering::Release);
+    assert_eq!(
+        wait_state(first),
+        InjectedStateChangeOutcome::SupersededByShutdown
+    );
+    for receipt in queued {
+        assert_eq!(
+            wait_state(receipt),
+            InjectedStateChangeOutcome::SupersededByShutdown
+        );
+    }
+    assert_eq!(
+        confirmed(wait_receipt(shutdown)).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
+fn active_preboundary_graph_preparation_delays_suspend_without_blocking_callback() {
+    let fixture = lifecycle_fixture();
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    let transaction = base
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap();
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let state = controller.state_control();
+    let suspended = state.suspend().unwrap();
+    let callbacks_before = control.render_count.load(Ordering::Acquire);
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(base.state(), AudioContextState::Running);
+    assert!(
+        control.render_count.load(Ordering::Acquire) > callbacks_before,
+        "pre-boundary preparation must not stop the active callback"
+    );
+    let gain = transaction.commit(gain_payload()).unwrap();
+    assert_eq!(wait_state(suspended), InjectedStateChangeOutcome::Applied);
+    assert_eq!(base.state(), AudioContextState::Suspended);
+    drop(gain);
+    assert_eq!(
+        wait_state(state.resume().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn state_barrier_live_stall_has_no_deadline_and_endpoint_death_supersedes() {
+    let fixture = lifecycle_fixture();
+    let control = PumpControl::new(false, false);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let state_receipt = controller.state_control().suspend().unwrap();
+    let (state_send, state_recv) = mpsc::sync_channel(1);
+    thread::spawn(move || state_send.send(executor::block_on(state_receipt)).unwrap());
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(state_recv.try_recv(), Err(mpsc::TryRecvError::Empty));
+    control.stop.store(true, Ordering::Release);
+    assert_eq!(
+        state_recv.recv_timeout(TIMEOUT).unwrap(),
+        InjectedStateChangeOutcome::SupersededByShutdown
+    );
+    let report = confirmed(wait_receipt(controller.receipt()));
+    assert_eq!(report.mode(), OutputShutdownMode::Silent);
+    assert!(report.endpoint_death().is_some());
+}
+
+#[test]
+fn resume_error_and_panic_are_uncertain_state_failures() {
+    for panic_on_resume in [false, true] {
+        let fixture = lifecycle_fixture();
+        let control = PumpControl::new(false, true);
+        let lifecycle = start(
+            TestPrepared::new(
+                format(48_000.),
+                PreparedBehavior::Pump(Arc::clone(&control)),
+            ),
+            fixture,
+        )
+        .ok()
+        .unwrap();
+        let InjectedOutputStart::Running(controller) = lifecycle else {
+            panic!("pumping endpoint must start running");
+        };
+        let state = controller.state_control();
+        assert_eq!(
+            wait_state(state.suspend().unwrap()),
+            InjectedStateChangeOutcome::Applied
+        );
+        if panic_on_resume {
+            control.resume_panics.store(true, Ordering::Release);
+        } else {
+            control.resume_errors.store(true, Ordering::Release);
+        }
+        let shutdown = controller.receipt();
+        assert_eq!(
+            wait_state(state.resume().unwrap()),
+            InjectedStateChangeOutcome::Failed(InjectedStateChangeFailure::EndpointUncertain)
+        );
+        let OutputShutdownOutcome::Unconfirmed { failure, .. } = wait_receipt(shutdown) else {
+            panic!("uncertain native resume cannot mint physical proof");
+        };
+        assert_eq!(
+            failure.kind(),
+            if panic_on_resume {
+                OutputShutdownIssueKind::EndpointMethodPanicked
+            } else {
+                OutputShutdownIssueKind::EndpointStateTransitionFailed
+            }
+        );
+        assert!(!control.shutdown_called.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn initial_native_suspend_error_and_panic_are_uncertain_without_state_event() {
+    for panic_on_suspend in [false, true] {
+        let state_events = Arc::new(AtomicUsize::new(0));
+        let state_events_for_handler = Arc::clone(&state_events);
+        let setup = injected_event_dispatch_setup_with_handlers(move |events| {
+            events.set_handler(
+                EventType::StateChange,
+                EventHandler::Multiple(Box::new(move |_| {
+                    state_events_for_handler.fetch_add(1, Ordering::AcqRel);
+                })),
+            );
+        })
+        .unwrap();
+        let fixture = lifecycle_fixture_with_event_setup(true, false, 8, setup);
+        let control = PumpControl::new(false, true);
+        if panic_on_suspend {
+            control.suspend_panics.store(true, Ordering::Release);
+        } else {
+            control.suspend_errors.store(true, Ordering::Release);
+        }
+        let lifecycle = start(
+            TestPrepared::new(
+                format(48_000.),
+                PreparedBehavior::Pump(Arc::clone(&control)),
+            ),
+            fixture,
+        )
+        .ok()
+        .unwrap();
+        let InjectedOutputStart::Running(controller) = lifecycle else {
+            panic!("pumping endpoint must transfer before worker reconciliation");
+        };
+        let OutputShutdownOutcome::Unconfirmed { failure, .. } = wait_receipt(controller.receipt())
+        else {
+            panic!("initial endpoint uncertainty cannot mint graph proof");
+        };
+        assert_eq!(
+            failure.kind(),
+            if panic_on_suspend {
+                OutputShutdownIssueKind::EndpointMethodPanicked
+            } else {
+                OutputShutdownIssueKind::EndpointStateTransitionFailed
+            }
+        );
+        assert_eq!(state_events.load(Ordering::Acquire), 0);
+        assert!(!control.shutdown_called.load(Ordering::Acquire));
+    }
 }
 
 #[test]

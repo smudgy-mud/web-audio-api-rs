@@ -120,6 +120,7 @@ pub(crate) enum GraphLifecycleOutcome {
     ControllerSequenceGap = 2,
     RequiredBatchPending = 3,
     ProtocolViolation = 4,
+    EventDeliveryFailed = 5,
 }
 
 #[allow(dead_code)]
@@ -130,6 +131,7 @@ impl GraphLifecycleOutcome {
             2 => Some(Self::ControllerSequenceGap),
             3 => Some(Self::RequiredBatchPending),
             4 => Some(Self::ProtocolViolation),
+            5 => Some(Self::EventDeliveryFailed),
             _ => None,
         }
     }
