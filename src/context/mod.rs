@@ -62,7 +62,10 @@ pub use online::*;
 
 mod resource;
 pub(crate) use resource::SharedAudioNodeLifetimeReservation;
-pub use resource::{AudioControlBatchReservation, AudioNodeLifetimeReservation};
+pub use resource::{
+    AudioControlBatchReservation, AudioControlBatchReservationProvider,
+    AudioNodeLifetimeReservation,
+};
 
 mod hosted;
 pub use hosted::{

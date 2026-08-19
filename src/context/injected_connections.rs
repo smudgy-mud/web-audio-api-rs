@@ -22,7 +22,9 @@ use super::injected_node_lifetime::{
     InjectedNodeReclaimCleanup, InjectedNodeRegistration, InjectedNodeRegistrationStamp,
     NodeLifetimeInner, NodeReclaimCleanupError,
 };
-use super::{AudioNodeId, DESTINATION_NODE_ID, LISTENER_PARAM_IDS};
+use super::{
+    AudioControlBatchReservationProvider, AudioNodeId, DESTINATION_NODE_ID, LISTENER_PARAM_IDS,
+};
 use crate::message::ControlMessage;
 
 /// Maximum explicit edges represented by one private injected graph.
@@ -406,13 +408,14 @@ struct InjectedConnectionRegistryState {
     edges: ArrayVec<InjectedHostExplicitConnection, MAX_INJECTED_EXPLICIT_CONNECTIONS>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InjectedConnectionOperationError {
     Control(InjectedControlError),
     ForeignEndpoint,
     InactiveEndpoint,
     InvalidPort,
     Capacity,
+    HostReservationRejected,
     Unconnected,
     SerializerPoisoned,
     RejectedPayloadPanicked,
@@ -635,6 +638,7 @@ impl InjectedConnectionRegistryInner {
         destination: &InjectedConnectionEndpoint,
         output: usize,
         input: usize,
+        host_reservation: Option<AudioControlBatchReservationProvider>,
     ) -> Result<InjectedConnectionOperationOutcome, InjectedConnectionOperationError> {
         let owner =
             validate_endpoints(control, node_ids, exact_registry, source, Some(destination))?;
@@ -691,7 +695,7 @@ impl InjectedConnectionRegistryInner {
         let commands = vec![ControlMessage::InjectedConnectExplicit(expected)].into_boxed_slice();
         #[cfg(test)]
         registry.run_operation_hook_for_test(InjectedConnectionOperationTestPoint::BeforeReserve);
-        let reservation = match reserve_after_serialization(admitted, 1) {
+        let reservation = match reserve_after_serialization(admitted, 1, host_reservation) {
             Ok(reservation) => reservation,
             Err(error) => {
                 fail_closed.disarm();
@@ -755,6 +759,7 @@ impl InjectedConnectionRegistryInner {
         exact_registry: &Weak<NodeLifetimeInner>,
         source: &InjectedConnectionEndpoint,
         selector: InjectedDisconnectSelector<'_>,
+        host_reservation: Option<AudioControlBatchReservationProvider>,
     ) -> Result<InjectedConnectionOperationOutcome, InjectedConnectionOperationError> {
         let destination = selector.destination();
         let owner = validate_endpoints(control, node_ids, exact_registry, source, destination)?;
@@ -832,13 +837,14 @@ impl InjectedConnectionRegistryInner {
             .into_boxed_slice();
         #[cfg(test)]
         registry.run_operation_hook_for_test(InjectedConnectionOperationTestPoint::BeforeReserve);
-        let reservation = match reserve_after_serialization(admitted, removed.len()) {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                fail_closed.disarm();
-                return Err(error);
-            }
-        };
+        let reservation =
+            match reserve_after_serialization(admitted, removed.len(), host_reservation) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    fail_closed.disarm();
+                    return Err(error);
+                }
+            };
         let batch = reservation.into_preboxed(commands);
         #[cfg(test)]
         registry.run_operation_hook_for_test(InjectedConnectionOperationTestPoint::BeforeCommit);
@@ -1006,10 +1012,26 @@ fn validate_endpoints(
 fn reserve_after_serialization(
     mut admitted: super::injected_control::AdmittedGraphOperation,
     command_count: usize,
+    host_reservation: Option<AudioControlBatchReservationProvider>,
 ) -> Result<super::injected_control::ControlBatchReservation, InjectedConnectionOperationError> {
+    let host_reservation = match host_reservation {
+        Some(provider) => Some(
+            provider
+                .reserve(command_count)
+                .ok_or(InjectedConnectionOperationError::HostReservationRejected)?,
+        ),
+        None => None,
+    };
     loop {
         match admitted.reserve_commands(command_count) {
-            Ok(reservation) => return Ok(reservation),
+            Ok(reservation) => {
+                return Ok(match host_reservation {
+                    Some(host_reservation) => reservation
+                        .with_host_reservation(host_reservation)
+                        .map_err(InjectedConnectionOperationError::Control)?,
+                    None => reservation,
+                });
+            }
             Err(failure) if failure.error == InjectedControlError::Contended => {
                 admitted = failure.operation;
                 std::thread::park_timeout(std::time::Duration::from_millis(1));
