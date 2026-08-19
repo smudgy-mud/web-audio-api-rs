@@ -4,8 +4,9 @@ use std::fmt::Debug;
 use std::sync::OnceLock;
 
 use crate::context::{
-    AudioContextRegistration, AudioParamId, BaseAudioContext, ConcreteBaseAudioContext,
-    InjectedOscillatorControl, InjectedOscillatorMutationError, InjectedOscillatorPayload,
+    AudioContextRegistration, AudioNodeLifetimeReservation, AudioParamId, BaseAudioContext,
+    ConcreteBaseAudioContext, InjectedOscillatorControl, InjectedOscillatorMutationError,
+    InjectedOscillatorPayload,
 };
 use crate::param::{
     injected_audio_param_raw_parts, AudioParam, AudioParamDescriptor, AutomationRate,
@@ -320,6 +321,14 @@ impl OscillatorNode {
     }
 
     fn new_injected(context: &ConcreteBaseAudioContext, options: OscillatorOptions) -> Self {
+        Self::new_injected_with_lifetime(context, options, None)
+    }
+
+    pub(crate) fn new_injected_with_lifetime(
+        context: &ConcreteBaseAudioContext,
+        options: OscillatorOptions,
+        lifetime: Option<AudioNodeLifetimeReservation>,
+    ) -> Self {
         let OscillatorOptions {
             type_,
             frequency,
@@ -332,7 +341,7 @@ impl OscillatorNode {
             "NotSupportedError - custom PeriodicWave oscillators are not available on the exact injected context"
         );
         let transaction = context
-            .try_begin_injected_oscillator(type_)
+            .try_begin_injected_oscillator_with_lifetime(type_, lifetime)
             .unwrap_or_else(|error| panic!("injected Oscillator admission failed: {error:?}"));
         let oscillator_id = transaction.oscillator_id();
         let frequency_id = transaction.frequency_id();

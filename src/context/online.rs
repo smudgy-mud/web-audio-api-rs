@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "diagnostics")]
 use crate::context::{AudioBackendDiagnostics, AudioContextDiagnostics};
-use crate::context::{AudioContextState, BaseAudioContext, ConcreteBaseAudioContext};
+use crate::context::{
+    AudioContextState, AudioNodeLifetimeReservation, BaseAudioContext, ConcreteBaseAudioContext,
+};
 #[cfg(feature = "diagnostics")]
 use crate::events::EventPayload;
 use crate::events::{EventDispatch, EventHandler, EventLoop, EventType};
@@ -283,6 +285,55 @@ impl AudioContext {
     #[must_use]
     pub fn builder(output: Arc<dyn AudioOutputFactory>) -> AudioContextBuilder {
         AudioContextBuilder::new(output)
+    }
+
+    /// Constructs a hosted `GainNode` while attaching host accounting to both exact graph nodes.
+    ///
+    /// The reservation is released only after the Gain node and its AudioParam are physically
+    /// reclaimed, or after rejected construction has fully rolled back. This operation is
+    /// available only on contexts returned by [`AudioContext::builder`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a legacy context or when exact construction is rejected.
+    pub fn create_gain_with_lifetime_reservation(
+        &self,
+        reservation: AudioNodeLifetimeReservation,
+    ) -> node::GainNode {
+        assert!(
+            self.is_hosted(),
+            "NotSupportedError - lifetime reservations require an exact hosted AudioContext"
+        );
+        node::GainNode::new_injected_with_lifetime(
+            &self.base,
+            node::GainOptions::default(),
+            Some(reservation),
+        )
+    }
+
+    /// Constructs a hosted fixed-wave `OscillatorNode` while attaching host accounting to all
+    /// three exact graph nodes (oscillator, frequency, and detune).
+    ///
+    /// The reservation is released only after all three nodes are physically reclaimed, or after
+    /// rejected construction has fully rolled back. This operation is available only on contexts
+    /// returned by [`AudioContext::builder`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a legacy context or when exact construction is rejected.
+    pub fn create_oscillator_with_lifetime_reservation(
+        &self,
+        reservation: AudioNodeLifetimeReservation,
+    ) -> node::OscillatorNode {
+        assert!(
+            self.is_hosted(),
+            "NotSupportedError - lifetime reservations require an exact hosted AudioContext"
+        );
+        node::OscillatorNode::new_injected_with_lifetime(
+            &self.base,
+            node::OscillatorOptions::default(),
+            Some(reservation),
+        )
     }
 
     pub(super) fn from_hosted_parts(
@@ -1687,6 +1738,88 @@ mod tests {
         assert_eq!(context.state(), AudioContextState::Closed);
         assert!(probe.callback_destroyed.load(AtomicOrdering::Acquire));
         assert!(probe.shutdown_joined.load(AtomicOrdering::Acquire));
+    }
+
+    #[test]
+    fn hosted_node_reservations_survive_wrapper_drop_until_staged_graph_reclaim() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, AtomicOrdering::Release);
+            }
+        }
+
+        let (suspend_release, suspend_wait) = crossbeam_channel::bounded(1);
+        let mut factory = InjectedTestFactory::new(false);
+        factory.suspend_release = Some(suspend_wait);
+        let factory = Arc::new(factory);
+        let probe = Arc::clone(&factory.probe);
+        let context = AudioContext::builder(factory)
+            .initially_suspended(true)
+            .build()
+            .unwrap();
+
+        let deadline = Instant::now() + INJECTED_TEST_TIMEOUT;
+        while probe.suspend_calls.load(AtomicOrdering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "initial native suspension was never entered"
+            );
+            thread::yield_now();
+        }
+
+        let gain_dropped = Arc::new(AtomicBool::new(false));
+        let oscillator_dropped = Arc::new(AtomicBool::new(false));
+        let gain = context.create_gain_with_lifetime_reservation(
+            AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&gain_dropped))),
+        );
+        let oscillator = context.create_oscillator_with_lifetime_reservation(
+            AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&oscillator_dropped))),
+        );
+        drop(gain);
+        drop(oscillator);
+
+        // Construction is staged and the renderer has not been allowed to observe either graph
+        // insertion or teardown. Wrapper destruction alone must not release host accounting.
+        assert!(!gain_dropped.load(AtomicOrdering::Acquire));
+        assert!(!oscillator_dropped.load(AtomicOrdering::Acquire));
+
+        suspend_release.send(()).unwrap();
+        assert_eq!(
+            context.request_resume().unwrap().wait(),
+            AudioContextStateChangeOutcome::Applied
+        );
+        while !gain_dropped.load(AtomicOrdering::Acquire)
+            || !oscillator_dropped.load(AtomicOrdering::Acquire)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "node lifetime reservation was not released after physical reclaim"
+            );
+            thread::yield_now();
+        }
+
+        let whole_graph_dropped = Arc::new(AtomicBool::new(false));
+        let surviving_oscillator = context.create_oscillator_with_lifetime_reservation(
+            AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&whole_graph_dropped))),
+        );
+        assert!(!whole_graph_dropped.load(AtomicOrdering::Acquire));
+        assert!(matches!(
+            context.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert!(whole_graph_dropped.load(AtomicOrdering::Acquire));
+        drop(surviving_oscillator);
+
+        let rejected_dropped = Arc::new(AtomicBool::new(false));
+        let rejected = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            context.create_gain_with_lifetime_reservation(AudioNodeLifetimeReservation::new(
+                DropProbe(Arc::clone(&rejected_dropped)),
+            ));
+        }));
+        assert!(rejected.is_err());
+        assert!(rejected_dropped.load(AtomicOrdering::Acquire));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::context::{
-    AudioContextRegistration, AudioParamId, BaseAudioContext, ConcreteBaseAudioContext,
+    AudioContextRegistration, AudioNodeLifetimeReservation, AudioParamId, BaseAudioContext,
+    ConcreteBaseAudioContext,
 };
 use crate::param::{injected_audio_param_raw_parts, AudioParam, AudioParamDescriptor};
 use crate::render::{
@@ -131,10 +132,18 @@ impl GainNode {
     }
 
     fn new_injected(context: &ConcreteBaseAudioContext, options: GainOptions) -> Self {
+        Self::new_injected_with_lifetime(context, options, None)
+    }
+
+    pub(crate) fn new_injected_with_lifetime(
+        context: &ConcreteBaseAudioContext,
+        options: GainOptions,
+        lifetime: Option<AudioNodeLifetimeReservation>,
+    ) -> Self {
         let transaction = context
             .injected_node_constructor()
             .expect("injected Gain selection requires an injected construction base")
-            .try_begin_gain()
+            .try_begin_gain_with_lifetime(lifetime)
             .unwrap_or_else(|error| panic!("injected Gain admission failed: {error:?}"));
 
         // All potentially panicking validation and payload construction happens after one exact
