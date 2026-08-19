@@ -19,8 +19,10 @@ mod injected_control;
 
 mod injected_ids;
 #[cfg(test)]
-pub(crate) use injected_ids::{injected_node_id_pair, InjectedNodeIdOwner};
+pub(crate) use injected_ids::injected_node_id_pair;
 pub(crate) use injected_ids::{InjectedGraphReclaimInit, InjectedGraphReclaimPublisher};
+
+mod injected_node_lifetime;
 
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
