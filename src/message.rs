@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "diagnostics")]
 use crate::context::AudioBackendDiagnostics;
-use crate::context::AudioNodeId;
+use crate::context::{AudioControlBatchReservation, AudioNodeId};
 use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
 use crate::render::graph::Graph;
 use crate::render::AudioProcessor;
@@ -354,6 +354,7 @@ impl InjectedCommandCreditPool {
             .map(|_| InjectedCommandCredit {
                 inner: Arc::clone(&self.inner),
                 count,
+                host_reservation: None,
             })
     }
 
@@ -369,6 +370,23 @@ impl InjectedCommandCreditPool {
 pub(crate) struct InjectedCommandCredit {
     inner: Arc<InjectedCommandCreditState>,
     count: usize,
+    /// Dropped with the logical command credit. Accepted credits live in batch storage through
+    /// off-render-thread reclamation; rejected credits remain under graph admission through
+    /// typed rollback.
+    host_reservation: Option<AudioControlBatchReservation>,
+}
+
+impl InjectedCommandCredit {
+    pub(crate) fn attach_host_reservation(
+        &mut self,
+        reservation: AudioControlBatchReservation,
+    ) -> bool {
+        if self.host_reservation.is_some() {
+            return false;
+        }
+        self.host_reservation = Some(reservation);
+        true
+    }
 }
 
 impl Drop for InjectedCommandCredit {

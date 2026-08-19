@@ -4,9 +4,9 @@ use std::fmt::Debug;
 use std::sync::OnceLock;
 
 use crate::context::{
-    AudioContextRegistration, AudioNodeLifetimeReservation, AudioParamId, BaseAudioContext,
-    ConcreteBaseAudioContext, InjectedOscillatorControl, InjectedOscillatorMutationError,
-    InjectedOscillatorPayload,
+    AudioContextRegistration, AudioControlBatchReservation, AudioNodeLifetimeReservation,
+    AudioParamId, BaseAudioContext, ConcreteBaseAudioContext, InjectedOscillatorControl,
+    InjectedOscillatorMutationError, InjectedOscillatorPayload,
 };
 use crate::param::{
     injected_audio_param_raw_parts, AudioParam, AudioParamDescriptor, AutomationRate,
@@ -329,6 +329,15 @@ impl OscillatorNode {
         options: OscillatorOptions,
         lifetime: Option<AudioNodeLifetimeReservation>,
     ) -> Self {
+        Self::new_injected_with_reservations(context, options, lifetime, None)
+    }
+
+    pub(crate) fn new_injected_with_reservations(
+        context: &ConcreteBaseAudioContext,
+        options: OscillatorOptions,
+        lifetime: Option<AudioNodeLifetimeReservation>,
+        control: Option<AudioControlBatchReservation>,
+    ) -> Self {
         let OscillatorOptions {
             type_,
             frequency,
@@ -341,7 +350,7 @@ impl OscillatorNode {
             "NotSupportedError - custom PeriodicWave oscillators are not available on the exact injected context"
         );
         let transaction = context
-            .try_begin_injected_oscillator_with_lifetime(type_, lifetime)
+            .try_begin_injected_oscillator_with_reservations(type_, lifetime, control)
             .unwrap_or_else(|error| panic!("injected Oscillator admission failed: {error:?}"));
         let oscillator_id = transaction.oscillator_id();
         let frequency_id = transaction.frequency_id();
@@ -454,6 +463,71 @@ impl OscillatorNode {
             completion,
             injected_control: Some(constructed.oscillator_control),
         }
+    }
+
+    /// Starts an exact hosted oscillator while attaching one host reservation to the submitted
+    /// one-command batch.
+    ///
+    /// The reservation is retained through suspended staging and off-render-thread reclamation.
+    /// It is released during typed rollback if the batch is not accepted.
+    ///
+    /// # Panics
+    ///
+    /// Panics for an invalid time, a legacy context, duplicate start, or rejected exact control.
+    pub fn start_at_with_control_reservation(
+        &mut self,
+        when: f64,
+        reservation: AudioControlBatchReservation,
+    ) {
+        assert_valid_time_value(when);
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!("NotSupportedError - control reservations require an exact hosted oscillator")
+        });
+        finish_exact_oscillator_mutation(
+            control.try_start_with_host_reservation(when, reservation),
+        );
+    }
+
+    /// Stops an exact hosted oscillator while attaching one host reservation to the submitted
+    /// one-command batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics for an invalid time, a legacy context, stop-before-start, or rejected exact control.
+    pub fn stop_at_with_control_reservation(
+        &mut self,
+        when: f64,
+        reservation: AudioControlBatchReservation,
+    ) {
+        assert_valid_time_value(when);
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!("NotSupportedError - control reservations require an exact hosted oscillator")
+        });
+        finish_exact_oscillator_mutation(control.try_stop_with_host_reservation(when, reservation));
+    }
+
+    /// Changes the fixed waveform of an exact hosted oscillator while attaching one host
+    /// reservation to the submitted one-command batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics for `Custom`, a legacy context, or rejected exact control.
+    pub fn set_type_with_control_reservation(
+        &mut self,
+        type_: OscillatorType,
+        reservation: AudioControlBatchReservation,
+    ) {
+        assert_ne!(
+            type_,
+            OscillatorType::Custom,
+            "InvalidStateError: Custom type cannot be set manually"
+        );
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!("NotSupportedError - control reservations require an exact hosted oscillator")
+        });
+        finish_exact_oscillator_mutation(
+            control.try_set_type_with_host_reservation(type_, reservation),
+        );
     }
 
     /// A-rate [`AudioParam`] that defines the fundamental frequency of the
