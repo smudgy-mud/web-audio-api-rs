@@ -42,7 +42,11 @@ pub(crate) use injected_node_lifetime::{
 
 mod injected_node_construction;
 pub(crate) use injected_node_construction::{
-    InjectedAudioParamMutation, InjectedGainPayload, InjectedOscillatorCommandKind,
+    InjectedAudioParamMutation, InjectedConstantSourceCommandKind,
+    InjectedConstantSourceConstruction, InjectedConstantSourceConstructionError,
+    InjectedConstantSourceControl, InjectedConstantSourceMutationError,
+    InjectedConstantSourcePayload, InjectedConstantSourceRenderMessage,
+    InjectedConstantSourceWireCommand, InjectedGainPayload, InjectedOscillatorCommandKind,
     InjectedOscillatorControl, InjectedOscillatorMutationError, InjectedOscillatorPayload,
     InjectedOscillatorRenderMessage, InjectedOscillatorWireCommand,
     InjectedScheduledSourceEventMint,

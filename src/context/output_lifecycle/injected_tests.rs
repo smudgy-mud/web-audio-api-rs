@@ -17,8 +17,8 @@ use crate::context::injected_control::{
 };
 use crate::context::injected_ids::injected_node_id_pair;
 use crate::context::injected_node_construction::{
-    InjectedGainPayload, InjectedNodeConstructor, InjectedOscillatorConstructionError,
-    InjectedOscillatorPayload,
+    InjectedConstantSourceConstructionError, InjectedConstantSourcePayload, InjectedGainPayload,
+    InjectedNodeConstructor, InjectedOscillatorConstructionError, InjectedOscillatorPayload,
 };
 use crate::context::injected_node_lifetime::injected_node_lifetime_registry;
 use crate::context::injected_node_lifetime::{
@@ -38,7 +38,8 @@ use crate::message::ControlMessage;
 use crate::node::{
     AudioBufferSourceNode, AudioBufferSourceOptions, AudioNode, AudioScheduledSourceNode,
     AudioScheduledSourceNodeExt, ChannelConfigInner, ChannelCountMode, ChannelInterpretation,
-    GainNode, GainOptions, OscillatorNode, OscillatorOptions, OscillatorType,
+    ConstantSourceNode, ConstantSourceOptions, GainNode, GainOptions, OscillatorNode,
+    OscillatorOptions, OscillatorType,
 };
 use crate::output::{
     AudioOutputConfig, AudioOutputDeathReason, AudioOutputErrorKind, AudioRenderCallback,
@@ -760,6 +761,33 @@ fn oscillator_payload_for_test(
         },
         frequency_initial_value: frequency_raw.set_initial_value_for_injected(440.),
         detune_initial_value: detune_raw.set_initial_value_for_injected(0.),
+    }
+}
+
+fn constant_source_payload_for_test(
+    source_processor: Box<dyn AudioProcessor>,
+) -> InjectedConstantSourcePayload {
+    let (offset_raw, offset_processor) = injected_audio_param_raw_parts(AudioParamDescriptor {
+        name: String::new(),
+        min_value: f32::MIN,
+        max_value: f32::MAX,
+        default_value: 1.,
+        automation_rate: AutomationRate::A,
+    });
+    InjectedConstantSourcePayload {
+        offset_processor,
+        source_processor,
+        param_channel_config: ChannelConfigInner {
+            count: 1,
+            count_mode: ChannelCountMode::Explicit,
+            interpretation: ChannelInterpretation::Discrete,
+        },
+        source_channel_config: ChannelConfigInner {
+            count: 2,
+            count_mode: ChannelCountMode::Max,
+            interpretation: ChannelInterpretation::Speakers,
+        },
+        offset_initial_value: offset_raw.set_initial_value_for_injected(1.),
     }
 }
 
@@ -1781,6 +1809,69 @@ fn exact_fixed_oscillators_use_ids_eleven_through_thirteen_render_without_alloca
 }
 
 #[test]
+fn exact_constant_source_uses_source_and_offset_ids_renders_without_allocation_and_ends_once() {
+    let fixture = lifecycle_fixture_inner(
+        false,
+        false,
+        16,
+        8,
+        injected_event_dispatch_setup().unwrap(),
+    );
+    let base = fixture.take_exact_base();
+    let destination = base.destination();
+    let mut source = ConstantSourceNode::new(&base, ConstantSourceOptions { offset: 0.375 });
+    assert_eq!(source.registration().id(), AudioNodeId(11));
+    assert_eq!(source.offset().registration().id(), AudioNodeId(12));
+    assert_eq!(source.offset().value(), 0.375);
+    source.offset().set_value(0.625);
+    let completion = source.completion_token();
+    let ended = Arc::new(AtomicUsize::new(0));
+    let ended_for_handler = Arc::clone(&ended);
+    source.set_onended(move |_| {
+        ended_for_handler.fetch_add(1, Ordering::AcqRel);
+    });
+    source.connect(&destination);
+    source.start_at(0.);
+    source.stop_at(0.01);
+
+    let control = PumpControl::new(false, true);
+    control
+        .deny_next_render_allocation
+        .store(true, Ordering::Release);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || control.output_nonzero.load(Ordering::Acquire),
+        "exact ConstantSource did not render its scalar output",
+    );
+    wait_until(
+        || completion.is_complete(),
+        "exact ConstantSource completion did not become authoritative",
+    );
+    wait_until(
+        || ended.load(Ordering::Acquire) == 1,
+        "exact ConstantSource did not dispatch one generation-keyed ended event",
+    );
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(ended.load(Ordering::Acquire), 1);
+
+    drop(source);
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.reclaim_issue().is_none());
+}
+
+#[test]
 fn exact_buffer_source_uses_source_detune_playback_ids_and_renders_owned_pcm_without_allocation() {
     let fixture = lifecycle_fixture_inner(
         false,
@@ -2400,6 +2491,78 @@ fn suspended_exact_oscillator_commands_flush_fifo_through_real_b4c_resume() {
 }
 
 #[test]
+fn suspended_exact_constant_source_commands_flush_fifo_through_real_b4c_resume() {
+    let fixture =
+        lifecycle_fixture_inner(true, false, 16, 8, injected_event_dispatch_setup().unwrap());
+    let base = fixture.take_exact_base();
+    let destination = base.destination();
+    let mut source = ConstantSourceNode::new(&base, ConstantSourceOptions::default());
+    let completion = source.completion_token();
+    let ended = Arc::new(AtomicUsize::new(0));
+    let ended_for_handler = Arc::clone(&ended);
+    source.set_onended(move |_| {
+        ended_for_handler.fetch_add(1, Ordering::AcqRel);
+    });
+    source.connect(&destination);
+    source.offset().set_value(0.25);
+    source.offset().set_value(0.75);
+    source.start_at(0.);
+    source.stop_at(1.);
+    source.stop_at(0.01);
+    let applied_before = base.applied_control_batch_sequence();
+
+    let control = PumpControl::new(false, false);
+    control.max_render_count.store(32, Ordering::Release);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || control.suspend_count.load(Ordering::Acquire) == 1,
+        "initially suspended endpoint was not natively reconciled",
+    );
+    assert_eq!(base.state(), AudioContextState::Suspended);
+    assert_eq!(base.applied_control_batch_sequence(), applied_before);
+
+    control.release.store(true, Ordering::Release);
+    assert_eq!(
+        wait_state(controller.state_control().resume().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    wait_until(
+        || control.render_count.load(Ordering::Acquire) == 32,
+        "fixed resumed render window did not complete",
+    );
+    assert!(
+        completion.is_complete(),
+        "staged Stop FIFO was reversed: 32 quanta exceed 0.01s but are below 1s"
+    );
+    wait_until(
+        || ended.load(Ordering::Acquire) == 1,
+        "resumed exact ConstantSource did not dispatch ended",
+    );
+    assert_eq!(source.offset().value(), 0.75);
+    assert!(base.applied_control_batch_sequence() >= applied_before + 7);
+
+    control
+        .max_render_count
+        .store(usize::MAX, Ordering::Release);
+    drop(source);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
 fn connected_started_stopped_oscillator_survives_immediate_handle_drop_until_ended_and_reclaim() {
     let fixture = lifecycle_fixture_with_capacity(false, false, 32);
     let base = fixture.take_exact_base();
@@ -2433,6 +2596,46 @@ fn connected_started_stopped_oscillator_survives_immediate_handle_drop_until_end
     wait_until(
         || ended.load(Ordering::Acquire) == 1,
         "dropped connected source did not dispatch ended",
+    );
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.reclaim_issue().is_none());
+}
+
+#[test]
+fn connected_started_stopped_constant_source_survives_handle_drop_until_ended_and_reclaim() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 16);
+    let base = fixture.take_exact_base();
+    let destination = base.destination();
+    let ended = Arc::new(AtomicUsize::new(0));
+    let ended_for_handler = Arc::clone(&ended);
+    let mut source = ConstantSourceNode::new(&base, ConstantSourceOptions::default());
+    let completion = source.completion_token();
+    source.set_onended(move |_| {
+        ended_for_handler.fetch_add(1, Ordering::AcqRel);
+    });
+    source.connect(&destination);
+    source.start_at(0.);
+    source.stop_at(0.01);
+    drop(source);
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || completion.is_complete(),
+        "dropped connected ConstantSource did not remain live through its stop",
+    );
+    wait_until(
+        || ended.load(Ordering::Acquire) == 1,
+        "dropped connected ConstantSource did not dispatch ended",
     );
     let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
     assert_eq!(report.mode(), OutputShutdownMode::Graceful);
@@ -2614,6 +2817,48 @@ fn exact_oscillator_event_nonce_exhaustion_is_typed_terminal_and_never_reused() 
 }
 
 #[test]
+fn exact_constant_source_event_nonce_exhaustion_is_terminal_and_quarantines_both_ids() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let nonce_source = Arc::new(AtomicU64::new(u64::MAX));
+    base.injected_events()
+        .unwrap()
+        .set_nonce_source_for_test(Arc::clone(&nonce_source));
+
+    assert_eq!(
+        base.try_begin_injected_constant_source_with_reservations(None, None)
+            .err(),
+        Some(InjectedConstantSourceConstructionError::EventIdentityExhausted)
+    );
+    assert_eq!(nonce_source.load(Ordering::Acquire), u64::MAX);
+    let ids = fixture.allocator.try_reserve(2).unwrap();
+    assert_eq!(ids.id(0), AudioNodeId(13));
+    assert_eq!(ids.id(1), AudioNodeId(14));
+    drop(ids);
+    assert!(matches!(
+        base.try_begin_injected_constant_source_with_reservations(None, None),
+        Err(InjectedConstantSourceConstructionError::Control(
+            crate::context::injected_control::InjectedControlError::ProtocolViolation
+        ))
+    ));
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
 fn exact_oscillator_not_accepted_parser_restores_all_three_ids_from_the_seven_record_batch() {
     let fixture = lifecycle_fixture_with_capacity(false, false, 8);
     let base = fixture.take_exact_base();
@@ -2636,6 +2881,44 @@ fn exact_oscillator_not_accepted_parser_restores_all_three_ids_from_the_seven_re
     assert_eq!(restored.id(0), AudioNodeId(11));
     assert_eq!(restored.id(1), AudioNodeId(12));
     assert_eq!(restored.id(2), AudioNodeId(13));
+    drop(restored);
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
+fn exact_constant_source_not_accepted_parser_restores_both_ids_from_four_record_batch() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let transaction = base
+        .try_begin_injected_constant_source_with_reservations(None, None)
+        .unwrap();
+    base.fail_closed_injected_protocol();
+    assert_eq!(
+        transaction
+            .commit(constant_source_payload_for_test(Box::new(SilentProcessor)))
+            .err(),
+        Some(InjectedConstantSourceConstructionError::Control(
+            crate::context::injected_control::InjectedControlError::ProtocolViolation
+        ))
+    );
+
+    let restored = fixture.allocator.try_reserve(2).unwrap();
+    assert_eq!(restored.id(0), AudioNodeId(11));
+    assert_eq!(restored.id(1), AudioNodeId(12));
     drop(restored);
 
     let control = PumpControl::new(false, true);
@@ -3054,6 +3337,220 @@ fn exact_oscillator_runtime_wrong_processor_latches_before_failed_watermark() {
         .unwrap();
     let construction_sequence = constructor.last_submitted_batch_sequence();
     constructed.oscillator_control.try_start(0.).unwrap();
+    let failed_sequence = constructor.last_submitted_batch_sequence();
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Silent);
+    assert_eq!(base.applied_control_batch_sequence(), construction_sequence);
+    assert!(construction_sequence < failed_sequence);
+    assert!(constructor.control().render_protocol_failed_for_test());
+    drop(constructed);
+}
+
+#[test]
+fn exact_constant_source_runtime_saturation_precedes_host_mutation_and_recovers() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut source = ConstantSourceNode::new(&base, ConstantSourceOptions::default());
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || base.applied_control_batch_sequence() >= construction_sequence,
+        "ConstantSource construction did not apply before runtime saturation",
+    );
+    wait_until(
+        || constructor.connection_transport_accounting_for_test() == (0, 0, 0, 0),
+        "construction credits did not retire before runtime saturation",
+    );
+
+    let held = constructor
+        .control()
+        .try_begin_operation(crate::message::CONTROL_COMMANDS_PER_CALLBACK)
+        .unwrap();
+    let submitted_before = constructor.last_submitted_batch_sequence();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        source.start_at(0.);
+    }))
+    .is_err());
+    assert!(!source.injected_control_for_test().has_start());
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        submitted_before
+    );
+    drop(held);
+
+    source.start_at(0.);
+    source.stop_at(0.);
+    assert!(source.injected_control_for_test().has_start());
+    drop(source);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn exact_constant_source_runtime_not_accepted_keeps_start_mirror_false() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut source = ConstantSourceNode::new(&base, ConstantSourceOptions::default());
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || base.applied_control_batch_sequence() >= construction_sequence,
+        "ConstantSource construction did not apply before runtime rejection",
+    );
+    wait_until(
+        || constructor.connection_transport_accounting_for_test() == (0, 0, 0, 0),
+        "construction credits did not retire before runtime rejection",
+    );
+    let submitted_before = constructor.last_submitted_batch_sequence();
+    source
+        .injected_control_for_test()
+        .fail_next_runtime_commit_for_test();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        source.start();
+    }))
+    .is_err());
+    assert!(!source.injected_control_for_test().has_start());
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        submitted_before
+    );
+    assert_eq!(
+        constructor.connection_transport_accounting_for_test(),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
+fn exact_constant_source_stop_before_start_and_duplicate_start_precede_transport_mutation() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut source = ConstantSourceNode::new(&base, ConstantSourceOptions::default());
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        source.stop_at(0.);
+    }))
+    .is_err());
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        construction_sequence
+    );
+    source.start_at(0.);
+    let start_sequence = constructor.last_submitted_batch_sequence();
+    assert!(construction_sequence < start_sequence);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        source.start_at(0.);
+    }))
+    .is_err());
+    assert_eq!(constructor.last_submitted_batch_sequence(), start_sequence);
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || base.applied_control_batch_sequence() >= start_sequence,
+        "accepted ConstantSource Start did not apply after validation failures",
+    );
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn accepted_constant_source_runtime_finalizer_panic_keeps_start_queue_owned_and_applied() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut source = ConstantSourceNode::new(&base, ConstantSourceOptions::default());
+    source
+        .injected_control_for_test()
+        .panic_next_runtime_finalizer_for_test();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        source.start();
+    }))
+    .is_err());
+    assert!(source.injected_control_for_test().has_start());
+    let accepted_sequence = constructor.last_submitted_batch_sequence();
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || base.applied_control_batch_sequence() >= accepted_sequence,
+        "accepted ConstantSource Start was suppressed after finalizer panic",
+    );
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
+fn exact_constant_source_runtime_wrong_processor_latches_before_failed_watermark() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let transaction = base
+        .try_begin_injected_constant_source_with_reservations(None, None)
+        .unwrap();
+    let constructed = transaction
+        .commit(constant_source_payload_for_test(Box::new(SilentProcessor)))
+        .unwrap();
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+    constructed.source_control.try_start(0.).unwrap();
     let failed_sequence = constructor.last_submitted_batch_sequence();
 
     let control = PumpControl::new(false, true);

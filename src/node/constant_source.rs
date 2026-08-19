@@ -1,15 +1,21 @@
 use std::any::Any;
 
-use crate::context::{AudioContextRegistration, AudioParamId, BaseAudioContext};
-use crate::param::{AudioParam, AudioParamDescriptor, AutomationRate};
+use crate::context::{
+    AudioContextRegistration, AudioControlBatchReservation, AudioNodeLifetimeReservation,
+    AudioParamId, BaseAudioContext, ConcreteBaseAudioContext, InjectedConstantSourceControl,
+    InjectedConstantSourceMutationError, InjectedConstantSourcePayload,
+};
+use crate::param::{
+    injected_audio_param_raw_parts, AudioParam, AudioParamDescriptor, AutomationRate,
+};
 use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope,
 };
 use crate::{assert_valid_time_value, RENDER_QUANTUM_SIZE};
 
 use super::{
-    AudioNode, AudioScheduledSourceNode, AudioScheduledSourceNodeExt, ChannelConfig,
-    ScheduledSourceCompletionToken,
+    AudioNode, AudioNodeOptions, AudioScheduledSourceNode, AudioScheduledSourceNodeExt,
+    ChannelConfig, ChannelCountMode, ChannelInterpretation, ScheduledSourceCompletionToken,
 };
 
 /// Options for constructing an [`ConstantSourceNode`]
@@ -82,6 +88,7 @@ pub struct ConstantSourceNode {
     offset: AudioParam,
     has_start: bool,
     completion: ScheduledSourceCompletionToken,
+    injected_control: Option<InjectedConstantSourceControl>,
 }
 
 impl AudioNode for ConstantSourceNode {
@@ -110,6 +117,10 @@ impl AudioScheduledSourceNode for ConstantSourceNode {
 
     fn start_at(&mut self, when: f64) {
         assert_valid_time_value(when);
+        if let Some(control) = &self.injected_control {
+            finish_exact_constant_source_mutation(control.try_start(when));
+            return;
+        }
         assert!(
             !self.has_start,
             "InvalidStateError - Cannot call `start` twice"
@@ -126,6 +137,10 @@ impl AudioScheduledSourceNode for ConstantSourceNode {
 
     fn stop_at(&mut self, when: f64) {
         assert_valid_time_value(when);
+        if let Some(control) = &self.injected_control {
+            finish_exact_constant_source_mutation(control.try_stop(when));
+            return;
+        }
         assert!(
             self.has_start,
             "InvalidStateError - cannot stop before start"
@@ -152,6 +167,9 @@ impl ConstantSourceNode {
     /// * `context` - audio context in which the audio node will live
     /// * `options` - initial value of the offset parameter
     pub fn new<C: BaseAudioContext>(context: &C, options: ConstantSourceOptions) -> Self {
+        if context.base().injected_node_constructor().is_some() {
+            return Self::new_injected(context.base(), options);
+        }
         context.base().register(move |registration| {
             let ConstantSourceOptions { offset } = options;
 
@@ -173,6 +191,7 @@ impl ConstantSourceNode {
                 stop_time: f64::MAX,
                 ended_triggered: false,
                 completion: completion.clone(),
+                exact_key: None,
             };
 
             let node = ConstantSourceNode {
@@ -181,19 +200,202 @@ impl ConstantSourceNode {
                 offset: param,
                 has_start: false,
                 completion,
+                injected_control: None,
             };
 
             (node, Box::new(render))
         })
     }
 
+    fn new_injected(context: &ConcreteBaseAudioContext, options: ConstantSourceOptions) -> Self {
+        Self::new_injected_with_lifetime(context, options, None)
+    }
+
+    pub(crate) fn new_injected_with_lifetime(
+        context: &ConcreteBaseAudioContext,
+        options: ConstantSourceOptions,
+        lifetime: Option<AudioNodeLifetimeReservation>,
+    ) -> Self {
+        Self::new_injected_with_reservations(context, options, lifetime, None)
+    }
+
+    pub(crate) fn new_injected_with_reservations(
+        context: &ConcreteBaseAudioContext,
+        options: ConstantSourceOptions,
+        lifetime: Option<AudioNodeLifetimeReservation>,
+        control: Option<AudioControlBatchReservation>,
+    ) -> Self {
+        let transaction = context
+            .try_begin_injected_constant_source_with_reservations(lifetime, control)
+            .unwrap_or_else(|error| panic!("injected ConstantSource admission failed: {error:?}"));
+        let source_id = transaction.source_id();
+        let offset_id = transaction.offset_id();
+        let completion = ScheduledSourceCompletionToken::new_exact(transaction.completion_key());
+
+        let descriptor = AudioParamDescriptor {
+            name: String::new(),
+            min_value: f32::MIN,
+            max_value: f32::MAX,
+            default_value: 1.,
+            automation_rate: AutomationRate::A,
+        };
+        let (offset_raw, offset_processor) = injected_audio_param_raw_parts(descriptor);
+        let offset_initial_value = offset_raw.set_initial_value_for_injected(options.offset);
+        let channel_config = ChannelConfig::default();
+        let param_channel_config: ChannelConfig = AudioNodeOptions {
+            channel_count: 1,
+            channel_count_mode: ChannelCountMode::Explicit,
+            channel_interpretation: ChannelInterpretation::Discrete,
+        }
+        .into();
+        let renderer = Box::new(ConstantSourceRenderer {
+            offset: AudioParamId::from_node_id(offset_id),
+            start_time: f64::MAX,
+            stop_time: f64::MAX,
+            ended_triggered: false,
+            completion: completion.clone(),
+            exact_key: Some(transaction.completion_key()),
+        });
+        let constructed = transaction
+            .commit(InjectedConstantSourcePayload {
+                offset_processor,
+                source_processor: renderer,
+                param_channel_config: param_channel_config.inner(),
+                source_channel_config: channel_config.inner(),
+                offset_initial_value,
+            })
+            .unwrap_or_else(|error| {
+                panic!("injected ConstantSource construction failed: {error:?}")
+            });
+        debug_assert_eq!(constructed.source_id, source_id);
+        debug_assert_eq!(constructed.offset_id, offset_id);
+        let _accepted_placement = constructed.outcome;
+
+        let offset_registration = AudioContextRegistration::from_injected_with_connection(
+            offset_id,
+            context.clone(),
+            constructed.offset_registration,
+            constructed.offset_connection,
+            crate::context::InjectedConnectionEndpointKind::AudioParam,
+            1,
+            1,
+        );
+        let registration = AudioContextRegistration::from_injected_scheduled_source(
+            source_id,
+            context.clone(),
+            constructed.source_registration,
+            constructed.source_connection,
+            constructed.source_control.ended_target(),
+        );
+        let constructor = context
+            .injected_node_constructor()
+            .expect("exact ConstantSource context retains constructor");
+        if !constructed
+            .source_control
+            .matches_registration(&registration, constructor)
+        {
+            context.fail_closed_injected_protocol();
+            panic!("exact ConstantSource control does not match its registration");
+        }
+        let offset = AudioParam::from_injected_raw_parts(
+            offset_registration,
+            offset_raw,
+            constructed.offset_mutation,
+        );
+
+        Self {
+            registration,
+            channel_config,
+            offset,
+            has_start: false,
+            completion,
+            injected_control: Some(constructed.source_control),
+        }
+    }
+
+    /// Starts an exact hosted ConstantSource while attaching one host reservation to the
+    /// submitted one-command batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics for an invalid time, a legacy context, duplicate start, or rejected exact control.
+    pub fn start_at_with_control_reservation(
+        &mut self,
+        when: f64,
+        reservation: AudioControlBatchReservation,
+    ) {
+        assert_valid_time_value(when);
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!(
+                "NotSupportedError - control reservations require an exact hosted ConstantSource"
+            )
+        });
+        finish_exact_constant_source_mutation(
+            control.try_start_with_host_reservation(when, reservation),
+        );
+    }
+
+    /// Stops an exact hosted ConstantSource while attaching one host reservation to the
+    /// submitted one-command batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics for an invalid time, a legacy context, stop-before-start, or rejected exact control.
+    pub fn stop_at_with_control_reservation(
+        &mut self,
+        when: f64,
+        reservation: AudioControlBatchReservation,
+    ) {
+        assert_valid_time_value(when);
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!(
+                "NotSupportedError - control reservations require an exact hosted ConstantSource"
+            )
+        });
+        finish_exact_constant_source_mutation(
+            control.try_stop_with_host_reservation(when, reservation),
+        );
+    }
+
     /// Returns the offset `AudioParam`. Default is `1.0`.
     ///
     /// Useful as a constructible `AudioParam`: connect this once to several
-    /// sink params and automate it to drive them all in lockstep.
+    /// sink params and automate it to drive them all in lockstep. Legacy contexts support the
+    /// full automation timeline; exact hosted contexts currently admit scalar `set_value`
+    /// updates through their bounded control transport.
     #[must_use]
     pub fn offset(&self) -> &AudioParam {
         &self.offset
+    }
+
+    #[cfg(test)]
+    pub(crate) fn injected_control_for_test(&self) -> &InjectedConstantSourceControl {
+        self.injected_control
+            .as_ref()
+            .expect("test requires an exact injected ConstantSource")
+    }
+}
+
+fn finish_exact_constant_source_mutation(
+    result: Result<crate::context::CommitControlOutcome, InjectedConstantSourceMutationError>,
+) {
+    match result {
+        Ok(_) => {}
+        Err(InjectedConstantSourceMutationError::DuplicateStart) => {
+            panic!("InvalidStateError - Cannot call `start` twice")
+        }
+        Err(InjectedConstantSourceMutationError::StopBeforeStart) => {
+            panic!("InvalidStateError - cannot stop before start")
+        }
+        Err(InjectedConstantSourceMutationError::Inactive) => {
+            panic!("InvalidStateError - exact ConstantSource is no longer active")
+        }
+        Err(InjectedConstantSourceMutationError::Control(error)) => {
+            panic!("InvalidStateError - exact ConstantSource command was rejected: {error:?}")
+        }
+        Err(error) => {
+            panic!("InvalidStateError - exact ConstantSource transaction failed: {error:?}")
+        }
     }
 }
 
@@ -203,6 +405,7 @@ struct ConstantSourceRenderer {
     stop_time: f64,
     ended_triggered: bool,
     completion: ScheduledSourceCompletionToken,
+    exact_key: Option<crate::events::ExactEndedEventKey>,
 }
 
 impl ConstantSourceRenderer {
@@ -287,6 +490,26 @@ impl AudioProcessor for ConstantSourceRenderer {
     }
 
     fn onmessage(&mut self, msg: &mut dyn Any) {
+        if let Some(message) =
+            msg.downcast_mut::<crate::context::InjectedConstantSourceRenderMessage>()
+        {
+            let Some(key) = self.exact_key else {
+                return;
+            };
+            let Some(command) = message.apply_to(key) else {
+                return;
+            };
+            match command {
+                crate::context::InjectedConstantSourceCommandKind::Start(value) => {
+                    self.start_time = value
+                }
+                crate::context::InjectedConstantSourceCommandKind::Stop(value) => {
+                    self.stop_time = value
+                }
+            }
+            return;
+        }
+
         if let Some(schedule) = msg.downcast_ref::<Schedule>() {
             match *schedule {
                 Schedule::Start(v) => self.start_time = v,

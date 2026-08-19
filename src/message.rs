@@ -1017,6 +1017,9 @@ pub(crate) enum ControlMessage {
     /// Fixed, non-general exact oscillator start/stop/type command.
     InjectedOscillator(crate::context::InjectedOscillatorWireCommand),
 
+    /// Fixed, non-general exact ConstantSource start/stop command.
+    InjectedConstantSource(crate::context::InjectedConstantSourceWireCommand),
+
     /// Fixed, non-general exact BufferSource start/stop/loop command.
     InjectedAudioBufferSourceScalar(crate::context::InjectedAudioBufferSourceScalarWireCommand),
 
