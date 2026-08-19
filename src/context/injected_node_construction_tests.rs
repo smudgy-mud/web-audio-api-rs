@@ -1053,7 +1053,14 @@ fn incident_cleanup_wins_serializer_then_stale_generation_cannot_send_after_id_r
     harness.wait_for_transport_idle();
     assert_eq!(constructor.connection_edge_count_for_test(), 1);
     assert!(!graph_reservation_dropped.load(Ordering::Acquire));
-    assert!(control_reservation_dropped.load(Ordering::Acquire));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !control_reservation_dropped.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "applied connection batch was not reclaimed off the render thread"
+        );
+        thread::yield_now();
+    }
 
     let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
     let (release_send, release_recv) = crossbeam_channel::bounded(1);
