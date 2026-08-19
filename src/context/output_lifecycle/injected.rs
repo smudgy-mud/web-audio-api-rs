@@ -1,10 +1,18 @@
 //! Private lifecycle worker for one exactly bound injected output.
 
 use std::panic::{self, AssertUnwindSafe};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
 use super::*;
-use crate::context::injected_control::InjectedControlError;
+use crate::context::injected_admission::GraphControlAdmission;
+use crate::context::injected_control::{
+    BeginControlStateTransition, ControlStateBoundary, ControlStateObservation,
+    InjectedControlError, SubmittedControlStateTransition,
+};
 use crate::context::injected_node_lifetime::{
     InjectedCloseObservation, InjectedNodeRetireOutcome, InjectedOutputRenderOwner,
     InjectedRenderReclaimOutcome, MagicInitializedInjectedOutputRenderer,
@@ -15,6 +23,7 @@ use crate::context::ConcreteBaseAudioContext;
 use crate::events::{
     InjectedConfirmedEventRetirement, InjectedLifecycleEventLoop, InjectedTerminalStateOutcome,
 };
+use crate::message::GraphLifecycleTransition;
 use crate::output::{AudioOutputEventSink, AudioOutputStartFailure, PreparedAudioOutput};
 
 const OPEN_DRIVE_BUDGET: usize = 32;
@@ -51,9 +60,198 @@ impl Drop for FailClosedEventLoop {
     }
 }
 
-enum InjectedLifecycleCommand {
-    Graceful,
-    Silent,
+const STATE_REQUEST_CAPACITY: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedStateChangeOutcome {
+    Applied,
+    Unchanged,
+    SupersededByShutdown,
+    Closed,
+    Failed(InjectedStateChangeFailure),
+    ControllerTerminated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedStateChangeFailure {
+    Transport,
+    EventDelivery,
+    EndpointUncertain,
+    WorkerPanicked,
+}
+
+type StateCompletionReceiver = futures_channel::oneshot::Receiver<InjectedStateChangeOutcome>;
+
+#[derive(Clone)]
+pub(crate) struct InjectedStateChangeReceipt {
+    shared: futures_util::future::Shared<StateCompletionReceiver>,
+}
+
+impl std::future::Future for InjectedStateChangeReceipt {
+    type Output = InjectedStateChangeOutcome;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.shared).poll(cx) {
+            Poll::Ready(Ok(outcome)) => Poll::Ready(outcome),
+            Poll::Ready(Err(_)) => Poll::Ready(InjectedStateChangeOutcome::ControllerTerminated),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+struct StateChangeCompleter(Option<futures_channel::oneshot::Sender<InjectedStateChangeOutcome>>);
+
+impl StateChangeCompleter {
+    fn complete(mut self, outcome: InjectedStateChangeOutcome) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(outcome);
+        }
+    }
+}
+
+impl Drop for StateChangeCompleter {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(InjectedStateChangeOutcome::Failed(
+                InjectedStateChangeFailure::WorkerPanicked,
+            ));
+        }
+    }
+}
+
+fn state_change_receipt_pair() -> (StateChangeCompleter, InjectedStateChangeReceipt) {
+    use futures_util::FutureExt as _;
+
+    let (sender, receiver) = futures_channel::oneshot::channel();
+    (
+        StateChangeCompleter(Some(sender)),
+        InjectedStateChangeReceipt {
+            shared: receiver.shared(),
+        },
+    )
+}
+
+struct InjectedStateChangeCommand {
+    target: crate::context::AudioContextState,
+    admission: GraphControlAdmission,
+    completer: StateChangeCompleter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownLatchState {
+    Open = 0,
+    Graceful = 1,
+    Silent = 2,
+}
+
+impl ShutdownLatchState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Open,
+            1 => Self::Graceful,
+            2 => Self::Silent,
+            _ => Self::Silent,
+        }
+    }
+}
+
+struct InjectedLifecycleRequestGate {
+    phase: AtomicU8,
+    serialize: Mutex<()>,
+    wake: crossbeam_channel::Sender<()>,
+}
+
+impl InjectedLifecycleRequestGate {
+    fn load(&self) -> ShutdownLatchState {
+        ShutdownLatchState::from_u8(self.phase.load(Ordering::Acquire))
+    }
+
+    fn latch(&self, mode: OutputShutdownMode) {
+        let next = match mode {
+            OutputShutdownMode::Graceful => ShutdownLatchState::Graceful,
+            OutputShutdownMode::Silent => ShutdownLatchState::Silent,
+        };
+        let _serialization = self
+            .serialize
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.load();
+        if current == ShutdownLatchState::Open
+            || (current == ShutdownLatchState::Graceful && next == ShutdownLatchState::Silent)
+        {
+            self.phase.store(next as u8, Ordering::Release);
+        }
+        let _ = self.wake.try_send(());
+    }
+}
+
+/// Cancellation-independent control for the private exact output lifecycle.
+///
+/// The fixed-capacity request queue provides admission only: a successful call linearizes before
+/// a concurrently latched shutdown and transfers the native transition to the lifecycle worker.
+/// Dropping every clone of the returned receipt merely abandons observation; it never cancels an
+/// accepted transition. Requests linearized after shutdown complete as
+/// [`InjectedStateChangeOutcome::Closed`], and queue saturation is reported synchronously.
+///
+/// Receipts have no wall-clock deadline. A live stalled renderer or endpoint therefore remains
+/// pending until it advances or an authoritative shutdown/death condition supersedes it.
+/// [`Applied`](InjectedStateChangeOutcome::Applied) means the renderer changed the exact shared
+/// state, successfully enqueued its state event, and the endpoint method completed; it does not
+/// mean the event handler has run. Any endpoint error or panic makes endpoint ownership uncertain
+/// and starts fail-closed silent teardown rather than permitting a retry on that endpoint.
+#[derive(Clone)]
+pub(crate) struct InjectedOutputStateControl {
+    command_send: Sender<InjectedStateChangeCommand>,
+    request_gate: Arc<InjectedLifecycleRequestGate>,
+    admission_gate: crate::context::InjectedContextAdmissionGate,
+}
+
+impl InjectedOutputStateControl {
+    pub(crate) fn suspend(&self) -> Result<InjectedStateChangeReceipt, InjectedControlError> {
+        self.request(crate::context::AudioContextState::Suspended)
+    }
+
+    pub(crate) fn resume(&self) -> Result<InjectedStateChangeReceipt, InjectedControlError> {
+        self.request(crate::context::AudioContextState::Running)
+    }
+
+    fn request(
+        &self,
+        target: crate::context::AudioContextState,
+    ) -> Result<InjectedStateChangeReceipt, InjectedControlError> {
+        let serialization = match self.request_gate.serialize.try_lock() {
+            Ok(serialization) => serialization,
+            Err(TryLockError::WouldBlock) => return Err(InjectedControlError::Contended),
+            Err(TryLockError::Poisoned(_)) => return Err(InjectedControlError::Poisoned),
+        };
+        let (completer, receipt) = state_change_receipt_pair();
+        if self.request_gate.load() != ShutdownLatchState::Open {
+            drop(serialization);
+            completer.complete(InjectedStateChangeOutcome::Closed);
+            return Ok(receipt);
+        }
+        let admission = self
+            .admission_gate
+            .try_graph_control()
+            .map_err(InjectedControlError::from)?;
+        match self.command_send.try_send(InjectedStateChangeCommand {
+            target,
+            admission,
+            completer,
+        }) {
+            Ok(()) => {
+                drop(serialization);
+                let _ = self.request_gate.wake.try_send(());
+                Ok(receipt)
+            }
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                Err(InjectedControlError::LogicalCommandCredits)
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                Err(InjectedControlError::Disconnected)
+            }
+        }
+    }
 }
 
 pub(crate) enum InjectedOutputStart {
@@ -249,7 +447,8 @@ impl Drop for InjectedOutputStartFailure {
 
 pub(crate) struct InjectedOutputLifecycleController {
     base: ConcreteBaseAudioContext,
-    command_send: Sender<InjectedLifecycleCommand>,
+    state_control: InjectedOutputStateControl,
+    request_gate: Arc<InjectedLifecycleRequestGate>,
     receipt: OutputShutdownReceipt,
     worker: Option<JoinHandle<()>>,
     requested: bool,
@@ -264,17 +463,19 @@ impl InjectedOutputLifecycleController {
         self.receipt.clone()
     }
 
+    pub(crate) fn state_control(&self) -> InjectedOutputStateControl {
+        self.state_control.clone()
+    }
+
     pub(crate) fn shutdown_gracefully(mut self) -> OutputShutdownReceipt {
         self.requested = true;
-        let _ = self
-            .command_send
-            .try_send(InjectedLifecycleCommand::Graceful);
+        self.request_gate.latch(OutputShutdownMode::Graceful);
         self.receipt.clone()
     }
 
     pub(crate) fn shutdown_silently(mut self) -> OutputShutdownReceipt {
         self.requested = true;
-        let _ = self.command_send.try_send(InjectedLifecycleCommand::Silent);
+        self.request_gate.latch(OutputShutdownMode::Silent);
         self.receipt.clone()
     }
 }
@@ -282,7 +483,7 @@ impl InjectedOutputLifecycleController {
 impl Drop for InjectedOutputLifecycleController {
     fn drop(&mut self) {
         if !self.requested {
-            let _ = self.command_send.try_send(InjectedLifecycleCommand::Silent);
+            self.request_gate.latch(OutputShutdownMode::Silent);
         }
         self.worker.take();
     }
@@ -476,16 +677,34 @@ fn start_running(
     event_loop: InjectedLifecycleEventLoop,
     spawner: &dyn LifecycleWorkerSpawner,
 ) -> Result<InjectedOutputLifecycleController, Box<InjectedOutputStartFailure>> {
+    let initially_suspended = base.state() == crate::context::AudioContextState::Suspended;
+    let admission_gate = owner.state_request_gate();
     let resources = InjectedRunningResources {
         endpoint: Some(endpoint),
         owner: Some(owner),
         output_events: Some(output_events),
         event_loop: Some(event_loop),
     };
-    let (command_send, command_recv) = crossbeam_channel::bounded(1);
+    let (command_send, command_recv) = crossbeam_channel::bounded(STATE_REQUEST_CAPACITY);
+    let (request_wake, request_wake_receiver) = crossbeam_channel::bounded(1);
+    let request_gate = Arc::new(InjectedLifecycleRequestGate {
+        phase: AtomicU8::new(ShutdownLatchState::Open as u8),
+        serialize: Mutex::new(()),
+        wake: request_wake,
+    });
+    let worker_request_gate = Arc::clone(&request_gate);
     let (bootstrap_send, bootstrap_recv) = crossbeam_channel::bounded(1);
     let (completer, receipt) = shutdown_receipt_pair();
-    let job = Box::new(move || injected_running_worker(bootstrap_recv, command_recv, completer));
+    let job = Box::new(move || {
+        injected_running_worker(
+            bootstrap_recv,
+            command_recv,
+            request_wake_receiver,
+            worker_request_gate,
+            initially_suspended,
+            completer,
+        )
+    });
     let worker = match spawner.spawn(job) {
         Ok(worker) => worker,
         Err(error) => return Err(running_transfer_failure(error, resources, base, None)),
@@ -500,7 +719,12 @@ fn start_running(
     }
     Ok(InjectedOutputLifecycleController {
         base,
-        command_send,
+        state_control: InjectedOutputStateControl {
+            command_send,
+            request_gate: Arc::clone(&request_gate),
+            admission_gate,
+        },
+        request_gate,
         receipt,
         worker: Some(worker),
         requested: false,
@@ -729,15 +953,29 @@ fn run_uncertain(
 
 fn injected_running_worker(
     bootstrap: Receiver<InjectedRunningResources>,
-    commands: Receiver<InjectedLifecycleCommand>,
+    commands: Receiver<InjectedStateChangeCommand>,
+    request_wake: Receiver<()>,
+    request_gate: Arc<InjectedLifecycleRequestGate>,
+    initially_suspended: bool,
     completer: OutputShutdownCompleter,
 ) {
     let outcome = match bootstrap.recv() {
         Ok(mut resources) => panic::catch_unwind(AssertUnwindSafe(|| {
-            run_injected_running(&mut resources, &commands)
+            run_injected_running(
+                &mut resources,
+                &commands,
+                &request_wake,
+                &request_gate,
+                initially_suspended,
+            )
         }))
         .unwrap_or_else(|payload| {
             quarantine_panic_payload(payload);
+            request_gate.latch(OutputShutdownMode::Silent);
+            drain_state_commands(
+                &commands,
+                InjectedStateChangeOutcome::Failed(InjectedStateChangeFailure::WorkerPanicked),
+            );
             OutputShutdownOutcome::Unconfirmed {
                 failure: OutputShutdownIssue::new(
                     OutputShutdownIssueKind::WorkerPanicked,
@@ -798,11 +1036,57 @@ fn promote_late_endpoint_death(
 
 fn run_injected_running(
     resources: &mut InjectedRunningResources,
-    commands: &Receiver<InjectedLifecycleCommand>,
+    commands: &Receiver<InjectedStateChangeCommand>,
+    request_wake: &Receiver<()>,
+    request_gate: &InjectedLifecycleRequestGate,
+    initially_suspended: bool,
 ) -> OutputShutdownOutcome {
     let mut owner = resources.owner.take().unwrap();
     let output_events = resources.output_events.as_ref().unwrap();
-    let mut request = wait_for_injected_request(&mut owner, commands, output_events);
+    let endpoint = resources.endpoint.as_deref_mut().unwrap();
+    let live = drive_running_until_shutdown(
+        &mut owner,
+        endpoint,
+        commands,
+        request_wake,
+        request_gate,
+        output_events,
+        initially_suspended,
+    );
+    let mut request = match live {
+        Ok(request) => request,
+        Err(issue) => {
+            request_gate.latch(OutputShutdownMode::Silent);
+            drain_state_commands(commands, InjectedStateChangeOutcome::SupersededByShutdown);
+            let mut request = InjectedLifecycleRequest {
+                mode: OutputShutdownMode::Silent,
+                endpoint_death: output_events.death_reason(),
+                issue: Some(issue.clone()),
+            };
+            let prepared = prepare_injected_close(owner, &mut request, output_events, None);
+            let event_loop = FailClosedEventLoop::new(resources.event_loop.take().unwrap());
+            let output_events = resources.output_events.take().unwrap();
+            let endpoint = resources.endpoint.take().unwrap();
+            std::mem::forget(endpoint);
+            return match prepared {
+                PreparedInjectedClose::Ready(ready) => {
+                    wait_for_ready_render_quiescence(&ready);
+                    drop(ready);
+                    drop(output_events);
+                    finish_unconfirmed_events(event_loop, issue)
+                }
+                PreparedInjectedClose::NoProof { render, .. }
+                | PreparedInjectedClose::EndpointUncertain { render, .. } => {
+                    wait_for_render_quiescence(&render);
+                    drop(render);
+                    drop(output_events);
+                    finish_unconfirmed_events(event_loop, issue)
+                }
+            };
+        }
+    };
+    request_gate.latch(request.mode);
+    drain_state_commands(commands, InjectedStateChangeOutcome::SupersededByShutdown);
     let prepared = prepare_injected_close(
         owner,
         &mut request,
@@ -832,6 +1116,578 @@ fn run_injected_running(
             finish_unconfirmed_events(event_loop, issue)
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerGraphState {
+    Running,
+    Suspended,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerEndpointState {
+    Running,
+    Suspended,
+}
+
+enum StateCommandDrive {
+    Continue,
+    Shutdown(InjectedLifecycleRequest),
+    EndpointUncertain(OutputShutdownIssue),
+}
+
+enum StateAckFailure {
+    Superseded(InjectedLifecycleRequest),
+    Terminal {
+        request: InjectedLifecycleRequest,
+        failure: InjectedStateChangeFailure,
+    },
+}
+
+fn drain_state_commands(
+    commands: &Receiver<InjectedStateChangeCommand>,
+    outcome: InjectedStateChangeOutcome,
+) {
+    while let Ok(command) = commands.try_recv() {
+        let InjectedStateChangeCommand {
+            admission,
+            completer,
+            ..
+        } = command;
+        drop(admission);
+        completer.complete(outcome);
+    }
+}
+
+fn request_from_latch(
+    request_gate: &InjectedLifecycleRequestGate,
+    output_events: &AudioOutputEventWatcher,
+    issue: Option<OutputShutdownIssue>,
+) -> Option<InjectedLifecycleRequest> {
+    if let Some(reason) = output_events.death_reason() {
+        return Some(InjectedLifecycleRequest {
+            mode: OutputShutdownMode::Silent,
+            endpoint_death: Some(reason),
+            issue,
+        });
+    }
+    let mode = match request_gate.load() {
+        ShutdownLatchState::Open => return None,
+        ShutdownLatchState::Graceful => OutputShutdownMode::Graceful,
+        ShutdownLatchState::Silent => OutputShutdownMode::Silent,
+    };
+    Some(InjectedLifecycleRequest {
+        mode,
+        endpoint_death: None,
+        issue,
+    })
+}
+
+fn drive_open_node_lifetimes(
+    owner: &mut InjectedOutputRenderOwner,
+    issue: &mut Option<OutputShutdownIssue>,
+) {
+    if issue.is_some() {
+        return;
+    }
+    for _ in 0..OPEN_DRIVE_BUDGET {
+        match owner.try_drive_node_lifetimes() {
+            NodeLifetimeDriveOutcome::Idle | NodeLifetimeDriveOutcome::Retry { .. } => break,
+            NodeLifetimeDriveOutcome::Quarantined { .. } => {
+                *issue = Some(OutputShutdownIssue::new(
+                    OutputShutdownIssueKind::InjectedNodeLifetime,
+                    "injected node-lifetime driver entered quarantine",
+                ));
+                break;
+            }
+            NodeLifetimeDriveOutcome::Submitted { .. }
+            | NodeLifetimeDriveOutcome::Reconciled { .. }
+            | NodeLifetimeDriveOutcome::CloseSuperseded { .. } => {}
+        }
+    }
+}
+
+fn drive_running_until_shutdown(
+    owner: &mut InjectedOutputRenderOwner,
+    endpoint: &mut dyn RunningAudioOutput,
+    commands: &Receiver<InjectedStateChangeCommand>,
+    request_wake: &Receiver<()>,
+    request_gate: &InjectedLifecycleRequestGate,
+    output_events: &AudioOutputEventWatcher,
+    initially_suspended: bool,
+) -> Result<InjectedLifecycleRequest, OutputShutdownIssue> {
+    let mut graph = if initially_suspended {
+        WorkerGraphState::Suspended
+    } else {
+        WorkerGraphState::Running
+    };
+    // Prepared::start publishes a logically Running endpoint. An initially-suspended graph is
+    // reconciled natively before servicing user requests and without emitting a duplicate event.
+    let mut endpoint_state = WorkerEndpointState::Running;
+    if initially_suspended {
+        if let Some(request) = request_from_latch(request_gate, output_events, None) {
+            return Ok(request);
+        }
+        match panic::catch_unwind(AssertUnwindSafe(|| endpoint.suspend())) {
+            Ok(Ok(())) => endpoint_state = WorkerEndpointState::Suspended,
+            Ok(Err(error)) => {
+                return Err(issue_from_audio_error(
+                    OutputShutdownIssueKind::EndpointStateTransitionFailed,
+                    error,
+                ));
+            }
+            Err(payload) => {
+                quarantine_panic_payload(payload);
+                return Err(OutputShutdownIssue::new(
+                    OutputShutdownIssueKind::EndpointMethodPanicked,
+                    "injected endpoint panicked during initial native suspension",
+                ));
+            }
+        }
+        // Close/death may have committed while the synchronous native method was in flight. It
+        // dominates before any caller state request is observed.
+        if let Some(request) = request_from_latch(request_gate, output_events, None) {
+            return Ok(request);
+        }
+    }
+
+    let mut issue = None;
+    loop {
+        if let Some(request) = request_from_latch(request_gate, output_events, issue.clone()) {
+            return Ok(request);
+        }
+        drive_open_node_lifetimes(owner, &mut issue);
+        if let Some(request) = request_from_latch(request_gate, output_events, issue.clone()) {
+            return Ok(request);
+        }
+        match commands.try_recv() {
+            Ok(command) => match drive_state_command(
+                owner,
+                endpoint,
+                command,
+                request_gate,
+                output_events,
+                &mut graph,
+                &mut endpoint_state,
+                issue.clone(),
+            ) {
+                StateCommandDrive::Continue => continue,
+                StateCommandDrive::Shutdown(request) => return Ok(request),
+                StateCommandDrive::EndpointUncertain(issue) => return Err(issue),
+            },
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                return Ok(InjectedLifecycleRequest {
+                    mode: OutputShutdownMode::Silent,
+                    endpoint_death: None,
+                    issue,
+                });
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+        }
+        crossbeam_channel::select! {
+            recv(request_wake) -> _ => {},
+            recv(commands) -> command => {
+                if let Ok(command) = command {
+                    match drive_state_command(
+                        owner,
+                        endpoint,
+                        command,
+                        request_gate,
+                        output_events,
+                        &mut graph,
+                        &mut endpoint_state,
+                        issue.clone(),
+                    ) {
+                        StateCommandDrive::Continue => {},
+                        StateCommandDrive::Shutdown(request) => return Ok(request),
+                        StateCommandDrive::EndpointUncertain(issue) => return Err(issue),
+                    }
+                }
+            },
+            default(NODE_LIFETIME_RETRY_INTERVAL) => {},
+        }
+    }
+}
+
+fn terminal_state_failure(
+    snapshot: crate::message::GraphLifecycleSnapshot,
+) -> (InjectedStateChangeFailure, OutputShutdownIssue) {
+    let event_failed = matches!(
+        snapshot,
+        crate::message::GraphLifecycleSnapshot::Applied {
+            outcome: crate::message::GraphLifecycleOutcome::EventDeliveryFailed,
+            ..
+        }
+    );
+    if event_failed {
+        (
+            InjectedStateChangeFailure::EventDelivery,
+            OutputShutdownIssue::new(
+                OutputShutdownIssueKind::EventDeliveryDegraded,
+                "renderer changed injected state but could not enqueue its exact state event",
+            ),
+        )
+    } else {
+        (
+            InjectedStateChangeFailure::Transport,
+            OutputShutdownIssue::new(
+                OutputShutdownIssueKind::InjectedControlClose,
+                "renderer rejected the exact injected state barrier",
+            ),
+        )
+    }
+}
+
+fn wait_for_boundary(
+    owner: &mut InjectedOutputRenderOwner,
+    boundary: ControlStateBoundary,
+    request_gate: &InjectedLifecycleRequestGate,
+    output_events: &AudioOutputEventWatcher,
+    issue: Option<OutputShutdownIssue>,
+) -> Result<Option<InjectedLifecycleRequest>, InjectedControlError> {
+    loop {
+        if let Some(request) = request_from_latch(request_gate, output_events, issue.clone()) {
+            owner.cancel_state_transition(boundary)?;
+            return Ok(Some(request));
+        }
+        match owner.state_boundary_ready(boundary) {
+            Ok(true) => return Ok(None),
+            Ok(false) | Err(InjectedControlError::Contended) => {
+                std::thread::park_timeout(NODE_LIFETIME_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn wait_for_state_ack(
+    owner: &InjectedOutputRenderOwner,
+    submitted: SubmittedControlStateTransition,
+    request_gate: &InjectedLifecycleRequestGate,
+    output_events: &AudioOutputEventWatcher,
+    issue: Option<OutputShutdownIssue>,
+) -> Result<(), StateAckFailure> {
+    loop {
+        if let Some(request) = request_from_latch(request_gate, output_events, issue.clone()) {
+            return Err(StateAckFailure::Superseded(request));
+        }
+        match owner.observe_state_transition(submitted) {
+            ControlStateObservation::Applied => return Ok(()),
+            ControlStateObservation::Terminal(snapshot) => {
+                let (failure, issue) = terminal_state_failure(snapshot);
+                request_gate.latch(OutputShutdownMode::Silent);
+                return Err(StateAckFailure::Terminal {
+                    request: InjectedLifecycleRequest {
+                        mode: OutputShutdownMode::Silent,
+                        endpoint_death: output_events.death_reason(),
+                        issue: Some(issue),
+                    },
+                    failure,
+                });
+            }
+            ControlStateObservation::Pending => {
+                match owner.state_transition_wake_receiver().try_recv() {
+                    Ok(()) => {}
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        std::thread::park_timeout(NODE_LIFETIME_RETRY_INTERVAL);
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        request_gate.latch(OutputShutdownMode::Silent);
+                        return Err(StateAckFailure::Terminal {
+                            request: InjectedLifecycleRequest {
+                                mode: OutputShutdownMode::Silent,
+                                endpoint_death: output_events.death_reason(),
+                                issue: Some(OutputShutdownIssue::new(
+                                    OutputShutdownIssueKind::InjectedControlClose,
+                                    "renderer state-barrier publisher retired before acknowledgement",
+                                )),
+                            },
+                            failure: InjectedStateChangeFailure::Transport,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_state_command(
+    owner: &mut InjectedOutputRenderOwner,
+    endpoint: &mut dyn RunningAudioOutput,
+    command: InjectedStateChangeCommand,
+    request_gate: &InjectedLifecycleRequestGate,
+    output_events: &AudioOutputEventWatcher,
+    graph: &mut WorkerGraphState,
+    endpoint_state: &mut WorkerEndpointState,
+    issue: Option<OutputShutdownIssue>,
+) -> StateCommandDrive {
+    let InjectedStateChangeCommand {
+        target,
+        admission,
+        completer,
+    } = command;
+    if let Some(request) = request_from_latch(request_gate, output_events, issue.clone()) {
+        drop(admission);
+        completer.complete(InjectedStateChangeOutcome::SupersededByShutdown);
+        return StateCommandDrive::Shutdown(request);
+    }
+
+    let transition = match target {
+        crate::context::AudioContextState::Suspended => GraphLifecycleTransition::Suspend,
+        crate::context::AudioContextState::Running => GraphLifecycleTransition::Resume,
+        crate::context::AudioContextState::Closed => {
+            drop(admission);
+            completer.complete(InjectedStateChangeOutcome::Closed);
+            return StateCommandDrive::Continue;
+        }
+    };
+    let graph_matches = matches!(
+        (target, *graph),
+        (
+            crate::context::AudioContextState::Suspended,
+            WorkerGraphState::Suspended
+        ) | (
+            crate::context::AudioContextState::Running,
+            WorkerGraphState::Running
+        )
+    );
+    let endpoint_matches = matches!(
+        (target, *endpoint_state),
+        (
+            crate::context::AudioContextState::Suspended,
+            WorkerEndpointState::Suspended
+        ) | (
+            crate::context::AudioContextState::Running,
+            WorkerEndpointState::Running
+        )
+    );
+    if graph_matches && endpoint_matches {
+        drop(admission);
+        completer.complete(InjectedStateChangeOutcome::Unchanged);
+        return StateCommandDrive::Continue;
+    }
+
+    // Resume the native endpoint before exposing staged graph work. An initially-suspended graph
+    // may still have a Running endpoint only during bootstrap, which skips this redundant call.
+    if transition == GraphLifecycleTransition::Resume && !endpoint_matches {
+        match panic::catch_unwind(AssertUnwindSafe(|| endpoint.resume())) {
+            Ok(Ok(())) => *endpoint_state = WorkerEndpointState::Running,
+            Ok(Err(error)) => {
+                drop(admission);
+                completer.complete(InjectedStateChangeOutcome::Failed(
+                    InjectedStateChangeFailure::EndpointUncertain,
+                ));
+                return StateCommandDrive::EndpointUncertain(issue_from_audio_error(
+                    OutputShutdownIssueKind::EndpointStateTransitionFailed,
+                    error,
+                ));
+            }
+            Err(payload) => {
+                quarantine_panic_payload(payload);
+                drop(admission);
+                completer.complete(InjectedStateChangeOutcome::Failed(
+                    InjectedStateChangeFailure::EndpointUncertain,
+                ));
+                return StateCommandDrive::EndpointUncertain(OutputShutdownIssue::new(
+                    OutputShutdownIssueKind::EndpointMethodPanicked,
+                    "injected endpoint resume panicked",
+                ));
+            }
+        }
+        if let Some(request) = request_from_latch(request_gate, output_events, issue.clone()) {
+            drop(admission);
+            completer.complete(InjectedStateChangeOutcome::SupersededByShutdown);
+            return StateCommandDrive::Shutdown(request);
+        }
+    }
+
+    let mut submitted = None;
+    if !graph_matches {
+        let boundary = loop {
+            match owner.try_begin_state_transition(transition) {
+                Ok(BeginControlStateTransition::Boundary(boundary)) => break boundary,
+                Ok(BeginControlStateTransition::AlreadyPlaced) => {
+                    drop(admission);
+                    completer.complete(InjectedStateChangeOutcome::Failed(
+                        InjectedStateChangeFailure::Transport,
+                    ));
+                    request_gate.latch(OutputShutdownMode::Silent);
+                    return StateCommandDrive::Shutdown(InjectedLifecycleRequest {
+                        mode: OutputShutdownMode::Silent,
+                        endpoint_death: output_events.death_reason(),
+                        issue: Some(OutputShutdownIssue::new(
+                            OutputShutdownIssueKind::InjectedControlClose,
+                            "worker graph state disagreed with exact transport placement",
+                        )),
+                    });
+                }
+                Err(InjectedControlError::Contended) => {
+                    if let Some(request) =
+                        request_from_latch(request_gate, output_events, issue.clone())
+                    {
+                        drop(admission);
+                        completer.complete(InjectedStateChangeOutcome::SupersededByShutdown);
+                        return StateCommandDrive::Shutdown(request);
+                    }
+                    std::thread::park_timeout(NODE_LIFETIME_RETRY_INTERVAL);
+                }
+                Err(_) => {
+                    drop(admission);
+                    completer.complete(InjectedStateChangeOutcome::Failed(
+                        InjectedStateChangeFailure::Transport,
+                    ));
+                    request_gate.latch(OutputShutdownMode::Silent);
+                    return StateCommandDrive::Shutdown(InjectedLifecycleRequest {
+                        mode: OutputShutdownMode::Silent,
+                        endpoint_death: output_events.death_reason(),
+                        issue: Some(OutputShutdownIssue::new(
+                            OutputShutdownIssueKind::InjectedControlClose,
+                            "injected state transition could not establish its boundary",
+                        )),
+                    });
+                }
+            }
+        };
+        match wait_for_boundary(owner, boundary, request_gate, output_events, issue.clone()) {
+            Ok(Some(request)) => {
+                drop(admission);
+                completer.complete(InjectedStateChangeOutcome::SupersededByShutdown);
+                return StateCommandDrive::Shutdown(request);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                drop(admission);
+                completer.complete(InjectedStateChangeOutcome::Failed(
+                    InjectedStateChangeFailure::Transport,
+                ));
+                request_gate.latch(OutputShutdownMode::Silent);
+                return StateCommandDrive::Shutdown(InjectedLifecycleRequest {
+                    mode: OutputShutdownMode::Silent,
+                    endpoint_death: output_events.death_reason(),
+                    issue: Some(OutputShutdownIssue::new(
+                        OutputShutdownIssueKind::InjectedControlClose,
+                        "injected state reservation drain failed",
+                    )),
+                });
+            }
+        }
+
+        if transition == GraphLifecycleTransition::Resume {
+            loop {
+                if let Some(request) =
+                    request_from_latch(request_gate, output_events, issue.clone())
+                {
+                    let _ = owner.cancel_state_transition(boundary);
+                    drop(admission);
+                    completer.complete(InjectedStateChangeOutcome::SupersededByShutdown);
+                    return StateCommandDrive::Shutdown(request);
+                }
+                match owner.try_flush_state_transition(boundary) {
+                    Ok(flush) if flush.remaining_staged == 0 => break,
+                    Ok(_) | Err(InjectedControlError::Contended) => {
+                        std::thread::park_timeout(NODE_LIFETIME_RETRY_INTERVAL);
+                    }
+                    Err(_) => {
+                        drop(admission);
+                        completer.complete(InjectedStateChangeOutcome::Failed(
+                            InjectedStateChangeFailure::Transport,
+                        ));
+                        request_gate.latch(OutputShutdownMode::Silent);
+                        return StateCommandDrive::Shutdown(InjectedLifecycleRequest {
+                            mode: OutputShutdownMode::Silent,
+                            endpoint_death: output_events.death_reason(),
+                            issue: Some(OutputShutdownIssue::new(
+                                OutputShutdownIssueKind::InjectedControlClose,
+                                "injected staged Resume flush failed",
+                            )),
+                        });
+                    }
+                }
+            }
+        }
+        let exact = match owner.try_submit_state_transition(boundary) {
+            Ok(exact) => exact,
+            Err(_) => {
+                drop(admission);
+                completer.complete(InjectedStateChangeOutcome::Failed(
+                    InjectedStateChangeFailure::Transport,
+                ));
+                request_gate.latch(OutputShutdownMode::Silent);
+                return StateCommandDrive::Shutdown(InjectedLifecycleRequest {
+                    mode: OutputShutdownMode::Silent,
+                    endpoint_death: output_events.death_reason(),
+                    issue: Some(OutputShutdownIssue::new(
+                        OutputShutdownIssueKind::InjectedControlClose,
+                        "injected state barrier submission failed",
+                    )),
+                });
+            }
+        };
+        submitted = Some(exact);
+    }
+    // Admission ends only after the exact boundary is published (or proved unnecessary). Close
+    // may now seal without waiting on a live callback or endpoint method.
+    drop(admission);
+
+    if let Some(exact) = submitted {
+        if let Err(failure) =
+            wait_for_state_ack(owner, exact, request_gate, output_events, issue.clone())
+        {
+            return match failure {
+                StateAckFailure::Superseded(request) => {
+                    completer.complete(InjectedStateChangeOutcome::SupersededByShutdown);
+                    StateCommandDrive::Shutdown(request)
+                }
+                StateAckFailure::Terminal { request, failure } => {
+                    completer.complete(InjectedStateChangeOutcome::Failed(failure));
+                    StateCommandDrive::Shutdown(request)
+                }
+            };
+        }
+        *graph = match transition {
+            GraphLifecycleTransition::Suspend => WorkerGraphState::Suspended,
+            GraphLifecycleTransition::Resume => WorkerGraphState::Running,
+            GraphLifecycleTransition::Close => unreachable!(),
+        };
+    }
+
+    // Suspend mirrors legacy order: graph/state/event acknowledgement first, native endpoint
+    // suspension second. Any endpoint Err is conservatively uncertain under the public trait.
+    if transition == GraphLifecycleTransition::Suspend && !endpoint_matches {
+        if let Some(request) = request_from_latch(request_gate, output_events, issue.clone()) {
+            completer.complete(InjectedStateChangeOutcome::SupersededByShutdown);
+            return StateCommandDrive::Shutdown(request);
+        }
+        match panic::catch_unwind(AssertUnwindSafe(|| endpoint.suspend())) {
+            Ok(Ok(())) => *endpoint_state = WorkerEndpointState::Suspended,
+            Ok(Err(error)) => {
+                completer.complete(InjectedStateChangeOutcome::Failed(
+                    InjectedStateChangeFailure::EndpointUncertain,
+                ));
+                return StateCommandDrive::EndpointUncertain(issue_from_audio_error(
+                    OutputShutdownIssueKind::EndpointStateTransitionFailed,
+                    error,
+                ));
+            }
+            Err(payload) => {
+                quarantine_panic_payload(payload);
+                completer.complete(InjectedStateChangeOutcome::Failed(
+                    InjectedStateChangeFailure::EndpointUncertain,
+                ));
+                return StateCommandDrive::EndpointUncertain(OutputShutdownIssue::new(
+                    OutputShutdownIssueKind::EndpointMethodPanicked,
+                    "injected endpoint suspend panicked",
+                ));
+            }
+        }
+        if let Some(request) = request_from_latch(request_gate, output_events, issue) {
+            completer.complete(InjectedStateChangeOutcome::SupersededByShutdown);
+            return StateCommandDrive::Shutdown(request);
+        }
+    }
+    completer.complete(InjectedStateChangeOutcome::Applied);
+    StateCommandDrive::Continue
 }
 
 fn run_injected_partial(resources: &mut InjectedPartialResources) -> OutputShutdownOutcome {
@@ -864,78 +1720,6 @@ fn run_injected_partial(resources: &mut InjectedPartialResources) -> OutputShutd
             drop(output_events);
             finish_unconfirmed_events(event_loop, issue)
         }
-    }
-}
-
-fn wait_for_injected_request(
-    owner: &mut InjectedOutputRenderOwner,
-    commands: &Receiver<InjectedLifecycleCommand>,
-    output_events: &AudioOutputEventWatcher,
-) -> InjectedLifecycleRequest {
-    let mut issue = None;
-    let mut drive = true;
-    loop {
-        if let Some(request) = probe_injected_request(commands, output_events, issue.clone()) {
-            return request;
-        }
-
-        if drive {
-            for _ in 0..OPEN_DRIVE_BUDGET {
-                match owner.try_drive_node_lifetimes() {
-                    NodeLifetimeDriveOutcome::Idle | NodeLifetimeDriveOutcome::Retry { .. } => {
-                        break;
-                    }
-                    NodeLifetimeDriveOutcome::Quarantined { .. } => {
-                        issue = Some(OutputShutdownIssue::new(
-                            OutputShutdownIssueKind::InjectedNodeLifetime,
-                            "injected node-lifetime driver entered quarantine",
-                        ));
-                        drive = false;
-                        break;
-                    }
-                    NodeLifetimeDriveOutcome::Submitted { .. }
-                    | NodeLifetimeDriveOutcome::Reconciled { .. }
-                    | NodeLifetimeDriveOutcome::CloseSuperseded { .. } => {}
-                }
-            }
-        }
-
-        if let Some(request) = probe_injected_request(commands, output_events, issue.clone()) {
-            return request;
-        }
-        if drive {
-            let _ = owner.wait_for_node_lifetime_activity();
-        } else {
-            std::thread::park_timeout(NODE_LIFETIME_RETRY_INTERVAL);
-        }
-    }
-}
-
-fn probe_injected_request(
-    commands: &Receiver<InjectedLifecycleCommand>,
-    output_events: &AudioOutputEventWatcher,
-    issue: Option<OutputShutdownIssue>,
-) -> Option<InjectedLifecycleRequest> {
-    if let Some(reason) = output_events.death_reason() {
-        return Some(InjectedLifecycleRequest {
-            mode: OutputShutdownMode::Silent,
-            endpoint_death: Some(reason),
-            issue,
-        });
-    }
-    match commands.try_recv() {
-        Ok(InjectedLifecycleCommand::Graceful) => Some(InjectedLifecycleRequest {
-            mode: OutputShutdownMode::Graceful,
-            endpoint_death: None,
-            issue,
-        }),
-        Ok(InjectedLifecycleCommand::Silent)
-        | Err(crossbeam_channel::TryRecvError::Disconnected) => Some(InjectedLifecycleRequest {
-            mode: OutputShutdownMode::Silent,
-            endpoint_death: None,
-            issue,
-        }),
-        Err(crossbeam_channel::TryRecvError::Empty) => None,
     }
 }
 
@@ -1038,11 +1822,13 @@ fn prepare_injected_close(
         Some(Ok(Ok(()))) => {}
         Some(Ok(Err(error))) => {
             request.mode = OutputShutdownMode::Silent;
-            request.issue = Some(issue_from_audio_error(
-                OutputShutdownIssueKind::EndpointRejectedShutdown,
-                error,
-            ));
-            return PreparedInjectedClose::Ready(sealed.into_silent_reclaim());
+            return PreparedInjectedClose::EndpointUncertain {
+                render: sealed.quarantine_into_render_owner(),
+                issue: issue_from_audio_error(
+                    OutputShutdownIssueKind::EndpointStateTransitionFailed,
+                    error,
+                ),
+            };
         }
         Some(Err(payload)) => {
             quarantine_panic_payload(payload);

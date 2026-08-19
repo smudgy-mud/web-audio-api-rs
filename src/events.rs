@@ -254,6 +254,11 @@ impl InjectedContextState {
         })))
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(initially_suspended: bool) -> Self {
+        Self::new(initially_suspended)
+    }
+
     pub(crate) fn load(&self) -> AudioContextState {
         self.0.load(Ordering::Acquire).into()
     }

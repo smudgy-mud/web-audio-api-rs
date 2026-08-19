@@ -14,12 +14,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 
 use super::injected_control::{
-    AcceptedBatchFinalizeError, BeginControlCloseFailure, ControlCloseDegradation,
-    ControlCloseRetirement, DrainedControlClose, ExactBoundInjectedRenderer,
-    ExactInjectedRenderPairFailure, ExtractedControlPayloads, FinishControlCloseFailure,
-    InjectedControlError, InjectedControlIdentity, InjectedControlLifecycleOwner,
-    InjectedControlProducer, InjectedNodeLifetimeBootstrap, ObserveControlCloseFailure,
-    SubmittedControlClose,
+    AcceptedBatchFinalizeError, BeginControlCloseFailure, BeginControlStateTransition,
+    ControlCloseDegradation, ControlCloseRetirement, ControlStateBoundary, ControlStateObservation,
+    DrainedControlClose, ExactBoundInjectedRenderer, ExactInjectedRenderPairFailure,
+    ExtractedControlPayloads, FinishControlCloseFailure, FlushControlOutcome, InjectedControlError,
+    InjectedControlIdentity, InjectedControlLifecycleOwner, InjectedControlProducer,
+    InjectedNodeLifetimeBootstrap, ObserveControlCloseFailure, SubmittedControlClose,
+    SubmittedControlStateTransition,
 };
 use super::injected_ids::{
     InjectedGraphReclaimInit, InjectedNodeIdAllocator, InjectedNodeIdIdentity, InjectedNodeIdOwner,
@@ -534,8 +535,82 @@ impl Drop for InjectedOutputRenderOwner {
     }
 }
 
-#[cfg(test)]
 impl InjectedOutputRenderOwner {
+    pub(crate) fn state_request_gate(&self) -> super::InjectedContextAdmissionGate {
+        self.control
+            .as_ref()
+            .expect("open injected output retains control lifecycle")
+            .admission_gate()
+    }
+
+    pub(crate) fn try_begin_state_transition(
+        &mut self,
+        transition: crate::message::GraphLifecycleTransition,
+    ) -> Result<BeginControlStateTransition, InjectedControlError> {
+        self.control
+            .as_mut()
+            .expect("open injected output retains control lifecycle")
+            .try_begin_state_transition(transition)
+    }
+
+    pub(crate) fn state_boundary_ready(
+        &self,
+        boundary: ControlStateBoundary,
+    ) -> Result<bool, InjectedControlError> {
+        self.control
+            .as_ref()
+            .expect("open injected output retains control lifecycle")
+            .state_boundary_ready(boundary)
+    }
+
+    pub(crate) fn try_flush_state_transition(
+        &mut self,
+        boundary: ControlStateBoundary,
+    ) -> Result<FlushControlOutcome, InjectedControlError> {
+        self.control
+            .as_mut()
+            .expect("open injected output retains control lifecycle")
+            .try_flush_state_transition(boundary)
+    }
+
+    pub(crate) fn try_submit_state_transition(
+        &mut self,
+        boundary: ControlStateBoundary,
+    ) -> Result<SubmittedControlStateTransition, InjectedControlError> {
+        self.control
+            .as_mut()
+            .expect("open injected output retains control lifecycle")
+            .try_submit_state_transition(boundary)
+    }
+
+    pub(crate) fn cancel_state_transition(
+        &mut self,
+        boundary: ControlStateBoundary,
+    ) -> Result<(), InjectedControlError> {
+        self.control
+            .as_mut()
+            .expect("open injected output retains control lifecycle")
+            .cancel_state_transition(boundary)
+    }
+
+    pub(crate) fn observe_state_transition(
+        &self,
+        submitted: SubmittedControlStateTransition,
+    ) -> ControlStateObservation {
+        self.control
+            .as_ref()
+            .expect("open injected output retains control lifecycle")
+            .observe_state_transition(submitted)
+    }
+
+    pub(crate) fn state_transition_wake_receiver(&self) -> &crossbeam_channel::Receiver<()> {
+        self.control
+            .as_ref()
+            .expect("open injected output retains control lifecycle")
+            .state_transition_wake_receiver()
+    }
+
+    #[cfg(test)]
     pub(crate) fn into_parts_for_test(
         mut self,
     ) -> (
