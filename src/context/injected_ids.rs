@@ -346,6 +346,13 @@ impl InjectedNodeIdOwner {
         InjectedNodeIdIdentity(Arc::downgrade(&self.inner))
     }
 
+    #[cfg(test)]
+    pub(crate) fn disconnect_reclaim_activity_for_test(&mut self) {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        drop(sender);
+        self.reclaim_activity = receiver;
+    }
+
     pub(crate) fn matches_graph_init(&self, graph: &InjectedGraphReclaimInit) -> bool {
         self.identity().ptr_eq(&graph.identity)
     }
@@ -383,6 +390,29 @@ impl InjectedNodeIdOwner {
             node: Some(node),
             identity: self.identity(),
         })
+    }
+
+    /// Returns one fully reconciled exact acknowledgement to this allocator. A foreign token is
+    /// returned intact, and no queue is modified, so the lifecycle registry can quarantine it and
+    /// keep the id permanently unavailable. Once accepted, the infallible queue push is the sole
+    /// publication point for ordinary id reuse.
+    pub(crate) fn make_reconciled_available(
+        &mut self,
+        mut pending: OwnedPendingNodeReclaim,
+    ) -> Result<(), OwnedPendingNodeReclaim> {
+        if !self.identity().ptr_eq(&pending.identity) {
+            return Err(pending);
+        }
+        let node = pending
+            .node
+            .take()
+            .expect("owned pending reclaim is consumed exactly once");
+        self.inner
+            .available_return
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(node);
+        Ok(())
     }
 
     /// Destroys an exact acknowledgement off RT after whole-graph retirement proves that this

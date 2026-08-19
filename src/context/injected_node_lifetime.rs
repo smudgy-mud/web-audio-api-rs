@@ -3,9 +3,9 @@
 //! This foundation is deliberately not wired to `ConcreteBaseAudioContext`. Cloneable registrars
 //! and live registrations retain only a weak registry capability; a unique lifecycle-side owner
 //! holds the fixed slot storage, exact graph-reclaim owner, and authoritative wake receivers.
-//! No ordinary graph-control credit is retained for a node lifetime. Normal teardown submission,
-//! retry/select driving, accepted-pending transitions, and ordinary reconciliation/id reuse are a
-//! later slice; this module currently supports exact reclaim placement and whole-graph retirement.
+//! No ordinary graph-control credit is retained for a node lifetime. Requested teardown is driven
+//! explicitly by the lifecycle caller through bounded, retryable operations; this slice does not
+//! create a worker or wire a public context constructor.
 
 #![allow(dead_code)]
 
@@ -23,6 +23,16 @@ use super::injected_ids::{
 };
 use super::AudioNodeId;
 
+mod teardown;
+#[allow(unused_imports)] // consumed by the later concrete lifecycle integration
+pub(crate) use teardown::{
+    NodeLifetimeActivity, NodeLifetimeDriveOutcome, NodeLifetimeQuarantineReason,
+    NodeLifetimeRetryReason, NODE_LIFETIME_RETRY_INTERVAL,
+};
+
+#[cfg(test)]
+mod teardown_tests;
+
 pub(crate) const DEFAULT_NODE_LIFETIME_CAPACITY: usize = 256;
 
 const PHASE_BITS: u32 = 4;
@@ -39,8 +49,12 @@ enum SlotPhase {
     Live = 2,
     Requested = 3,
     Canceling = 4,
-    Sealed = 5,
-    Quarantined = 6,
+    Servicing = 5,
+    AcceptedPending = 6,
+    AwaitingReclaim = 7,
+    Reconciling = 8,
+    Sealed = 9,
+    Quarantined = 10,
 }
 
 impl SlotPhase {
@@ -51,8 +65,12 @@ impl SlotPhase {
             2 => Self::Live,
             3 => Self::Requested,
             4 => Self::Canceling,
-            5 => Self::Sealed,
-            6 => Self::Quarantined,
+            5 => Self::Servicing,
+            6 => Self::AcceptedPending,
+            7 => Self::AwaitingReclaim,
+            8 => Self::Reconciling,
+            9 => Self::Sealed,
+            10 => Self::Quarantined,
             _ => unreachable!("private node-lifetime slot phase"),
         }
     }
@@ -102,6 +120,9 @@ pub(crate) enum NodeReclaimCleanupError {
 
 /// Control-side represented-resource cleanup run before an exact graph id becomes reusable.
 /// Concrete mirror/host-guard implementations are deferred with the injected context wiring.
+/// Returning `Rejected` must leave the implementation retry-safe and idempotent: the ordinary
+/// path retains it in quarantine, and whole-graph retirement invokes `reconcile` once more before
+/// reporting a final rejected cleanup.
 pub(crate) trait InjectedNodeReclaimCleanup: Send {
     fn reconcile(&mut self, id: AudioNodeId) -> Result<(), NodeReclaimCleanupError>;
 }
@@ -145,6 +166,36 @@ struct NodeLifetimeInner {
             crossbeam_channel::Receiver<()>,
         )>,
     >,
+    #[cfg(test)]
+    teardown_finalizer_behavior: AtomicU8,
+    #[cfg(test)]
+    teardown_finalizer_hook: Mutex<
+        Option<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    teardown_precommit_hook: Mutex<
+        Option<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    teardown_before_restore_hook: Mutex<
+        Option<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    teardown_post_publish_hook: Mutex<
+        Option<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+    >,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +213,7 @@ pub(crate) struct InjectedNodeLifetimeOwner {
     inner: Option<Arc<NodeLifetimeInner>>,
     request_wake: Option<crossbeam_channel::Receiver<()>>,
     node_ids: Option<InjectedNodeIdOwner>,
+    control: Option<InjectedControlProducer>,
     orphan_reclaim: Option<OwnedPendingNodeReclaim>,
 }
 
@@ -211,6 +263,16 @@ pub(crate) fn injected_node_lifetime_registry(
         arm_publish_hook: Mutex::new(None),
         #[cfg(test)]
         reclaim_attach_hook: Mutex::new(None),
+        #[cfg(test)]
+        teardown_finalizer_behavior: AtomicU8::new(0),
+        #[cfg(test)]
+        teardown_finalizer_hook: Mutex::new(None),
+        #[cfg(test)]
+        teardown_precommit_hook: Mutex::new(None),
+        #[cfg(test)]
+        teardown_before_restore_hook: Mutex::new(None),
+        #[cfg(test)]
+        teardown_post_publish_hook: Mutex::new(None),
     });
     let registrar = InjectedNodeLifetimeRegistrar {
         inner: Arc::downgrade(&inner),
@@ -219,6 +281,7 @@ pub(crate) fn injected_node_lifetime_registry(
         inner: Some(inner),
         request_wake: Some(request_receiver),
         node_ids: Some(node_ids),
+        control: Some(control.clone()),
         orphan_reclaim: None,
     };
     let node_lifetimes = InjectedNodeLifetimeBootstrap::new(owner, graph)
@@ -714,13 +777,6 @@ impl InjectedNodeLifetimeOwner {
         );
     }
 
-    #[cfg(test)]
-    fn request_wake_receiver(&self) -> &crossbeam_channel::Receiver<()> {
-        self.request_wake
-            .as_ref()
-            .expect("live node-lifetime owner retains its request wake")
-    }
-
     /// Transfers every currently available exact acknowledgement into a matching fixed slot.
     /// A live registration with an already-reclaimed graph node retains the exact token until that
     /// old registration is dropped, preventing ABA reuse after processor failure.
@@ -772,7 +828,12 @@ impl InjectedNodeLifetimeOwner {
                 || slot.id.load(Ordering::Acquire) != id.0
                 || !matches!(
                     SlotPhase::from_word(word),
-                    SlotPhase::Provisional | SlotPhase::Live | SlotPhase::Requested
+                    SlotPhase::Provisional
+                        | SlotPhase::Live
+                        | SlotPhase::Requested
+                        | SlotPhase::Servicing
+                        | SlotPhase::AcceptedPending
+                        | SlotPhase::AwaitingReclaim
                 )
             {
                 drop(payload);
@@ -844,13 +905,17 @@ impl InjectedNodeLifetimeOwner {
                         degraded = true;
                         break;
                     }
-                    SlotPhase::Canceling => {
+                    SlotPhase::Canceling
+                    | SlotPhase::Servicing
+                    | SlotPhase::AcceptedPending
+                    | SlotPhase::Reconciling => {
                         degraded = true;
                         with_phase(word, SlotPhase::Quarantined)
                     }
-                    SlotPhase::Provisional | SlotPhase::Live | SlotPhase::Requested => {
-                        with_phase(word, SlotPhase::Sealed)
-                    }
+                    SlotPhase::Provisional
+                    | SlotPhase::Live
+                    | SlotPhase::Requested
+                    | SlotPhase::AwaitingReclaim => with_phase(word, SlotPhase::Sealed),
                 };
                 if slot
                     .word
@@ -866,6 +931,7 @@ impl InjectedNodeLifetimeOwner {
             inner: self.inner.take(),
             request_wake: self.request_wake.take(),
             node_ids: self.node_ids.take(),
+            control: self.control.take(),
             orphan_reclaim: self.orphan_reclaim.take(),
             degraded,
             registry_quarantined,
@@ -907,6 +973,7 @@ impl Drop for InjectedNodeLifetimeOwner {
         if let Some(receiver) = self.request_wake.take() {
             std::mem::forget(receiver);
         }
+        self.control.take();
         if let Some(reclaim) = self.orphan_reclaim.take() {
             std::mem::forget(reclaim);
         }
@@ -921,6 +988,7 @@ pub(crate) struct SealedNodeLifetimeRegistry {
     inner: Option<Arc<NodeLifetimeInner>>,
     request_wake: Option<crossbeam_channel::Receiver<()>>,
     node_ids: Option<InjectedNodeIdOwner>,
+    control: Option<InjectedControlProducer>,
     orphan_reclaim: Option<OwnedPendingNodeReclaim>,
     degraded: bool,
     registry_quarantined: bool,
@@ -1016,6 +1084,7 @@ impl SealedNodeLifetimeRegistry {
             }
         }
         self.request_wake.take();
+        self.control.take();
         drop(node_ids);
         drop(inner);
         Ok(WholeGraphNodeRetirement {
@@ -1039,6 +1108,7 @@ impl Drop for SealedNodeLifetimeRegistry {
         if let Some(receiver) = self.request_wake.take() {
             std::mem::forget(receiver);
         }
+        self.control.take();
         if let Some(reclaim) = self.orphan_reclaim.take() {
             std::mem::forget(reclaim);
         }
@@ -1314,7 +1384,7 @@ mod tests {
                 .owner
                 .as_ref()
                 .unwrap()
-                .request_wake_receiver()
+                .request_activity_receiver()
                 .try_recv(),
             Err(crossbeam_channel::TryRecvError::Empty)
         );
@@ -1334,9 +1404,9 @@ mod tests {
         alloc_counter::deny_alloc(|| drop(first));
         alloc_counter::deny_alloc(|| drop(second));
         let owner = foundation.owner.as_ref().unwrap();
-        owner.request_wake_receiver().recv().unwrap();
+        owner.request_activity_receiver().recv().unwrap();
         assert_eq!(
-            owner.request_wake_receiver().try_recv(),
+            owner.request_activity_receiver().try_recv(),
             Err(crossbeam_channel::TryRecvError::Empty)
         );
 
@@ -1453,7 +1523,7 @@ mod tests {
         assert!(payload.reclaim.is_some());
         assert!(dropped.lock().unwrap().is_empty());
         drop(payload);
-        owner.request_wake_receiver().recv().unwrap();
+        owner.request_activity_receiver().recv().unwrap();
         foundation.owner = Some(owner);
     }
 
