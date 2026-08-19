@@ -7,7 +7,6 @@
 use std::panic::{self, AssertUnwindSafe};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU8, Ordering};
-#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 use arrayvec::ArrayVec;
@@ -17,15 +16,21 @@ use super::injected_control::{
     ControlBatchReservation, InjectedControlError, InjectedControlIdentity,
     InjectedControlProducer, RejectedControlRollback,
 };
-use super::injected_ids::{InjectedNodeIdAllocator, ProvisionalNodeIdError, ProvisionalNodeIds};
+use super::injected_ids::{
+    InjectedNodeIdAllocator, InjectedNodeIdIdentity, ProvisionalNodeIdError, ProvisionalNodeIds,
+};
 use super::injected_node_lifetime::{
     InjectedNodeLifetimeRegistrar, InjectedNodeReclaimCleanup, InjectedNodeRegistration,
-    NodeReclaimCleanupError, NodeRegistrationError, ProvisionalNodeRegistration,
+    InjectedNodeRegistrationIdentity, NodeReclaimCleanupError, NodeRegistrationError,
+    ProvisionalNodeRegistration,
 };
-use super::AudioNodeId;
+use super::{AudioContextRegistration, AudioNodeId};
 use crate::message::ControlMessage;
 use crate::node::ChannelConfigInner;
-use crate::param::AudioParamInitialValue;
+use crate::param::{
+    AudioParamInitialValue, AudioParamInner, InjectedAudioParamMirror, InjectedAudioParamProcessor,
+    InjectedAudioParamValue,
+};
 use crate::render::AudioProcessor;
 
 const GAIN_COMMAND_COUNT: usize = 4;
@@ -148,6 +153,15 @@ impl InjectedNodeConstructor {
             .control
             .try_begin_operation(GAIN_COMMAND_COUNT)
             .map_err(InjectedGainConstructionError::Control)?;
+        // Allocate the post-construction serializer while every later Gain resource is still
+        // rollback-owned by this admitted transaction.
+        let param_serializer = Arc::new(Mutex::new(()));
+        #[cfg(test)]
+        let param_finalizer_hook = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let param_rollback_hook = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let param_serializer_attempt = Arc::new(Mutex::new(None));
         let ids = self
             .allocator
             .try_reserve(GAIN_NODE_COUNT)
@@ -170,6 +184,13 @@ impl InjectedNodeConstructor {
             param,
             gain_id,
             param_id,
+            param_serializer,
+            #[cfg(test)]
+            param_finalizer_hook,
+            #[cfg(test)]
+            param_rollback_hook,
+            #[cfg(test)]
+            param_serializer_attempt,
             #[cfg(test)]
             id_corruption: 0,
             #[cfg(test)]
@@ -238,7 +259,7 @@ impl InjectedNodeReclaimCleanup for DeferredIncidentConnectionCleanup {
 }
 
 pub(crate) struct InjectedGainPayload {
-    pub(crate) param_processor: Box<dyn AudioProcessor>,
+    pub(crate) param_processor: InjectedAudioParamProcessor,
     pub(crate) gain_processor: Box<dyn AudioProcessor>,
     pub(crate) param_channel_config: ChannelConfigInner,
     pub(crate) gain_channel_config: ChannelConfigInner,
@@ -250,7 +271,220 @@ pub(crate) struct InjectedConstructedGain {
     pub(crate) param_id: AudioNodeId,
     pub(crate) gain_registration: InjectedNodeRegistration,
     pub(crate) param_registration: InjectedNodeRegistration,
+    pub(crate) param_mutation: InjectedAudioParamMutation,
     pub(crate) outcome: CommitControlOutcome,
+}
+
+/// Exact post-construction capability for the one supported injected AudioParam mutation.
+///
+/// The serializer is allocated while the Gain transaction can still roll back. Clones share that
+/// ordering, the exact host mirror, and weak control/allocator/slot-generation brands, but retain
+/// no transport, admission, or live-registration credit.
+#[derive(Clone)]
+pub(crate) struct InjectedAudioParamMutation {
+    control: InjectedControlProducer,
+    node_ids: InjectedNodeIdIdentity,
+    param_id: AudioNodeId,
+    lifetime: InjectedNodeRegistrationIdentity,
+    serializer: Arc<Mutex<()>>,
+    mirror: InjectedAudioParamMirror,
+    #[cfg(test)]
+    finalizer_hook: Arc<Mutex<Option<AudioParamFinalizerHook>>>,
+    #[cfg(test)]
+    rollback_hook: Arc<Mutex<Option<AudioParamRollbackHook>>>,
+    #[cfg(test)]
+    serializer_attempt: Arc<Mutex<Option<crossbeam_channel::Sender<()>>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedAudioParamMutationError {
+    Control(InjectedControlError),
+    AcceptedFinalizer(AcceptedBatchFinalizeFailure),
+    SerializerPoisoned,
+    RejectedPayloadPanicked,
+    ProtocolViolation,
+}
+
+impl InjectedAudioParamMutation {
+    pub(crate) fn matches_registration(
+        &self,
+        registration: &AudioContextRegistration,
+        constructor: &InjectedNodeConstructor,
+        raw_parts: &AudioParamInner,
+    ) -> bool {
+        self.param_id == registration.id()
+            && constructor.matches_control_identity(&self.control.identity())
+            && constructor.matches_node_id_identity(&self.node_ids)
+            && registration.matches_injected_lifetime_identity(&self.lifetime)
+            && self.mirror.matches_inner(raw_parts)
+    }
+
+    /// Commits one fixed value update. Expected transport rejection is returned only after the
+    /// serializer guard is gone, so the public panic-shaped API cannot poison this lock.
+    pub(crate) fn try_set_value(
+        &self,
+        value: InjectedAudioParamValue,
+        clamped: f32,
+    ) -> Result<CommitControlOutcome, InjectedAudioParamMutationError> {
+        let result = {
+            #[cfg(test)]
+            if let Some(attempted) = self.serializer_attempt.lock().unwrap().take() {
+                attempted.send(()).unwrap();
+            }
+            let _serialized = self
+                .serializer
+                .lock()
+                .map_err(|_| InjectedAudioParamMutationError::SerializerPoisoned)?;
+            let reservation = self
+                .control
+                .try_begin_audio_param_value()
+                .map_err(InjectedAudioParamMutationError::Control)?;
+            let expected_bits = value.get().to_bits();
+            let prepared = reservation.prepare(self.param_id, value);
+            let mirror = &self.mirror;
+            #[cfg(test)]
+            let finalizer_hook = &self.finalizer_hook;
+            match self.control.try_commit_with_finalize(prepared, move |_| {
+                #[cfg(test)]
+                if let Some(hook) = finalizer_hook.lock().unwrap().take() {
+                    hook.entered.send(()).unwrap();
+                    hook.release.recv().unwrap();
+                    assert!(!hook.panics, "forced AudioParam accepted-finalizer panic");
+                }
+                mirror.store(clamped);
+                Ok(())
+            }) {
+                Ok(outcome) => Ok(outcome),
+                Err(CommitWithFinalizeFailure::AcceptedFinalizer(failure)) => {
+                    Err(InjectedAudioParamMutationError::AcceptedFinalizer(failure))
+                }
+                Err(CommitWithFinalizeFailure::NotAccepted(failure)) => {
+                    let control = self.control.clone();
+                    let param_id = self.param_id;
+                    #[cfg(test)]
+                    let rollback_hook = &self.rollback_hook;
+                    let (error, rollback) = failure.rollback_with_commands(move |commands| {
+                        let mut fail_closed = FailClosedParamRollback::new(control);
+                        let mut commands = commands.into_vec().into_iter();
+                        let exact = matches!(
+                            (commands.next(), commands.next()),
+                            (
+                                Some(ControlMessage::InjectedAudioParamValue { id, value }),
+                                None
+                            ) if id == param_id && value.get().to_bits() == expected_bits
+                        );
+                        #[cfg(test)]
+                        if let Some(hook) = rollback_hook.lock().unwrap().take() {
+                            hook.entered.send(()).unwrap();
+                            hook.release.recv().unwrap();
+                            assert!(!hook.panics, "forced AudioParam rejected rollback panic");
+                        }
+                        if exact {
+                            fail_closed.disarm();
+                        }
+                        exact
+                    });
+                    match rollback {
+                        RejectedControlRollback::Completed(true) => {
+                            Err(InjectedAudioParamMutationError::Control(error))
+                        }
+                        RejectedControlRollback::Completed(false) => {
+                            Err(InjectedAudioParamMutationError::ProtocolViolation)
+                        }
+                        RejectedControlRollback::Panicked => {
+                            Err(InjectedAudioParamMutationError::RejectedPayloadPanicked)
+                        }
+                    }
+                }
+            }
+        };
+        result
+    }
+
+    pub(crate) fn fail_closed_protocol(&self) {
+        self.control.fail_closed_protocol();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_finalizer_for_test(
+        &self,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+        panics: bool,
+    ) {
+        *self.finalizer_hook.lock().unwrap() = Some(AudioParamFinalizerHook {
+            entered,
+            release,
+            panics,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_rollback_for_test(
+        &self,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+        panics: bool,
+    ) {
+        *self.rollback_hook.lock().unwrap() = Some(AudioParamRollbackHook {
+            entered,
+            release,
+            panics,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signal_next_serializer_attempt_for_test(
+        &self,
+        attempted: crossbeam_channel::Sender<()>,
+    ) {
+        *self.serializer_attempt.lock().unwrap() = Some(attempted);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_node_id_identity_for_test(&mut self, identity: InjectedNodeIdIdentity) {
+        self.node_ids = identity;
+    }
+}
+
+#[cfg(test)]
+struct AudioParamFinalizerHook {
+    entered: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+    panics: bool,
+}
+
+#[cfg(test)]
+struct AudioParamRollbackHook {
+    entered: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+    panics: bool,
+}
+
+struct FailClosedParamRollback {
+    control: InjectedControlProducer,
+    armed: bool,
+}
+
+impl FailClosedParamRollback {
+    fn new(control: InjectedControlProducer) -> Self {
+        Self {
+            control,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailClosedParamRollback {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control.fail_closed_protocol();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,6 +506,13 @@ pub(crate) struct InjectedGainConstruction {
     param: ProvisionalNodeRegistration,
     gain_id: AudioNodeId,
     param_id: AudioNodeId,
+    param_serializer: Arc<Mutex<()>>,
+    #[cfg(test)]
+    param_finalizer_hook: Arc<Mutex<Option<AudioParamFinalizerHook>>>,
+    #[cfg(test)]
+    param_rollback_hook: Arc<Mutex<Option<AudioParamRollbackHook>>>,
+    #[cfg(test)]
+    param_serializer_attempt: Arc<Mutex<Option<crossbeam_channel::Sender<()>>>>,
     #[cfg(test)]
     id_corruption: u8,
     #[cfg(test)]
@@ -315,6 +556,41 @@ impl InjectedGainConstruction {
         mut self,
         payload: InjectedGainPayload,
     ) -> Result<InjectedConstructedGain, InjectedGainConstructionError> {
+        let InjectedGainPayload {
+            param_processor,
+            gain_processor,
+            param_channel_config,
+            gain_channel_config,
+            initial_value,
+        } = payload;
+        // Validate the exact renderer/host mirror while the whole Gain transaction can still roll
+        // back, then perform the only processor boxing allocation before moving reclaim tokens.
+        let (param_processor, mirror) = match param_processor.into_boxed_prevalidated() {
+            Ok(parts) => parts,
+            Err(mismatch) => {
+                let destructor_panicked =
+                    self.rollback_param_processor_mismatch(mismatch, gain_processor);
+                return Err(if destructor_panicked {
+                    InjectedGainConstructionError::RejectedPayloadPanicked
+                } else {
+                    InjectedGainConstructionError::ProtocolViolation
+                });
+            }
+        };
+        let param_mutation = InjectedAudioParamMutation {
+            control: self.control.clone(),
+            node_ids: self.ids.identity(),
+            param_id: self.param_id,
+            lifetime: self.param.identity(),
+            serializer: Arc::clone(&self.param_serializer),
+            mirror,
+            #[cfg(test)]
+            finalizer_hook: Arc::clone(&self.param_finalizer_hook),
+            #[cfg(test)]
+            rollback_hook: Arc::clone(&self.param_rollback_hook),
+            #[cfg(test)]
+            serializer_attempt: Arc::clone(&self.param_serializer_attempt),
+        };
         // Allocate command storage before moving either exact reclaim node. Every later command
         // construction is a closed struct move with the exact capacity already reserved.
         let mut commands = Vec::with_capacity(GAIN_COMMAND_COUNT);
@@ -338,22 +614,22 @@ impl InjectedGainConstruction {
         commands.push(ControlMessage::RegisterNode {
             id: self.param_id,
             reclaim_id: param_reclaim,
-            node: payload.param_processor,
+            node: param_processor,
             inputs: 1,
             outputs: 1,
-            channel_config: payload.param_channel_config,
+            channel_config: param_channel_config,
         });
         commands.push(ControlMessage::AudioParamInitialValue {
             id: self.param_id,
-            value: payload.initial_value,
+            value: initial_value,
         });
         commands.push(ControlMessage::RegisterNode {
             id: self.gain_id,
             reclaim_id: gain_reclaim,
-            node: payload.gain_processor,
+            node: gain_processor,
             inputs: 1,
             outputs: 1,
-            channel_config: payload.gain_channel_config,
+            channel_config: gain_channel_config,
         });
         commands.push(ControlMessage::ConnectNode {
             from: self.param_id,
@@ -402,12 +678,12 @@ impl InjectedGainConstruction {
             gain_arm.arm_accepted()
         });
         match committed {
-            Ok(outcome) => self.finish_accepted(outcome),
+            Ok(outcome) => self.finish_accepted(outcome, param_mutation),
             Err(CommitWithFinalizeFailure::AcceptedFinalizer(failure)) => {
                 Err(InjectedGainConstructionError::AcceptedFinalizer(failure))
             }
             Err(CommitWithFinalizeFailure::NotAccepted(failure)) => {
-                self.rollback_not_accepted(failure)
+                self.rollback_not_accepted(failure, param_mutation)
             }
         }
     }
@@ -415,6 +691,7 @@ impl InjectedGainConstruction {
     fn finish_accepted(
         self,
         outcome: CommitControlOutcome,
+        param_mutation: InjectedAudioParamMutation,
     ) -> Result<InjectedConstructedGain, InjectedGainConstructionError> {
         let Self {
             control: _,
@@ -423,6 +700,13 @@ impl InjectedGainConstruction {
             param,
             gain_id,
             param_id,
+            param_serializer: _,
+            #[cfg(test)]
+                param_finalizer_hook: _,
+            #[cfg(test)]
+                param_rollback_hook: _,
+            #[cfg(test)]
+                param_serializer_attempt: _,
             #[cfg(test)]
                 id_corruption: _,
             #[cfg(test)]
@@ -446,6 +730,7 @@ impl InjectedGainConstruction {
             param_id,
             gain_registration,
             param_registration,
+            param_mutation,
             outcome,
         })
     }
@@ -453,6 +738,7 @@ impl InjectedGainConstruction {
     fn rollback_not_accepted(
         self,
         failure: super::injected_control::CommitControlFailure,
+        param_mutation: InjectedAudioParamMutation,
     ) -> Result<InjectedConstructedGain, InjectedGainConstructionError> {
         let Self {
             control: _,
@@ -461,6 +747,13 @@ impl InjectedGainConstruction {
             param,
             gain_id,
             param_id,
+            param_serializer: _,
+            #[cfg(test)]
+                param_finalizer_hook: _,
+            #[cfg(test)]
+                param_rollback_hook: _,
+            #[cfg(test)]
+                param_serializer_attempt: _,
             #[cfg(test)]
                 id_corruption: _,
             #[cfg(test)]
@@ -478,6 +771,7 @@ impl InjectedGainConstruction {
             // rejected batch still owns graph admission.
             drop(param);
             drop(gain);
+            drop(param_mutation);
             drop(ids);
             recovery
         });
@@ -501,6 +795,62 @@ impl InjectedGainConstruction {
         self.gain.arm_token().quarantine_accepted();
         self.param.arm_token().quarantine_accepted();
         self.ids.retain_unavailable();
+    }
+
+    fn rollback_param_processor_mismatch(
+        self,
+        param_processor: InjectedAudioParamProcessor,
+        gain_processor: Box<dyn AudioProcessor>,
+    ) -> bool {
+        let Self {
+            control,
+            ids,
+            gain,
+            param,
+            gain_id: _,
+            param_id: _,
+            param_serializer,
+            #[cfg(test)]
+            param_finalizer_hook,
+            #[cfg(test)]
+            param_rollback_hook,
+            #[cfg(test)]
+            param_serializer_attempt,
+            #[cfg(test)]
+                id_corruption: _,
+            #[cfg(test)]
+                foreign_reclaim: _,
+            reservation,
+        } = self;
+        // Exact IDs and provisional lifetime slots roll back before either processor destructor;
+        // the original admitted reservation remains the last released authority.
+        drop(param);
+        drop(gain);
+        drop(ids);
+        let param_panicked = match panic::catch_unwind(AssertUnwindSafe(|| drop(param_processor))) {
+            Ok(()) => false,
+            Err(payload) => {
+                std::mem::forget(payload);
+                true
+            }
+        };
+        let gain_panicked = match panic::catch_unwind(AssertUnwindSafe(|| drop(gain_processor))) {
+            Ok(()) => false,
+            Err(payload) => {
+                std::mem::forget(payload);
+                true
+            }
+        };
+        drop(param_serializer);
+        #[cfg(test)]
+        drop(param_finalizer_hook);
+        #[cfg(test)]
+        drop(param_rollback_hook);
+        #[cfg(test)]
+        drop(param_serializer_attempt);
+        drop(control);
+        drop(reservation);
+        param_panicked || gain_panicked
     }
 }
 

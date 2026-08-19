@@ -31,12 +31,14 @@ use crate::events::{
     EventPayload, EventType, InjectedEventDispatchSetup, InjectedLifecycleEventLoop,
 };
 use crate::message::ControlMessage;
-use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
+use crate::node::{
+    ChannelConfigInner, ChannelCountMode, ChannelInterpretation, GainNode, GainOptions,
+};
 use crate::output::{
     AudioOutputConfig, AudioOutputDeathReason, AudioOutputErrorKind, AudioRenderCallback,
     AudioRenderFormat, AudioRenderStatus, EndpointShutdownConfirmed,
 };
-use crate::param::AudioParamInitialValue;
+use crate::param::{AudioParamInitialValue, InjectedAudioParamProcessor};
 use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope,
 };
@@ -612,7 +614,9 @@ fn gain_payload() -> InjectedGainPayload {
         interpretation: ChannelInterpretation::Discrete,
     };
     InjectedGainPayload {
-        param_processor: Box::new(SilentProcessor),
+        param_processor: InjectedAudioParamProcessor::from_boxed_for_test(Box::new(
+            SilentProcessor,
+        )),
         gain_processor: Box::new(SilentProcessor),
         param_channel_config: config(),
         gain_channel_config: config(),
@@ -627,7 +631,9 @@ fn gain_payload_with_drop_probe(drops: &Arc<AtomicUsize>) -> InjectedGainPayload
         interpretation: ChannelInterpretation::Discrete,
     };
     InjectedGainPayload {
-        param_processor: Box::new(DropProbeProcessor(Arc::clone(drops))),
+        param_processor: InjectedAudioParamProcessor::from_boxed_for_test(Box::new(
+            DropProbeProcessor(Arc::clone(drops)),
+        )),
         gain_processor: Box::new(DropProbeProcessor(Arc::clone(drops))),
         param_channel_config: config(),
         gain_channel_config: config(),
@@ -1441,6 +1447,54 @@ fn resume_flushes_all_staged_graph_work_before_state_ack() {
     assert!(base.applied_control_batch_sequence() >= applied_before + 2);
     drop(first_gain);
     drop(second_gain);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn suspended_exact_gain_values_flush_fifo_before_b4c_resume_ack() {
+    let fixture = lifecycle_fixture();
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running");
+    };
+    let state = controller.state_control();
+    assert_eq!(
+        wait_state(state.suspend().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    let applied_before = base.applied_control_batch_sequence();
+
+    let gain = GainNode::new(&base, GainOptions::default());
+    gain.gain().set_value(0.25);
+    gain.gain().set_value(0.75);
+    assert_eq!(gain.gain().value(), 0.75);
+    assert_eq!(base.applied_control_batch_sequence(), applied_before);
+    let rendered_before_resume = control.render_count.load(Ordering::Acquire);
+
+    assert_eq!(
+        wait_state(state.resume().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    assert!(base.applied_control_batch_sequence() >= applied_before + 3);
+    wait_until(
+        || control.render_count.load(Ordering::Acquire) > rendered_before_resume,
+        "resumed endpoint did not process a post-resume quantum",
+    );
+    assert_eq!(gain.gain().value(), 0.75);
+    drop(gain);
     assert_eq!(
         confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
         OutputShutdownMode::Graceful
