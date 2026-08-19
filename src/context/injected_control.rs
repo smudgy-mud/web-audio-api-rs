@@ -1218,7 +1218,9 @@ impl InjectedControlProducer {
         if state.disconnected {
             return Err(InjectedControlError::Disconnected);
         }
-        if self.inner.accepted_finalizer_failed.load(Ordering::Acquire) {
+        if self.inner.accepted_finalizer_failed.load(Ordering::Acquire)
+            || self.inner.applied.render_protocol_failed()
+        {
             return Err(InjectedControlError::ProtocolViolation);
         }
         match state.phase {
@@ -1404,7 +1406,9 @@ impl InjectedControlProducer {
                 },
             });
         }
-        if inner.accepted_finalizer_failed.load(Ordering::Acquire) {
+        if inner.accepted_finalizer_failed.load(Ordering::Acquire)
+            || inner.applied.render_protocol_failed()
+        {
             drop(state);
             return Err(CommitControlFailure {
                 error: InjectedControlError::ProtocolViolation,
@@ -1555,7 +1559,9 @@ impl InjectedControlProducer {
         if state.disconnected {
             return Err(InjectedControlError::Disconnected);
         }
-        if self.inner.accepted_finalizer_failed.load(Ordering::Acquire) {
+        if self.inner.accepted_finalizer_failed.load(Ordering::Acquire)
+            || self.inner.applied.render_protocol_failed()
+        {
             return Err(InjectedControlError::ProtocolViolation);
         }
         if state.phase != TransportPhase::Open {
@@ -1714,7 +1720,9 @@ impl InjectedControlLifecycleOwner {
         if state.disconnected {
             return Err(InjectedControlError::Disconnected);
         }
-        if self.inner.accepted_finalizer_failed.load(Ordering::Acquire) {
+        if self.inner.accepted_finalizer_failed.load(Ordering::Acquire)
+            || self.inner.applied.render_protocol_failed()
+        {
             return Err(InjectedControlError::ProtocolViolation);
         }
         match state.phase {
@@ -1928,7 +1936,8 @@ impl InjectedControlLifecycleOwner {
             matches!(
                 state.phase,
                 TransportPhase::Transitioning | TransportPhase::Failed
-            ) || self.inner.accepted_finalizer_failed.load(Ordering::Acquire);
+            ) || self.inner.accepted_finalizer_failed.load(Ordering::Acquire)
+                || self.inner.applied.render_protocol_failed();
         state.phase = TransportPhase::SealStarted;
         let (capacity_worker, drain) = admissions.into_parts();
         drop(state);
@@ -1978,7 +1987,8 @@ impl ControlCloseRetirement {
         );
         drop(state);
         self.degradation.prior_transport_failure |=
-            self.inner.accepted_finalizer_failed.load(Ordering::Acquire);
+            self.inner.accepted_finalizer_failed.load(Ordering::Acquire)
+                || self.inner.applied.render_protocol_failed();
         (
             snapshot,
             DrainedControlClose {
@@ -2802,6 +2812,33 @@ mod tests {
     fn prior_transport_failure_survives_as_close_degradation() {
         let mut harness = Harness::new(1, false);
         harness.producer.fail_transport();
+        let sealed = harness.finish_close();
+        assert!(sealed.degradation.prior_transport_failure);
+        harness.callback();
+        assert!(sealed.close.try_observe_exact().is_ok());
+    }
+
+    #[test]
+    fn renderer_protocol_latch_is_absorbing_for_producers_and_degrades_close() {
+        let mut harness = Harness::new(1, false);
+        harness.producer.inner.applied.fail_render_protocol();
+        assert_eq!(
+            harness.producer.try_begin_operation(1).err(),
+            Some(InjectedControlError::ProtocolViolation)
+        );
+        assert_eq!(
+            harness.producer.try_flush(),
+            Err(InjectedControlError::ProtocolViolation)
+        );
+        assert_eq!(
+            harness
+                .owner
+                .as_mut()
+                .unwrap()
+                .try_begin_state_transition(GraphLifecycleTransition::Suspend)
+                .err(),
+            Some(InjectedControlError::ProtocolViolation)
+        );
         let sealed = harness.finish_close();
         assert!(sealed.degradation.prior_transport_failure);
         harness.callback();

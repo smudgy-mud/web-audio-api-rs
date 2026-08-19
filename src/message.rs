@@ -27,18 +27,37 @@ const _: () = assert!(CONTROL_BATCH_CAPACITY <= CONTROL_COMMANDS_PER_CALLBACK);
 
 pub(crate) type ControlBatchNode = llq::Node<Box<dyn Any + Send>>;
 
+#[derive(Debug, Default)]
+struct ControlBatchApplyState {
+    sequence: AtomicU64,
+    render_protocol_failed: AtomicU8,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ControlBatchApplied {
-    sequence: Arc<AtomicU64>,
+    inner: Arc<ControlBatchApplyState>,
 }
 
 impl ControlBatchApplied {
     pub(crate) fn load(&self) -> u64 {
-        self.sequence.load(Ordering::Acquire)
+        self.inner.sequence.load(Ordering::Acquire)
     }
 
     pub(super) fn publish(&self, sequence: u64) {
-        self.sequence.store(sequence, Ordering::Release);
+        self.inner.sequence.store(sequence, Ordering::Release);
+    }
+
+    /// Latches a renderer-side structural failure without claiming the offending envelope's
+    /// sequence as applied. The callback subsequently unwinds and exact shutdown reclaims the
+    /// still-owned envelope off the render thread.
+    pub(super) fn fail_render_protocol(&self) {
+        self.inner
+            .render_protocol_failed
+            .store(1, Ordering::Release);
+    }
+
+    pub(crate) fn render_protocol_failed(&self) -> bool {
+        self.inner.render_protocol_failed.load(Ordering::Acquire) != 0
     }
 }
 
@@ -532,11 +551,71 @@ impl ControlBatchStorage {
             .expect("control batch cursor never exceeds its storage")
     }
 
+    pub(crate) fn classify_injected_explicit_batch(&self) -> InjectedExplicitBatchShape {
+        if self.next != 0 || self.commands.is_empty() {
+            return InjectedExplicitBatchShape::Ordinary;
+        }
+
+        let mut connect = None;
+        let mut disconnect_count = 0;
+        let mut saw_explicit = false;
+        let mut saw_ordinary = false;
+        for command in &self.commands {
+            match command.as_ref() {
+                Some(ControlMessage::InjectedConnectExplicit(value)) => {
+                    saw_explicit = true;
+                    if connect.replace(*value).is_some() {
+                        return InjectedExplicitBatchShape::Invalid;
+                    }
+                }
+                Some(ControlMessage::InjectedDisconnectExplicit(_)) => {
+                    saw_explicit = true;
+                    disconnect_count += 1;
+                }
+                Some(_) => saw_ordinary = true,
+                None => return InjectedExplicitBatchShape::Invalid,
+            }
+        }
+
+        if !saw_explicit {
+            InjectedExplicitBatchShape::Ordinary
+        } else if saw_ordinary || (connect.is_some() && disconnect_count != 0) {
+            InjectedExplicitBatchShape::Invalid
+        } else if let Some(connect) = connect {
+            if self.commands.len() == 1 {
+                InjectedExplicitBatchShape::Connect(connect)
+            } else {
+                InjectedExplicitBatchShape::Invalid
+            }
+        } else if disconnect_count == self.commands.len() {
+            InjectedExplicitBatchShape::Disconnect
+        } else {
+            InjectedExplicitBatchShape::Invalid
+        }
+    }
+
+    pub(crate) fn injected_explicit_disconnects(
+        &self,
+    ) -> impl Iterator<Item = crate::context::InjectedExplicitDisconnect> + Clone + '_ {
+        self.commands.iter().map(|command| match command.as_ref() {
+            Some(ControlMessage::InjectedDisconnectExplicit(value)) => *value,
+            _ => unreachable!("caller prevalidated an all-disconnect exact envelope"),
+        })
+    }
+
     pub(crate) fn take_next(&mut self) -> Option<ControlMessage> {
         let command = self.commands.get_mut(self.next)?.take();
         self.next += 1;
         command
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedExplicitBatchShape {
+    Ordinary,
+    Connect(crate::context::InjectedExplicitConnect),
+    Disconnect,
+    Invalid,
 }
 
 /// Clone-shared envelope-storage budget. This is distinct from logical command and physical
@@ -628,8 +707,9 @@ impl ControlMessage {
     pub(crate) fn is_batchable(&self) -> bool {
         match self {
             Self::RegisterNode { .. }
-            | Self::ConnectNode { .. }
-            | Self::DisconnectNode { .. }
+            | Self::ConnectNode {
+                input: usize::MAX, ..
+            }
             | Self::MarkCycleBreaker { .. }
             | Self::AudioParamInitialValue { .. }
             | Self::NodeMessage { .. }
@@ -705,7 +785,7 @@ impl ControlBatchSender {
         &self,
         commands: Vec<ControlMessage>,
     ) -> Result<u64, ControlBatchSendError> {
-        self.try_send_inner(commands, None, None)
+        self.try_send_inner(commands, None, None, false)
     }
 
     pub(crate) fn batch_storage_in_flight(&self) -> usize {
@@ -718,6 +798,7 @@ impl ControlBatchSender {
         commands: Vec<ControlMessage>,
         forced_sequence: Option<u64>,
         #[allow(unused_variables)] reclaim_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+        allow_unbatchable_for_test: bool,
     ) -> Result<u64, ControlBatchSendError> {
         if commands.is_empty() {
             return Err(ControlBatchSendError::Empty);
@@ -731,7 +812,7 @@ impl ControlBatchSender {
         {
             return Err(ControlBatchSendError::NestedBatch);
         }
-        if commands.iter().any(|command| !command.is_batchable()) {
+        if !allow_unbatchable_for_test && commands.iter().any(|command| !command.is_batchable()) {
             return Err(ControlBatchSendError::UnsupportedCommand);
         }
 
@@ -783,7 +864,7 @@ impl ControlBatchSender {
         sequence: u64,
         commands: Vec<ControlMessage>,
     ) -> Result<u64, ControlBatchSendError> {
-        self.try_send_inner(commands, Some(sequence), None)
+        self.try_send_inner(commands, Some(sequence), None, false)
     }
 
     #[cfg(test)]
@@ -792,7 +873,16 @@ impl ControlBatchSender {
         commands: Vec<ControlMessage>,
         reclaim_probe: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<u64, ControlBatchSendError> {
-        self.try_send_inner(commands, None, Some(reclaim_probe))
+        self.try_send_inner(commands, None, Some(reclaim_probe), false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_send_exact_for_test(
+        &self,
+        commands: Vec<ControlMessage>,
+        reclaim_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<u64, ControlBatchSendError> {
+        self.try_send_inner(commands, None, reclaim_probe, true)
     }
 }
 
@@ -850,6 +940,16 @@ pub(crate) enum ControlMessage {
         input: usize,
         output: usize,
     },
+
+    /// Private fixed explicit-edge insertion. No production constructor exists until B5b-h's
+    /// dedicated admitted host transaction.
+    #[allow(dead_code)] // production constructor is added by the B5b-h host transaction
+    InjectedConnectExplicit(crate::context::InjectedExplicitConnect),
+
+    /// One member of a private atomic exact-edge removal envelope. The renderer preflights every
+    /// member before removing any edge.
+    #[allow(dead_code)] // production constructor is added by the B5b-h host transaction
+    InjectedDisconnectExplicit(crate::context::InjectedExplicitDisconnect),
 
     /// Notify the render thread this node is dropped in the control thread
     ControlHandleDropped { id: AudioNodeId },
