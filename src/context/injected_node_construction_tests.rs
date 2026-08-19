@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use super::injected_connections::{
     InjectedConnectionOperationError, InjectedConnectionOperationOutcome,
-    InjectedConnectionOperationTestPoint,
+    InjectedConnectionOperationTestPoint, InjectedDisconnectSelector,
 };
 use super::injected_control::{
     injected_control_channel, CommitControlOutcome, InjectedControlLifecycleOwner,
@@ -141,6 +141,20 @@ fn gain_descriptor() -> AudioParamDescriptor {
         default_value: 1.,
         min_value: f32::MIN,
         max_value: f32::MAX,
+    }
+}
+
+fn panic_message(result: std::thread::Result<()>) -> String {
+    let payload = result.expect_err("operation must panic");
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_owned(),
+            Err(payload) => {
+                std::mem::forget(payload);
+                "non-string panic payload".to_owned()
+            }
+        },
     }
 }
 
@@ -533,35 +547,211 @@ fn ordinary_endpoint_attachment_rejects_a_foreign_exact_base_and_fails_both_cont
 }
 
 #[test]
-fn exact_public_connect_disconnect_remain_not_supported_without_host_or_transport_mutation() {
+fn exact_public_connect_duplicate_and_disconnect_select_the_fixed_transaction() {
     let mut harness = Harness::new(8);
     let source = GainNode::new(harness.base(), GainOptions::default());
     let destination = GainNode::new(harness.base(), GainOptions::default());
     harness.callback();
     harness.wait_for_transport_idle();
-    let before_sequence = harness.base().applied_control_batch_sequence();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
 
-    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
-        source.connect(&destination);
-    }))
-    .is_err());
-    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
-        source.disconnect_dest(&destination);
-    }))
-    .is_err());
+    source.connect(&destination);
+    assert_eq!(constructor.connection_edge_count_for_test(), 1);
+    let accepted_sequence = constructor.last_submitted_batch_sequence();
+    let accepted_accounting = harness.producer.accounting();
+    source.connect(&destination);
+    assert_eq!(constructor.connection_edge_count_for_test(), 1);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        accepted_sequence
+    );
+    assert_eq!(harness.producer.accounting(), accepted_accounting);
+    harness.callback();
+    harness.wait_for_transport_idle();
+
+    source.disconnect_dest(&destination);
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    harness.callback();
+    harness.wait_for_transport_idle();
     assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+}
+
+#[test]
+fn public_exact_disconnect_overloads_preserve_destination_error_and_broad_noop_semantics() {
+    let mut harness = Harness::new(32);
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination_a = GainNode::new(harness.base(), GainOptions::default());
+    let destination_b = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+
+    source.connect(&destination_a);
+    source.connect_from_output_to_input(&destination_b, 0, 0);
+    source.gain().connect(destination_a.gain());
+    assert_eq!(constructor.connection_edge_count_for_test(), 3);
+
+    source.disconnect_dest_from_output_to_input(&destination_a, 0, 0);
+    assert_eq!(constructor.connection_edge_count_for_test(), 2);
+    assert!(panic_message(panic::catch_unwind(AssertUnwindSafe(|| {
+        source.disconnect_dest_from_output_to_input(&destination_a, 0, 0);
+    })))
+    .starts_with("InvalidAccessError"));
+    assert_eq!(constructor.connection_edge_count_for_test(), 2);
+
+    source.disconnect_dest_from_output(&destination_b, 0);
+    assert_eq!(constructor.connection_edge_count_for_test(), 1);
+    assert!(panic_message(panic::catch_unwind(AssertUnwindSafe(|| {
+        source.disconnect_dest_from_output(&destination_b, 0);
+    })))
+    .starts_with("InvalidAccessError"));
+    assert_eq!(constructor.connection_edge_count_for_test(), 1);
+
+    source.gain().disconnect_output(0);
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    let sequence_after_output = constructor.last_submitted_batch_sequence();
+    source.gain().disconnect_output(0);
     assert_eq!(
-        harness.base().applied_control_batch_sequence(),
-        before_sequence
+        constructor.last_submitted_batch_sequence(),
+        sequence_after_output
     );
+
+    source.connect(&destination_a);
+    source.connect(&destination_b);
+    source.disconnect_dest(&destination_a);
+    assert_eq!(constructor.connection_edge_count_for_test(), 1);
+    assert!(panic_message(panic::catch_unwind(AssertUnwindSafe(|| {
+        source.disconnect_dest(&destination_a);
+    })))
+    .starts_with("InvalidAccessError"));
+    source.disconnect();
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    let sequence_after_all = constructor.last_submitted_batch_sequence();
+    source.disconnect();
     assert_eq!(
-        harness
-            .base()
-            .injected_node_constructor()
-            .unwrap()
-            .connection_edge_count_for_test(),
-        0
+        constructor.last_submitted_batch_sequence(),
+        sequence_after_all
     );
+
+    source.connect(&destination_a);
+    source.connect(&destination_b);
+    source.disconnect_output(0);
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    let sequence_after_broad_output = constructor.last_submitted_batch_sequence();
+    source.disconnect_output(0);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        sequence_after_broad_output
+    );
+    harness.callback();
+    harness.wait_for_transport_idle();
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+}
+
+#[test]
+fn public_exact_connection_context_and_port_errors_precede_transport_mutation() {
+    let mut first = Harness::new(16);
+    let mut second = Harness::new(8);
+    let source = GainNode::new(first.base(), GainOptions::default());
+    let destination = GainNode::new(first.base(), GainOptions::default());
+    let foreign = GainNode::new(second.base(), GainOptions::default());
+    first.callback();
+    first.wait_for_transport_idle();
+    second.callback();
+    second.wait_for_transport_idle();
+    let exact_base = first.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+    let initial_sequence = constructor.last_submitted_batch_sequence();
+
+    let invalid = [
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            source.connect_from_output_to_input(&destination, 1, 0);
+        })),
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            source.connect_from_output_to_input(&destination, 0, 1);
+        })),
+        panic::catch_unwind(AssertUnwindSafe(|| source.disconnect_output(1))),
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            source.disconnect_dest_from_output(&destination, 1);
+        })),
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            source.disconnect_dest_from_output_to_input(&destination, 1, 0);
+        })),
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            source.disconnect_dest_from_output_to_input(&destination, 0, 1);
+        })),
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            source.connect(&foreign);
+        })),
+        panic::catch_unwind(AssertUnwindSafe(|| source.disconnect_dest(&foreign))),
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            source.disconnect_dest_from_output(&foreign, 0);
+        })),
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            source.connect_from_output_to_input(&foreign, 1, 1);
+        })),
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            source.disconnect_dest_from_output_to_input(&foreign, 1, 1);
+        })),
+    ];
+    let messages = invalid.map(panic_message);
+    assert!(messages[..6]
+        .iter()
+        .all(|message| message.starts_with("IndexSizeError")));
+    assert!(messages[6..]
+        .iter()
+        .all(|message| message.starts_with("InvalidAccessError")));
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        initial_sequence
+    );
+    assert_eq!(first.producer.accounting(), (0, 0, 0, 0));
+    assert_eq!(second.producer.accounting(), (0, 0, 0, 0));
+}
+
+#[test]
+fn public_exact_dispatch_rejects_illegal_selector_and_capless_registration_without_raw_fallback() {
+    let mut harness = Harness::new(16);
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+    let initial_sequence = constructor.last_submitted_batch_sequence();
+
+    let illegal = panic_message(panic::catch_unwind(AssertUnwindSafe(|| {
+        exact_base.disconnect_registrations(source.registration(), None, None, Some(0));
+    })));
+    assert!(illegal.starts_with("InvalidStateError"));
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        initial_sequence
+    );
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+
+    let constructed = construct_silent_gain(&harness);
+    let capless = AudioContextRegistration::from_injected(
+        constructed.gain_id,
+        exact_base.clone(),
+        constructed.gain_registration,
+    );
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let before_capless = constructor.last_submitted_batch_sequence();
+    let unsupported = panic_message(panic::catch_unwind(AssertUnwindSafe(|| {
+        exact_base.connect_registrations(&capless, destination.registration(), 0, 0);
+    })));
+    assert!(unsupported.starts_with("NotSupportedError"));
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    assert_eq!(constructor.last_submitted_batch_sequence(), before_capless);
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+    drop(capless);
+    drop(constructed.param_registration);
 }
 
 #[test]
@@ -615,7 +805,10 @@ fn internal_exact_connect_duplicate_and_disconnect_are_fixed_mirror_transactions
     harness.wait_for_transport_idle();
 
     assert!(matches!(
-        constructor.disconnect_exact(&source_cap, None, Some(&destination_cap), None),
+        constructor.disconnect_exact(
+            &source_cap,
+            InjectedDisconnectSelector::Destination(&destination_cap),
+        ),
         Ok(InjectedConnectionOperationOutcome::Committed(
             CommitControlOutcome::Enqueued { .. }
         ))
@@ -624,11 +817,14 @@ fn internal_exact_connect_duplicate_and_disconnect_are_fixed_mirror_transactions
     harness.callback();
     harness.wait_for_transport_idle();
     assert_eq!(
-        constructor.disconnect_exact(&source_cap, None, None, None),
+        constructor.disconnect_exact(&source_cap, InjectedDisconnectSelector::All),
         Ok(InjectedConnectionOperationOutcome::Noop)
     );
     assert_eq!(
-        constructor.disconnect_exact(&source_cap, None, Some(&destination_cap), None),
+        constructor.disconnect_exact(
+            &source_cap,
+            InjectedDisconnectSelector::Destination(&destination_cap),
+        ),
         Err(InjectedConnectionOperationError::Unconnected)
     );
 }
@@ -690,7 +886,7 @@ fn multi_edge_disconnect_not_accepted_restores_every_command_before_admission_re
         operation_base
             .injected_node_constructor()
             .unwrap()
-            .disconnect_exact(&source_cap, None, None, None)
+            .disconnect_exact(&source_cap, InjectedDisconnectSelector::All)
     });
     commit_recv.recv().unwrap();
 
@@ -775,7 +971,7 @@ fn post_seal_duplicate_and_no_match_are_rejected_before_noop_inspection() {
         Ok(InjectedConnectionOperationOutcome::Noop)
     );
     assert_eq!(
-        constructor.disconnect_exact(&unconnected_cap, None, None, None),
+        constructor.disconnect_exact(&unconnected_cap, InjectedDisconnectSelector::All),
         Ok(InjectedConnectionOperationOutcome::Noop)
     );
 
@@ -794,7 +990,7 @@ fn post_seal_duplicate_and_no_match_are_rejected_before_noop_inspection() {
         sealed
     );
     assert_eq!(
-        constructor.disconnect_exact(&unconnected_cap, None, None, None),
+        constructor.disconnect_exact(&unconnected_cap, InjectedDisconnectSelector::All),
         sealed
     );
     let (snapshot, drained) = retirement.retire_and_wait();
@@ -861,7 +1057,7 @@ fn incident_cleanup_wins_serializer_then_stale_generation_cannot_send_after_id_r
     release_send.send(()).unwrap();
     assert_eq!(
         operation.join().unwrap(),
-        Err(InjectedConnectionOperationError::ForeignEndpoint)
+        Err(InjectedConnectionOperationError::InactiveEndpoint)
     );
     assert_eq!(
         constructor.last_submitted_batch_sequence(),
@@ -912,7 +1108,10 @@ fn incident_cleanup_retries_serializer_contention_and_prevents_id_reuse_until_su
         operation_base
             .injected_node_constructor()
             .unwrap()
-            .disconnect_exact(&operation_source, None, Some(&operation_destination), None)
+            .disconnect_exact(
+                &operation_source,
+                InjectedDisconnectSelector::Destination(&operation_destination),
+            )
     });
     entered_recv.recv().unwrap();
     drop(source);

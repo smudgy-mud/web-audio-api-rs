@@ -11,7 +11,6 @@ use std::{
 use futures::executor;
 
 use super::*;
-use crate::context::injected_connections::InjectedConnectionOperationOutcome;
 use crate::context::injected_control::{
     injected_control_channel, BoundInjectedRenderer, InjectedConcreteEventBinding,
     InjectedControlLifecycleOwner,
@@ -23,8 +22,8 @@ use crate::context::injected_node_lifetime::{
     BoundInjectedOutputRenderer, MagicInitializedInjectedOutputRenderer,
 };
 use crate::context::{
-    AdmissionError, AudioContextState, ConcreteBaseAudioContext, ControlEventSendOutcome,
-    InjectedContextAdmissionGate,
+    AdmissionError, AudioContextState, BaseAudioContext, ConcreteBaseAudioContext,
+    ControlEventSendOutcome, InjectedContextAdmissionGate,
 };
 use crate::events::{
     injected_event_dispatch_setup, injected_event_dispatch_setup_bounded_for_test,
@@ -80,7 +79,13 @@ fn lifecycle_fixture_with_event_setup(
     capacity: usize,
     events: InjectedEventDispatchSetup,
 ) -> LifecycleFixture {
-    lifecycle_fixture_inner(initially_suspended, stage_hostile_payload, capacity, events)
+    lifecycle_fixture_inner(
+        initially_suspended,
+        stage_hostile_payload,
+        capacity,
+        capacity,
+        events,
+    )
 }
 
 fn lifecycle_fixture_with_capacity(
@@ -99,15 +104,16 @@ fn lifecycle_fixture_with_capacity(
 fn lifecycle_fixture_inner(
     initially_suspended: bool,
     stage_hostile_payload: bool,
-    capacity: usize,
+    control_capacity: usize,
+    lifetime_capacity: usize,
     events: InjectedEventDispatchSetup,
 ) -> LifecycleFixture {
     let gate = InjectedContextAdmissionGate::new();
     let (producer, lifecycle, render_init) =
-        injected_control_channel(gate.clone(), capacity, initially_suspended).unwrap();
+        injected_control_channel(gate.clone(), control_capacity, initially_suspended).unwrap();
     let (allocator, node_ids, graph) = injected_node_id_pair(0);
     let (registrar, bootstrap) =
-        injected_node_lifetime_registry(capacity, &producer, node_ids, graph)
+        injected_node_lifetime_registry(lifetime_capacity, &producer, node_ids, graph)
             .ok()
             .unwrap();
     let constructor =
@@ -230,6 +236,7 @@ struct PumpControl {
     resume_count: AtomicUsize,
     suspend_count: AtomicUsize,
     render_count: AtomicUsize,
+    output_nonzero: AtomicBool,
     shutdown_called: AtomicBool,
     resume_panics: AtomicBool,
     resume_errors: AtomicBool,
@@ -252,6 +259,7 @@ impl PumpControl {
             resume_count: AtomicUsize::new(0),
             suspend_count: AtomicUsize::new(0),
             render_count: AtomicUsize::new(0),
+            output_nonzero: AtomicBool::new(false),
             shutdown_called: AtomicBool::new(false),
             resume_panics: AtomicBool::new(false),
             resume_errors: AtomicBool::new(false),
@@ -483,9 +491,12 @@ impl PreparedAudioOutput for TestPrepared {
                             && thread_control.release.load(Ordering::Acquire)
                         {
                             thread_control.render_count.fetch_add(1, Ordering::AcqRel);
-                            if callback.render_interleaved_f32(&mut output)
-                                == AudioRenderStatus::Stop
-                            {
+                            let status = callback.render_interleaved_f32(&mut output);
+                            thread_control.output_nonzero.store(
+                                output.iter().any(|sample| *sample != 0.),
+                                Ordering::Release,
+                            );
+                            if status == AudioRenderStatus::Stop {
                                 break;
                             }
                         }
@@ -1539,34 +1550,10 @@ fn suspended_exact_connect_then_disconnect_stage_and_flush_fifo_before_resume_ac
 
     let source = GainNode::new(&base, GainOptions::default());
     let destination = GainNode::new(&base, GainOptions::default());
-    let source_cap = source
-        .registration()
-        .injected_connection_endpoint()
-        .unwrap()
-        .clone();
-    let destination_cap = destination
-        .registration()
-        .injected_connection_endpoint()
-        .unwrap()
-        .clone();
     let constructor = base.injected_node_constructor().unwrap();
-    assert_eq!(
-        constructor
-            .connect_exact(&source_cap, &destination_cap, 0, 0)
-            .unwrap(),
-        InjectedConnectionOperationOutcome::Committed(
-            crate::context::injected_control::CommitControlOutcome::Staged
-        )
-    );
+    source.connect(&destination);
     assert_eq!(constructor.connection_edge_count_for_test(), 1);
-    assert_eq!(
-        constructor
-            .disconnect_exact(&source_cap, None, Some(&destination_cap), None)
-            .unwrap(),
-        InjectedConnectionOperationOutcome::Committed(
-            crate::context::injected_control::CommitControlOutcome::Staged
-        )
-    );
+    source.disconnect_dest(&destination);
     assert_eq!(constructor.connection_edge_count_for_test(), 0);
     assert_eq!(base.applied_control_batch_sequence(), applied_before);
 
@@ -1577,6 +1564,221 @@ fn suspended_exact_connect_then_disconnect_stage_and_flush_fifo_before_resume_ac
     assert!(base.applied_control_batch_sequence() >= applied_before + 4);
     assert_eq!(base.state(), AudioContextState::Running);
     drop((source, destination));
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.reclaim_issue().is_none());
+}
+
+#[test]
+fn public_exact_param_connection_changes_real_destination_output_and_disconnect_silences_it() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 16);
+    let base = fixture.take_exact_base();
+    let gain = GainNode::new(&base, GainOptions::default());
+    let destination = base.destination();
+    gain.gain().connect(&destination);
+    assert_eq!(
+        base.injected_node_constructor()
+            .unwrap()
+            .connection_edge_count_for_test(),
+        1
+    );
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || control.output_nonzero.load(Ordering::Acquire),
+        "exact AudioParam edge never reached the real destination render",
+    );
+
+    gain.gain().disconnect_dest(&destination);
+    let render_before_disconnect = control.render_count.load(Ordering::Acquire);
+    wait_until(
+        || {
+            control.render_count.load(Ordering::Acquire) > render_before_disconnect
+                && !control.output_nonzero.load(Ordering::Acquire)
+        },
+        "exact disconnect did not silence the next real destination render",
+    );
+    assert_eq!(
+        base.injected_node_constructor()
+            .unwrap()
+            .connection_edge_count_for_test(),
+        0
+    );
+
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.reclaim_issue().is_none());
+}
+
+#[test]
+fn surviving_public_exact_handles_report_invalid_state_after_confirmed_retirement() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 16);
+    let base = fixture.take_exact_base();
+    let source = GainNode::new(&base, GainOptions::default());
+    let destination = GainNode::new(&base, GainOptions::default());
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.reclaim_issue().is_none());
+
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        source.connect(&destination);
+    }))
+    .expect_err("retired exact endpoint must reject public connect");
+    let message = payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .expect("connection panic uses a string payload");
+    assert!(message.starts_with("InvalidStateError"));
+    assert!(!message.starts_with("InvalidAccessError"));
+}
+
+#[test]
+fn public_exact_capacity_accepts_256_rejects_257_and_recovers_with_atomic_broad_disconnect() {
+    let fixture = lifecycle_fixture_inner(
+        false,
+        false,
+        768,
+        256,
+        injected_event_dispatch_setup().unwrap(),
+    );
+    let base = fixture.take_exact_base();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut gains = Vec::with_capacity(128);
+    for _ in 0..128 {
+        gains.push(GainNode::new(&base, GainOptions::default()));
+        let construction_sequence = constructor.last_submitted_batch_sequence();
+        wait_until(
+            || base.applied_control_batch_sequence() >= construction_sequence,
+            "exact Gain batch was not applied before the next construction",
+        );
+        wait_until(
+            || constructor.connection_transport_accounting_for_test() == (0, 0, 0, 0),
+            "exact Gain credits did not retire before the next construction",
+        );
+    }
+
+    let destination = base.destination();
+    let listener = base.listener();
+    let mut candidates: Vec<&dyn AudioNode> = vec![
+        &destination,
+        listener.position_x(),
+        listener.position_y(),
+        listener.position_z(),
+        listener.forward_x(),
+        listener.forward_y(),
+        listener.forward_z(),
+        listener.up_x(),
+        listener.up_y(),
+        listener.up_z(),
+    ];
+    for gain in gains.iter().skip(1) {
+        candidates.push(gain);
+        candidates.push(gain.gain());
+    }
+    assert!(candidates.len() > crate::context::MAX_INJECTED_EXPLICIT_CONNECTIONS);
+    let source = &gains[0];
+    for (index, candidate) in candidates
+        .iter()
+        .take(crate::context::MAX_INJECTED_EXPLICIT_CONNECTIONS)
+        .enumerate()
+    {
+        source.connect(*candidate);
+        if index % 16 == 15 {
+            wait_until(
+                || constructor.connection_transport_accounting_for_test() == (0, 0, 0, 0),
+                "connection fill credits did not retire",
+            );
+        }
+    }
+    assert_eq!(
+        constructor.connection_edge_count_for_test(),
+        crate::context::MAX_INJECTED_EXPLICIT_CONNECTIONS
+    );
+    let full_sequence = constructor.last_submitted_batch_sequence();
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        source.connect(candidates[crate::context::MAX_INJECTED_EXPLICIT_CONNECTIONS]);
+    }))
+    .expect_err("the 257th exact explicit edge must be rejected");
+    let message = payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .expect("capacity panic uses a string payload");
+    assert!(message.starts_with("NotSupportedError"));
+    assert!(message.contains("256"));
+    assert_eq!(constructor.last_submitted_batch_sequence(), full_sequence);
+    assert_eq!(
+        constructor.connection_edge_count_for_test(),
+        crate::context::MAX_INJECTED_EXPLICIT_CONNECTIONS
+    );
+
+    source.disconnect_dest(candidates[0]);
+    assert_eq!(
+        constructor.connection_edge_count_for_test(),
+        crate::context::MAX_INJECTED_EXPLICIT_CONNECTIONS - 1
+    );
+    source.connect(candidates[crate::context::MAX_INJECTED_EXPLICIT_CONNECTIONS]);
+    assert_eq!(
+        constructor.connection_edge_count_for_test(),
+        crate::context::MAX_INJECTED_EXPLICIT_CONNECTIONS
+    );
+    let replacement_sequence = constructor.last_submitted_batch_sequence();
+    wait_until(
+        || base.applied_control_batch_sequence() >= replacement_sequence,
+        "replacement edge did not apply after capacity recovery",
+    );
+    wait_until(
+        || constructor.connection_transport_accounting_for_test() == (0, 0, 0, 0),
+        "replacement edge credits did not retire before broad disconnect",
+    );
+
+    source.disconnect();
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    let broad_disconnect_sequence = constructor.last_submitted_batch_sequence();
+    wait_until(
+        || base.applied_control_batch_sequence() >= broad_disconnect_sequence,
+        "atomic 256-edge broad disconnect did not apply",
+    );
+    drop(candidates);
+    drop(listener);
+    drop(destination);
+    drop(gains);
     let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
     assert_eq!(report.mode(), OutputShutdownMode::Graceful);
     assert!(report.reclaim_issue().is_none());
