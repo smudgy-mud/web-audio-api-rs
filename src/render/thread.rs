@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::cell::Cell;
+use std::io;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -62,6 +63,8 @@ pub(crate) struct RenderThread {
     injected_physical_credit_owners: Option<InjectedPhysicalCreditOwners>,
     graph_lifecycle_publisher: Option<GraphLifecyclePublisher>,
     graph_lifecycle_next_sequence: u64,
+    #[cfg(test)]
+    fail_next_gc_spawn: bool,
 }
 
 // SAFETY:
@@ -155,6 +158,8 @@ impl RenderThread {
             injected_physical_credit_owners: None,
             graph_lifecycle_publisher: None,
             graph_lifecycle_next_sequence: 1,
+            #[cfg(test)]
+            fail_next_gc_spawn: false,
         }
     }
 
@@ -201,14 +206,33 @@ impl RenderThread {
     pub(crate) fn spawn_joinable_garbage_collector_thread(
         &mut self,
     ) -> Option<std::thread::JoinHandle<()>> {
+        self.try_spawn_joinable_garbage_collector_thread()
+            .expect("legacy garbage collector thread spawn failed")
+    }
+
+    /// Fallible injected-output variant which mutates the renderer only after the sidecar thread
+    /// has accepted ownership. On spawn failure the exact renderer remains unchanged and can be
+    /// returned through the branded output bootstrap transaction.
+    pub(crate) fn try_spawn_joinable_garbage_collector_thread(
+        &mut self,
+    ) -> io::Result<Option<std::thread::JoinHandle<()>>> {
         if self.garbage_collector.is_none() {
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_gc_spawn) {
+                return Err(io::Error::other("forced garbage collector spawn failure"));
+            }
             let (gc_producer, gc_consumer) = llq::Queue::new().split();
-            let join = spawn_garbage_collector_thread(gc_consumer);
+            let join = try_spawn_garbage_collector_thread(gc_consumer)?;
             self.garbage_collector = Some(gc_producer);
-            Some(join)
+            Ok(Some(join))
         } else {
-            None
+            Ok(None)
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_gc_spawn_for_test(&mut self) {
+        self.fail_next_gc_spawn = true;
     }
 
     #[inline(always)]
@@ -915,10 +939,10 @@ struct TerminateGarbageCollectorThread;
 struct ControlReceiverRetirement(Option<Receiver<ControlMessage>>);
 
 // Spawns a sidecar thread of the `RenderThread` for dropping resources.
-fn spawn_garbage_collector_thread(
+fn try_spawn_garbage_collector_thread(
     consumer: llq::Consumer<Box<dyn Any + Send>>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || run_garbage_collector_thread(consumer))
+) -> io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().spawn(move || run_garbage_collector_thread(consumer))
 }
 
 fn run_garbage_collector_thread(mut consumer: llq::Consumer<Box<dyn Any + Send>>) {

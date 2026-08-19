@@ -21,11 +21,11 @@ use super::injected_admission::{
 };
 #[cfg(test)]
 use super::injected_node_id_pair;
-use super::injected_node_lifetime::InjectedNodeLifetimeOwner;
 #[cfg(test)]
 use super::injected_node_lifetime::{
     injected_node_lifetime_registry, DEFAULT_NODE_LIFETIME_CAPACITY,
 };
+use super::injected_node_lifetime::{BoundInjectedOutputRenderer, InjectedNodeLifetimeOwner};
 use super::{InjectedContextAdmissionGate, InjectedGraphReclaimInit};
 use crate::events::EventDispatch;
 use crate::message::{
@@ -37,9 +37,11 @@ use crate::message::{
     InjectedPhysicalCredit, InjectedPhysicalCreditOwners, InjectedPhysicalCreditPool,
     CONTROL_BATCH_CAPACITY,
 };
+#[cfg(test)]
+use crate::output::audio_render_thread_pair;
 use crate::output::{
-    audio_render_thread_pair, AudioOutputEventSink, AudioRenderCallback, AudioRenderFormat,
-    AudioRenderOwner,
+    try_audio_render_thread_pair, AudioOutputError, AudioOutputEventSink, AudioRenderCallback,
+    AudioRenderFormat, AudioRenderOwner, AudioRenderThreadPairFailure,
 };
 use crate::render::RenderThread;
 use crate::stats::AudioStats;
@@ -253,9 +255,63 @@ pub(crate) struct BoundInjectedRenderer {
     node_lifetimes: InjectedNodeLifetimeOwner,
 }
 
+/// Opaque proof that this renderer and node owner passed the injected build-time graph/control
+/// identity checks together. No constructor accepting a raw `RenderThread` is exposed.
+pub(crate) struct ExactBoundInjectedRenderer {
+    renderer: RenderThread,
+    node_lifetimes: InjectedNodeLifetimeOwner,
+}
+
+pub(crate) struct ExactInjectedRenderPairFailure {
+    pub(crate) error: AudioOutputError,
+    pub(crate) renderer: ExactBoundInjectedRenderer,
+    pub(crate) events: AudioOutputEventSink,
+}
+
+impl ExactBoundInjectedRenderer {
+    #[cfg(test)]
+    pub(crate) fn fail_next_gc_spawn_for_test(&mut self) {
+        self.renderer.fail_next_gc_spawn_for_test();
+    }
+
+    #[allow(clippy::result_large_err)] // failure returns the exact unboxed renderer and node owner
+    pub(crate) fn try_into_audio_render_thread_pair(
+        self,
+        format: AudioRenderFormat,
+        events: AudioOutputEventSink,
+    ) -> Result<
+        (
+            AudioRenderOwner,
+            AudioRenderCallback,
+            InjectedNodeLifetimeOwner,
+        ),
+        ExactInjectedRenderPairFailure,
+    > {
+        match try_audio_render_thread_pair(format, self.renderer, events) {
+            Ok((owner, callback)) => Ok((owner, callback, self.node_lifetimes)),
+            Err(AudioRenderThreadPairFailure {
+                error,
+                renderer,
+                events,
+            }) => Err(ExactInjectedRenderPairFailure {
+                error,
+                renderer: ExactBoundInjectedRenderer {
+                    renderer,
+                    node_lifetimes: self.node_lifetimes,
+                },
+                events,
+            }),
+        }
+    }
+}
+
+pub(crate) struct BindInjectedOutputRendererFailure {
+    pub(crate) renderer: BoundInjectedRenderer,
+    pub(crate) control: InjectedControlLifecycleOwner,
+}
+
 impl BoundInjectedRenderer {
-    /// The only production extraction installs the mandatory joinable GC inside the sound
-    /// callback/owner pair. No crate caller can obtain an executable injected renderer without it.
+    #[cfg(test)]
     pub(crate) fn into_audio_render_thread_pair(
         self,
         format: AudioRenderFormat,
@@ -267,6 +323,31 @@ impl BoundInjectedRenderer {
     ) {
         let (owner, callback) = audio_render_thread_pair(format, self.renderer, events);
         (owner, callback, self.node_lifetimes)
+    }
+
+    /// Binds the sole lifecycle owner for this exact transport before callback installation.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn bind_output_lifecycle(
+        self,
+        control: InjectedControlLifecycleOwner,
+    ) -> Result<BoundInjectedOutputRenderer, BindInjectedOutputRendererFailure> {
+        if !self
+            .node_lifetimes
+            .control_identity()
+            .ptr_eq(&control.identity())
+        {
+            return Err(BindInjectedOutputRendererFailure {
+                renderer: self,
+                control,
+            });
+        }
+        Ok(BoundInjectedOutputRenderer::new(
+            ExactBoundInjectedRenderer {
+                renderer: self.renderer,
+                node_lifetimes: self.node_lifetimes,
+            },
+            control,
+        ))
     }
 
     #[cfg(test)]
@@ -1164,6 +1245,10 @@ pub(crate) struct ControlCloseRetirement {
 }
 
 impl InjectedControlLifecycleOwner {
+    pub(crate) fn identity(&self) -> InjectedControlIdentity {
+        InjectedControlIdentity(Arc::downgrade(&self.inner))
+    }
+
     /// Best-effort credit-release hint for the future non-RT lifecycle driver. The receiver is
     /// borrowed so no competing consumer can be retained through this API. Callers must retry
     /// from authoritative teardown/transport state; a wake is never an acknowledgement.

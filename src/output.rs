@@ -809,23 +809,62 @@ where
     )
 }
 
-#[allow(dead_code)] // invoked by the pending context lifecycle integration
-pub(crate) fn audio_render_thread_pair(
+pub(crate) struct AudioRenderThreadPairFailure {
+    pub(crate) error: AudioOutputError,
+    pub(crate) renderer: RenderThread,
+    pub(crate) events: AudioOutputEventSink,
+}
+
+/// Installs the mandatory joinable GC before publishing either callback-side ownership object.
+/// Spawn failure returns the unchanged exact renderer and event sink to its branded caller.
+#[allow(clippy::result_large_err)] // exact renderer return must not depend on a second allocation
+pub(crate) fn try_audio_render_thread_pair(
     format: AudioRenderFormat,
     mut renderer: RenderThread,
     events: AudioOutputEventSink,
-) -> (AudioRenderOwner, AudioRenderCallback) {
-    let garbage_collector_join = renderer
-        .spawn_joinable_garbage_collector_thread()
-        .expect("injected renderer must not already own a garbage collector");
-    audio_render_pair(
+) -> Result<(AudioRenderOwner, AudioRenderCallback), AudioRenderThreadPairFailure> {
+    let garbage_collector_join = match renderer.try_spawn_joinable_garbage_collector_thread() {
+        Ok(Some(join)) => join,
+        Ok(None) => {
+            return Err(AudioRenderThreadPairFailure {
+                error: AudioOutputError::new(
+                    AudioOutputErrorKind::BackendSpecific,
+                    "injected renderer already owns a garbage collector",
+                ),
+                renderer,
+                events,
+            });
+        }
+        Err(error) => {
+            return Err(AudioRenderThreadPairFailure {
+                error: AudioOutputError::new(
+                    AudioOutputErrorKind::BackendSpecific,
+                    format!("failed to spawn injected garbage collector: {error}"),
+                ),
+                renderer,
+                events,
+            });
+        }
+    };
+    Ok(audio_render_pair(
         format,
         Box::new(RenderThreadDriver {
             renderer: Some(renderer),
             garbage_collector_join,
         }),
         events,
-    )
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn audio_render_thread_pair(
+    format: AudioRenderFormat,
+    renderer: RenderThread,
+    events: AudioOutputEventSink,
+) -> (AudioRenderOwner, AudioRenderCallback) {
+    try_audio_render_thread_pair(format, renderer, events)
+        .map_err(|failure| failure.error)
+        .expect("injected render pair test bootstrap should succeed")
 }
 
 /// Opaque, single-owner callback for one independent context.
