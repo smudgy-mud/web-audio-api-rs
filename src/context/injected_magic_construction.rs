@@ -22,7 +22,10 @@ use super::injected_control::{
 use super::injected_ids::{InjectedNodeIdIdentity, ProvisionalNodeIdError, ProvisionalNodeIds};
 use super::injected_node_construction::InjectedNodeConstructor;
 use super::injected_node_lifetime::NodeLifetimeInner;
-use super::{AudioNodeId, DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS};
+use super::{
+    AudioControlBatchReservation, AudioNodeId, DESTINATION_NODE_ID, LISTENER_NODE_ID,
+    LISTENER_PARAM_IDS,
+};
 use crate::message::ControlMessage;
 use crate::node::{
     destination_raw_parts, ChannelConfig, ChannelConfigInner, ChannelCountMode,
@@ -198,13 +201,31 @@ impl InjectedNodeConstructor {
         max_channel_count: usize,
         offline: bool,
     ) -> Result<InjectedMagicGraph, InjectedMagicConstructionFailure> {
-        let reservation = self
-            .control()
-            .try_begin_operation(MAGIC_COMMAND_COUNT)
-            .map_err(|error| InjectedMagicConstructionFailure {
-                error: InjectedMagicConstructionError::Control(error),
-                retryable: control_error_is_retryable(error),
-            })?;
+        self.try_construct_magic_graph_with_host_reservation(
+            sample_rate,
+            max_channel_count,
+            offline,
+            None,
+        )
+    }
+
+    pub(crate) fn try_construct_magic_graph_with_host_reservation(
+        &self,
+        sample_rate: f32,
+        max_channel_count: usize,
+        offline: bool,
+        host_reservation: Option<AudioControlBatchReservation>,
+    ) -> Result<InjectedMagicGraph, InjectedMagicConstructionFailure> {
+        let reservation = match host_reservation {
+            Some(host_reservation) => self
+                .control()
+                .try_begin_operation_with_host_reservation(MAGIC_COMMAND_COUNT, host_reservation),
+            None => self.control().try_begin_operation(MAGIC_COMMAND_COUNT),
+        }
+        .map_err(|error| InjectedMagicConstructionFailure {
+            error: InjectedMagicConstructionError::Control(error),
+            retryable: control_error_is_retryable(error),
+        })?;
         let ids = self
             .allocator()
             .try_reserve(MAGIC_NODE_COUNT)

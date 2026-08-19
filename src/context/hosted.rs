@@ -12,6 +12,7 @@ use std::thread;
 
 use super::injected_control::{injected_control_channel, InjectedControlError};
 use super::injected_ids::injected_node_id_pair;
+use super::injected_magic_construction::MAGIC_COMMAND_COUNT;
 use super::injected_node_construction::InjectedNodeConstructor;
 use super::injected_node_lifetime::{
     injected_node_lifetime_registry, DEFAULT_NODE_LIFETIME_CAPACITY,
@@ -23,7 +24,8 @@ use super::output_lifecycle::{
     OutputShutdownOutcome, OutputShutdownReceipt,
 };
 use super::{
-    AudioContext, AudioContextOptions, ConcreteBaseAudioContext, InjectedContextAdmissionGate,
+    AudioContext, AudioContextOptions, AudioControlBatchReservation, ConcreteBaseAudioContext,
+    InjectedContextAdmissionGate,
 };
 use crate::events::injected_event_dispatch_setup;
 use crate::output::{
@@ -411,6 +413,7 @@ pub struct AudioContextBuilder {
     number_of_channels: usize,
     initially_suspended: bool,
     diagnostic_label: Option<String>,
+    initial_control_reservation: Option<AudioControlBatchReservation>,
 }
 
 impl fmt::Debug for AudioContextBuilder {
@@ -432,8 +435,13 @@ impl AudioContextBuilder {
             number_of_channels: 2,
             initially_suspended: false,
             diagnostic_label: None,
+            initial_control_reservation: None,
         }
     }
+
+    /// Number of exact graph-control commands used to install the permanent destination and
+    /// listener namespace before a hosted context is published.
+    pub const INITIAL_GRAPH_CONTROL_COMMAND_COUNT: usize = MAGIC_COMMAND_COUNT;
 
     /// Replaces the Web Audio output request options.
     #[must_use]
@@ -460,6 +468,21 @@ impl AudioContextBuilder {
     #[must_use]
     pub fn diagnostic_label(mut self, label: impl Into<String>) -> Self {
         self.diagnostic_label = Some(label.into());
+        self
+    }
+
+    /// Attaches host accounting for the permanent destination/listener graph-control batch.
+    ///
+    /// The caller must reserve [`Self::INITIAL_GRAPH_CONTROL_COMMAND_COUNT`] commands before
+    /// invoking the output factory. The reservation is released with that exact batch on
+    /// rejection or after accepted off-render-thread reclamation; a fail-closed quarantine
+    /// deliberately retains it.
+    #[must_use]
+    pub fn initial_control_reservation(
+        mut self,
+        reservation: AudioControlBatchReservation,
+    ) -> Self {
+        self.initial_control_reservation = Some(reservation);
         self
     }
 
@@ -814,16 +837,17 @@ fn build_hosted_context(
             ));
         }
     };
-    let renderer = match bootstrap.try_build() {
-        Ok(renderer) => renderer,
-        Err(failure) => {
-            drop(failure);
-            return Err(prepared_bootstrap_error(
-                stage,
-                "magic graph bootstrap failed",
-            ));
-        }
-    };
+    let renderer =
+        match bootstrap.try_build_with_control_reservation(builder.initial_control_reservation) {
+            Ok(renderer) => renderer,
+            Err(failure) => {
+                drop(failure);
+                return Err(prepared_bootstrap_error(
+                    stage,
+                    "magic graph bootstrap failed",
+                ));
+            }
+        };
 
     let base = renderer.base().clone();
     let event_thread_id = base
