@@ -18,8 +18,9 @@ use crate::context::injected_node_lifetime::{
 };
 use crate::context::{
     AdmissionError, AudioContextRegistration, AudioContextState, AudioControlBatchReservation,
-    AudioControlBatchReservationProvider, AudioNodeId, BaseAudioContext,
-    InjectedContextAdmissionGate, DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS,
+    AudioControlBatchReservationProvider, AudioExplicitConnectionReservationProvider, AudioNodeId,
+    BaseAudioContext, InjectedContextAdmissionGate, DESTINATION_NODE_ID, LISTENER_NODE_ID,
+    LISTENER_PARAM_IDS,
 };
 use crate::events::{
     EventDispatch, EventHandler, EventLoop, EventType, InjectedControlEventDispatch,
@@ -648,7 +649,7 @@ fn finish_exact_connection(
             )
         }
         Err(InjectedConnectionOperationError::HostReservationRejected) => {
-            panic!("QuotaExceededError - host control-batch reservation was rejected")
+            panic!("QuotaExceededError - host graph/control reservation was rejected")
         }
         Err(InjectedConnectionOperationError::Unconnected) => {
             panic!("InvalidAccessError - attempting to disconnect unconnected nodes")
@@ -1382,6 +1383,32 @@ impl ConcreteBaseAudioContext {
                 finish_exact_connection(
                     constructor
                         .connect_exact_with_host_reservation(from, to, output, input, provider),
+                );
+            }
+        }
+    }
+
+    pub(crate) fn connect_registrations_with_reservations(
+        &self,
+        from: &AudioContextRegistration,
+        to: &AudioContextRegistration,
+        output: usize,
+        input: usize,
+        provider: AudioExplicitConnectionReservationProvider,
+    ) {
+        match &self.inner.graph_control {
+            ConcreteGraphControl::Legacy(_) => {
+                drop(provider);
+                panic!(
+                    "NotSupportedError - explicit reservations require an exact hosted AudioContext"
+                );
+            }
+            ConcreteGraphControl::Injected(constructor) => {
+                let from = exact_connection_endpoint(from);
+                let to = exact_connection_endpoint(to);
+                finish_exact_connection(
+                    constructor
+                        .connect_exact_with_explicit_reservation(from, to, output, input, provider),
                 );
             }
         }
