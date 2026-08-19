@@ -31,10 +31,14 @@ pub(crate) struct NodeCollection {
 
 impl NodeCollection {
     pub fn new() -> Self {
+        Self::with_capacity(64)
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         let mut instance = Self {
-            nodes: Vec::with_capacity(64),
+            nodes: Vec::with_capacity(capacity),
         };
-        instance.ensure_capacity(64);
+        instance.ensure_capacity(capacity);
         instance
     }
 
@@ -88,7 +92,14 @@ impl NodeCollection {
 
     #[inline(always)]
     pub fn contains(&self, index: AudioNodeId) -> bool {
-        self.nodes[index.0 as usize].is_some()
+        self.nodes
+            .get(index.0 as usize)
+            .is_some_and(Option::is_some)
+    }
+
+    #[inline(always)]
+    pub fn get(&self, index: AudioNodeId) -> Option<&RefCell<Node>> {
+        self.nodes.get(index.0 as usize)?.as_ref()
     }
 
     #[inline(always)]

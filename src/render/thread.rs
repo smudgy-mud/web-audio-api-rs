@@ -28,7 +28,8 @@ use crate::events::{
 use crate::message::{
     control_batch_storage, control_batch_storage_mut, ControlBatchApplied, ControlBatchNode,
     ControlMessage, GraphLifecycleBarrier, GraphLifecycleOutcome, GraphLifecyclePublisher,
-    GraphLifecycleTransition, InjectedPhysicalCreditOwners, CONTROL_COMMANDS_PER_CALLBACK,
+    GraphLifecycleTransition, InjectedExplicitBatchShape, InjectedPhysicalCreditOwners,
+    CONTROL_COMMANDS_PER_CALLBACK,
 };
 use crate::node::ChannelInterpretation;
 use crate::render::AudioWorkletGlobalScope;
@@ -447,20 +448,97 @@ impl RenderThread {
                 return;
             }
 
-            for _ in 0..batch_commands {
-                let message = control_batch_storage_mut(
-                    self.pending_control_batch
+            let exact_shape = control_batch_storage(
+                self.pending_control_batch
+                    .as_ref()
+                    .expect("batch is pending"),
+            )
+            .classify_injected_explicit_batch();
+            match exact_shape {
+                InjectedExplicitBatchShape::Invalid => {
+                    self.fail_injected_render_protocol();
+                }
+                InjectedExplicitBatchShape::Connect(value) => {
+                    let valid = self.graph.as_ref().is_some_and(|graph| {
+                        graph.preflight_injected_explicit_connect(value).is_ok()
+                    });
+                    if !valid {
+                        self.fail_injected_render_protocol();
+                    }
+                    self.graph
                         .as_mut()
-                        .expect("batch is pending"),
-                )
-                .take_next()
-                .expect("validated batch has a command remaining");
-                *remaining -= 1;
+                        .expect("preflight proved an installed exact graph")
+                        .apply_injected_explicit_connect(value);
+                    let command = control_batch_storage_mut(
+                        self.pending_control_batch
+                            .as_mut()
+                            .expect("batch is pending"),
+                    )
+                    .take_next();
+                    debug_assert!(matches!(
+                        command,
+                        Some(ControlMessage::InjectedConnectExplicit(_))
+                    ));
+                    *remaining -= 1;
+                }
+                InjectedExplicitBatchShape::Disconnect => {
+                    let valid = {
+                        let (graph, pending) = (&self.graph, &self.pending_control_batch);
+                        let storage =
+                            control_batch_storage(pending.as_ref().expect("batch is pending"));
+                        graph.as_ref().is_some_and(|graph| {
+                            graph
+                                .preflight_injected_explicit_disconnects(
+                                    storage.injected_explicit_disconnects(),
+                                )
+                                .is_ok()
+                        })
+                    };
+                    if !valid {
+                        self.fail_injected_render_protocol();
+                    }
+                    {
+                        let (graph, pending) = (&mut self.graph, &self.pending_control_batch);
+                        let storage =
+                            control_batch_storage(pending.as_ref().expect("batch is pending"));
+                        graph
+                            .as_mut()
+                            .expect("preflight proved an installed exact graph")
+                            .apply_injected_explicit_disconnects(
+                                storage.injected_explicit_disconnects(),
+                            );
+                    }
+                    for _ in 0..batch_commands {
+                        let command = control_batch_storage_mut(
+                            self.pending_control_batch
+                                .as_mut()
+                                .expect("batch is pending"),
+                        )
+                        .take_next();
+                        debug_assert!(matches!(
+                            command,
+                            Some(ControlMessage::InjectedDisconnectExplicit(_))
+                        ));
+                        *remaining -= 1;
+                    }
+                }
+                InjectedExplicitBatchShape::Ordinary => {
+                    for _ in 0..batch_commands {
+                        let message = control_batch_storage_mut(
+                            self.pending_control_batch
+                                .as_mut()
+                                .expect("batch is pending"),
+                        )
+                        .take_next()
+                        .expect("validated batch has a command remaining");
+                        *remaining -= 1;
 
-                if self.handle_control_message(message).is_break() {
-                    let batch = self.pending_control_batch.take().unwrap();
-                    self.reclaim_control_batch(batch);
-                    return;
+                        if self.handle_control_message(message).is_break() {
+                            let batch = self.pending_control_batch.take().unwrap();
+                            self.reclaim_control_batch(batch);
+                            return;
+                        }
+                    }
                 }
             }
 
@@ -473,6 +551,18 @@ impl RenderThread {
                 .ok();
             self.reclaim_control_batch(batch);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fail_injected_render_protocol(&mut self) -> ! {
+        // Do not publish the pending sequence: no explicit Graph mutation was applied. The
+        // absorbing latch is authoritative even when the best-effort event hint is saturated.
+        self.control_batch_applied.fail_render_protocol();
+        self.event_sender
+            .try_send(EventDispatch::control_batch_activity())
+            .ok();
+        panic!("injected explicit-edge protocol violation");
     }
 
     /// Applies a complete injected bootstrap envelope before an audio callback can be published.
@@ -683,10 +773,13 @@ impl RenderThread {
                 output,
                 input,
             } => {
-                self.graph
+                let applied = self
+                    .graph
                     .as_mut()
-                    .unwrap()
-                    .add_edge((from, output), (to, input));
+                    .is_some_and(|graph| graph.try_add_edge((from, output), (to, input)).is_ok());
+                if !applied {
+                    self.fail_injected_render_protocol();
+                }
             }
             DisconnectNode {
                 from,
@@ -698,6 +791,10 @@ impl RenderThread {
                     .as_mut()
                     .unwrap()
                     .remove_edge((from, output), (to, input));
+            }
+            InjectedConnectExplicit(_) | InjectedDisconnectExplicit(_) => {
+                // Exact explicit records are legal only as a pre-scanned dedicated envelope.
+                self.fail_injected_render_protocol();
             }
             ControlHandleDropped { id } => {
                 self.graph.as_mut().unwrap().mark_control_handle_dropped(id);
@@ -1289,6 +1386,9 @@ mod tests {
     use std::thread::{self, ThreadId};
 
     use super::*;
+    use crate::context::{
+        injected_node_id_pair, InjectedExplicitConnect, InjectedExplicitDisconnect,
+    };
     use crate::events::EventLoop;
     use crate::message::{
         graph_lifecycle_ack_pair, ControlBatchSendError, ControlBatchSender,
@@ -1296,6 +1396,7 @@ mod tests {
         CONTROL_BATCH_STORAGE_IN_FLIGHT_LIMIT,
     };
     use crate::node::{ChannelConfigInner, ChannelCountMode};
+    use crate::render::graph::InjectedExplicitEdgeProtocolError;
     use crate::render::{AudioParamValues, AudioProcessor};
 
     struct TestHarness {
@@ -1315,6 +1416,20 @@ mod tests {
         control: Sender<ControlMessage>,
         barrier: GraphLifecycleBarrier,
         calls: Arc<AtomicUsize>,
+    }
+
+    struct ExplicitEdgeTestProcessor;
+
+    impl AudioProcessor for ExplicitEdgeTestProcessor {
+        fn process(
+            &mut self,
+            _inputs: &[AudioRenderQuantum],
+            _outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            _scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            true
+        }
     }
 
     impl AudioProcessor for BarrierAfterFirstQuantumProcessor {
@@ -1382,6 +1497,78 @@ mod tests {
 
     fn run_callback(renderer: &mut RenderThread) {
         renderer.render(&mut [] as &mut [f32]);
+    }
+
+    fn explicit_edge_test_graph(last_id: u64) -> Graph {
+        let (_allocator, _owner, init) = injected_node_id_pair(100);
+        let mut graph = init.into_graph();
+        for id in 0..=last_id {
+            graph.add_node(
+                AudioNodeId(id),
+                llq::Node::new(AudioNodeId(id)),
+                Box::new(ExplicitEdgeTestProcessor),
+                1,
+                1,
+                ChannelConfigInner {
+                    count: 1,
+                    count_mode: ChannelCountMode::Explicit,
+                    interpretation: ChannelInterpretation::Discrete,
+                },
+            );
+        }
+        graph
+    }
+
+    fn install_explicit_edge_test_graph(renderer: &mut RenderThread) {
+        renderer.graph = Some(explicit_edge_test_graph(4));
+    }
+
+    fn exact_connect(from: u64, to: u64) -> InjectedExplicitConnect {
+        InjectedExplicitConnect::new_for_test(AudioNodeId(from), AudioNodeId(to), 0, 0)
+    }
+
+    fn exact_disconnect(from: u64, to: u64) -> InjectedExplicitDisconnect {
+        InjectedExplicitDisconnect::new_for_test(AudioNodeId(from), AudioNodeId(to), 0, 0)
+    }
+
+    fn assert_exact_protocol_failure(
+        graph: Graph,
+        commands: Vec<ControlMessage>,
+        verify_unchanged: impl FnOnce(&Graph),
+    ) {
+        let mut test = harness(1, 1);
+        test.renderer.graph = Some(graph);
+        let (reclaimed_send, reclaimed_recv) = crossbeam_channel::bounded(1);
+        test.batches
+            .try_send_exact_for_test(
+                commands,
+                Some(Arc::new(move || {
+                    let _ = reclaimed_send.send(thread::current().id());
+                })),
+            )
+            .unwrap();
+
+        let render_thread = thread::current().id();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_callback(&mut test.renderer);
+        }))
+        .is_err());
+        assert_eq!(test.applied.load(), 0, "failed sequence remains unapplied");
+        assert!(test.applied.render_protocol_failed());
+        assert!(test.renderer.pending_control_batch.is_some());
+        verify_unchanged(test.renderer.graph.as_ref().unwrap());
+
+        drop(test.renderer);
+        let mut retired = Vec::new();
+        while let Some(node) = test.garbage.pop() {
+            retired.push(node);
+        }
+        thread::spawn(move || drop(retired)).join().unwrap();
+        assert_ne!(
+            reclaimed_recv.recv_timeout(Duration::from_secs(1)).unwrap(),
+            render_thread
+        );
+        assert_eq!(test.batches.batch_storage_in_flight(), 0);
     }
 
     fn marker(value: u16, log: &Arc<Mutex<Vec<u16>>>) -> ControlMessage {
@@ -2108,6 +2295,275 @@ mod tests {
         alloc_counter::deny_alloc(|| run_callback(&mut test.renderer));
         assert_eq!(test.applied.load(), 1);
         assert!(test.garbage.pop().is_some());
+    }
+
+    #[test]
+    fn exact_connect_and_atomic_disconnect_batch_apply_without_render_allocation() {
+        let mut test = harness(3, 3);
+        install_explicit_edge_test_graph(&mut test.renderer);
+
+        for edge in [exact_connect(1, 2), exact_connect(1, 3)] {
+            test.batches
+                .try_send_exact_for_test(vec![ControlMessage::InjectedConnectExplicit(edge)], None)
+                .unwrap();
+            alloc_counter::deny_alloc(|| run_callback(&mut test.renderer));
+        }
+        assert_eq!(test.applied.load(), 2);
+        let graph = test.renderer.graph.as_ref().unwrap();
+        assert_eq!(
+            graph.preflight_injected_explicit_connect(exact_connect(1, 2)),
+            Err(InjectedExplicitEdgeProtocolError::Duplicate)
+        );
+        assert_eq!(
+            graph.preflight_injected_explicit_connect(exact_connect(1, 3)),
+            Err(InjectedExplicitEdgeProtocolError::Duplicate)
+        );
+
+        test.batches
+            .try_send_exact_for_test(
+                vec![
+                    ControlMessage::InjectedDisconnectExplicit(exact_disconnect(1, 2)),
+                    ControlMessage::InjectedDisconnectExplicit(exact_disconnect(1, 3)),
+                ],
+                None,
+            )
+            .unwrap();
+        alloc_counter::deny_alloc(|| run_callback(&mut test.renderer));
+        assert_eq!(test.applied.load(), 3);
+        let graph = test.renderer.graph.as_ref().unwrap();
+        graph
+            .preflight_injected_explicit_connect(exact_connect(1, 2))
+            .unwrap();
+        graph
+            .preflight_injected_explicit_connect(exact_connect(1, 3))
+            .unwrap();
+    }
+
+    #[test]
+    fn exact_records_are_not_general_batchable() {
+        let test = harness(1, 1);
+        assert_eq!(
+            test.batches
+                .try_send(vec![ControlMessage::InjectedConnectExplicit(
+                    exact_connect(1, 2)
+                )]),
+            Err(ControlBatchSendError::UnsupportedCommand)
+        );
+        assert_eq!(
+            test.batches
+                .try_send(vec![ControlMessage::InjectedDisconnectExplicit(
+                    exact_disconnect(1, 2)
+                )]),
+            Err(ControlBatchSendError::UnsupportedCommand)
+        );
+    }
+
+    #[test]
+    fn every_exact_edge_divergence_latches_before_mutation_and_reclaims_off_rt() {
+        let mut duplicate = explicit_edge_test_graph(4);
+        duplicate
+            .preflight_injected_explicit_connect(exact_connect(1, 2))
+            .unwrap();
+        duplicate.apply_injected_explicit_connect(exact_connect(1, 2));
+        assert_exact_protocol_failure(
+            duplicate,
+            vec![ControlMessage::InjectedConnectExplicit(exact_connect(1, 2))],
+            |graph| {
+                assert_eq!(
+                    graph.preflight_injected_explicit_connect(exact_connect(1, 2)),
+                    Err(InjectedExplicitEdgeProtocolError::Duplicate)
+                );
+            },
+        );
+
+        let mut capacity =
+            explicit_edge_test_graph(crate::context::MAX_INJECTED_EXPLICIT_CONNECTIONS as u64 + 2);
+        for offset in 0..crate::context::MAX_INJECTED_EXPLICIT_CONNECTIONS {
+            let to = if offset == 0 { 0 } else { offset as u64 + 1 };
+            let edge = exact_connect(1, to);
+            capacity.preflight_injected_explicit_connect(edge).unwrap();
+            capacity.apply_injected_explicit_connect(edge);
+        }
+        let overflow = exact_connect(
+            1,
+            crate::context::MAX_INJECTED_EXPLICIT_CONNECTIONS as u64 + 1,
+        );
+        assert_exact_protocol_failure(
+            capacity,
+            vec![ControlMessage::InjectedConnectExplicit(overflow)],
+            |graph| {
+                assert_eq!(
+                    graph.preflight_injected_explicit_connect(overflow),
+                    Err(InjectedExplicitEdgeProtocolError::Capacity)
+                );
+                assert_eq!(
+                    graph.preflight_injected_explicit_connect(exact_connect(1, 0)),
+                    Err(InjectedExplicitEdgeProtocolError::Duplicate)
+                );
+            },
+        );
+
+        for invalid in [
+            InjectedExplicitConnect::new_for_test(AudioNodeId(1), AudioNodeId(99), 0, 0),
+            InjectedExplicitConnect::new_for_test(AudioNodeId(1), AudioNodeId(2), 1, 0),
+            InjectedExplicitConnect::new_for_test(AudioNodeId(1), AudioNodeId(2), 0, usize::MAX),
+        ] {
+            assert_exact_protocol_failure(
+                explicit_edge_test_graph(4),
+                vec![ControlMessage::InjectedConnectExplicit(invalid)],
+                |graph| {
+                    graph
+                        .preflight_injected_explicit_connect(exact_connect(1, 2))
+                        .unwrap();
+                },
+            );
+        }
+
+        for invalid in [
+            InjectedExplicitDisconnect::new_for_test(AudioNodeId(1), AudioNodeId(2), 1, 0),
+            InjectedExplicitDisconnect::new_for_test(AudioNodeId(1), AudioNodeId(2), 0, usize::MAX),
+        ] {
+            let mut graph = explicit_edge_test_graph(4);
+            graph
+                .preflight_injected_explicit_connect(exact_connect(1, 2))
+                .unwrap();
+            graph.apply_injected_explicit_connect(exact_connect(1, 2));
+            assert_exact_protocol_failure(
+                graph,
+                vec![ControlMessage::InjectedDisconnectExplicit(invalid)],
+                |graph| {
+                    assert_eq!(
+                        graph.preflight_injected_explicit_connect(exact_connect(1, 2)),
+                        Err(InjectedExplicitEdgeProtocolError::Duplicate)
+                    );
+                },
+            );
+        }
+
+        let mut missing = explicit_edge_test_graph(4);
+        missing
+            .preflight_injected_explicit_connect(exact_connect(1, 2))
+            .unwrap();
+        missing.apply_injected_explicit_connect(exact_connect(1, 2));
+        assert_exact_protocol_failure(
+            missing,
+            vec![ControlMessage::InjectedDisconnectExplicit(
+                exact_disconnect(1, 3),
+            )],
+            |graph| {
+                assert_eq!(
+                    graph.preflight_injected_explicit_connect(exact_connect(1, 2)),
+                    Err(InjectedExplicitEdgeProtocolError::Duplicate)
+                );
+            },
+        );
+
+        let mut duplicate_disconnect = explicit_edge_test_graph(4);
+        duplicate_disconnect
+            .preflight_injected_explicit_connect(exact_connect(1, 2))
+            .unwrap();
+        duplicate_disconnect.apply_injected_explicit_connect(exact_connect(1, 2));
+        assert_exact_protocol_failure(
+            duplicate_disconnect,
+            vec![
+                ControlMessage::InjectedDisconnectExplicit(exact_disconnect(1, 2)),
+                ControlMessage::InjectedDisconnectExplicit(exact_disconnect(1, 2)),
+            ],
+            |graph| {
+                assert_eq!(
+                    graph.preflight_injected_explicit_connect(exact_connect(1, 2)),
+                    Err(InjectedExplicitEdgeProtocolError::Duplicate)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn exact_disconnect_divergence_latches_before_removing_any_present_edge() {
+        let mut test = harness(3, 3);
+        install_explicit_edge_test_graph(&mut test.renderer);
+        for edge in [exact_connect(1, 2), exact_connect(1, 3)] {
+            test.batches
+                .try_send_exact_for_test(vec![ControlMessage::InjectedConnectExplicit(edge)], None)
+                .unwrap();
+            run_callback(&mut test.renderer);
+        }
+        assert_eq!(test.applied.load(), 2);
+
+        test.batches
+            .try_send_exact_for_test(
+                vec![
+                    ControlMessage::InjectedDisconnectExplicit(exact_disconnect(1, 2)),
+                    ControlMessage::InjectedDisconnectExplicit(exact_disconnect(2, 3)),
+                ],
+                None,
+            )
+            .unwrap();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_callback(&mut test.renderer);
+        }))
+        .is_err());
+        assert_eq!(test.applied.load(), 2);
+        assert!(test.applied.render_protocol_failed());
+        let graph = test.renderer.graph.as_ref().unwrap();
+        assert_eq!(
+            graph.preflight_injected_explicit_connect(exact_connect(1, 2)),
+            Err(InjectedExplicitEdgeProtocolError::Duplicate),
+            "the present prefix edge was not removed before the later mismatch"
+        );
+        assert_eq!(
+            graph.preflight_injected_explicit_connect(exact_connect(1, 3)),
+            Err(InjectedExplicitEdgeProtocolError::Duplicate)
+        );
+
+        drop(test.renderer);
+        let mut retired = Vec::new();
+        while let Some(node) = test.garbage.pop() {
+            retired.push(node);
+        }
+        thread::spawn(move || drop(retired)).join().unwrap();
+    }
+
+    #[test]
+    fn mixed_exact_batch_fails_before_ordinary_prefix_and_reclaims_off_render_thread() {
+        let mut test = harness(1, 1);
+        install_explicit_edge_test_graph(&mut test.renderer);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (reclaimed_send, reclaimed_recv) = crossbeam_channel::bounded(1);
+        test.batches
+            .try_send_exact_for_test(
+                vec![
+                    marker(7, &log),
+                    ControlMessage::InjectedConnectExplicit(exact_connect(1, 2)),
+                ],
+                Some(Arc::new(move || {
+                    let _ = reclaimed_send.send(thread::current().id());
+                })),
+            )
+            .unwrap();
+
+        let render_thread = thread::current().id();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_callback(&mut test.renderer);
+        }))
+        .is_err());
+        assert!(log.lock().unwrap().is_empty());
+        assert_eq!(test.applied.load(), 0, "failed sequence remains unapplied");
+        assert!(test.applied.render_protocol_failed());
+        assert!(test.renderer.pending_control_batch.is_some());
+        assert_eq!(test.batches.batch_storage_in_flight(), 1);
+
+        drop(test.renderer);
+        let mut retired = Vec::new();
+        while let Some(node) = test.garbage.pop() {
+            retired.push(node);
+        }
+        thread::spawn(move || drop(retired)).join().unwrap();
+        assert_ne!(
+            reclaimed_recv.recv_timeout(Duration::from_secs(1)).unwrap(),
+            render_thread
+        );
+        assert_eq!(test.batches.batch_storage_in_flight(), 0);
     }
 
     #[test]

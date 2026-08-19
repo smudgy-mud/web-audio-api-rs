@@ -7,10 +7,15 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
 
-use crate::context::AudioNodeId;
+use arrayvec::ArrayVec;
+
 use crate::context::InjectedGraphReclaimPublisher;
 #[cfg(feature = "diagnostics")]
 use crate::context::{AudioGraphDiagnostics, AudioGraphEdgeDiagnostics, AudioNodeDiagnostics};
+use crate::context::{
+    AudioNodeId, InjectedExplicitConnect, InjectedExplicitDisconnect,
+    MAX_INJECTED_EXPLICIT_CONNECTIONS, MAX_INJECTED_GRAPH_NODES,
+};
 use smallvec::{smallvec, SmallVec};
 
 use super::node_collection::AudioNodeIdSet;
@@ -26,6 +31,49 @@ struct OutgoingEdge {
     other_id: AudioNodeId,
     /// index of the other Nodes input port
     other_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InjectedExplicitRenderEdge {
+    from: AudioNodeId,
+    output: usize,
+    to: AudioNodeId,
+    input: usize,
+}
+
+impl From<InjectedExplicitConnect> for InjectedExplicitRenderEdge {
+    fn from(value: InjectedExplicitConnect) -> Self {
+        let (from, output, to, input) = value.edge();
+        Self {
+            from,
+            output,
+            to,
+            input,
+        }
+    }
+}
+
+impl From<InjectedExplicitDisconnect> for InjectedExplicitRenderEdge {
+    fn from(value: InjectedExplicitDisconnect) -> Self {
+        let (from, output, to, input) = value.edge();
+        Self {
+            from,
+            output,
+            to,
+            input,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedExplicitEdgeProtocolError {
+    InvalidEndpoint,
+    InvalidPort,
+    HiddenEdge,
+    Duplicate,
+    Capacity,
+    MissingLiveEdge,
+    DuplicateDisconnect,
 }
 
 impl std::fmt::Debug for OutgoingEdge {
@@ -86,7 +134,7 @@ impl Node {
     }
 
     /// Determine if this node is done playing and can be removed from the audio graph
-    fn can_free(&self, tail_time: bool) -> bool {
+    fn can_free(&self, tail_time: bool, has_explicit_outgoing: bool) -> bool {
         // Only drop when the Control thread has dropped its handle.
         // Otherwise the node can be reconnected/restarted etc.
         if !self.control_handle_dropped {
@@ -101,14 +149,17 @@ impl Node {
             }
 
             // Drop when the node does not have any inputs and outputs
-            if self.outgoing_edges.is_empty() {
+            if self.outgoing_edges.is_empty() && !has_explicit_outgoing {
                 return true;
             }
         }
 
         // Node has no control handle and does have inputs connected.
         // Drop when the processor when it has no outputs connected and does not have side effects
-        if !self.processor.has_side_effects() && self.outgoing_edges.is_empty() {
+        if !self.processor.has_side_effects()
+            && self.outgoing_edges.is_empty()
+            && !has_explicit_outgoing
+        {
             return true;
         }
 
@@ -138,6 +189,10 @@ pub(crate) struct Graph {
     /// Installed only by the opaque injected graph initializer. The exact LLQ node remains the
     /// authoritative acknowledgement; this is a lossy bounded activity hint.
     injected_reclaim_publisher: Option<InjectedGraphReclaimPublisher>,
+    /// Fixed explicit-edge store used only by the exact injected graph. Hidden ordering edges
+    /// remain in each node's inline `outgoing_edges` and cannot be reached by public disconnect.
+    injected_explicit_edges:
+        Option<Box<ArrayVec<InjectedExplicitRenderEdge, MAX_INJECTED_EXPLICIT_CONNECTIONS>>>,
     /// Topological ordering of the nodes
     ordered: Vec<AudioNodeId>,
     /// Topological sorting helper
@@ -161,7 +216,7 @@ impl std::fmt::Debug for Graph {
 
 impl Graph {
     pub fn new(reclaim_id_channel: llq::Producer<AudioNodeId>) -> Self {
-        Self::new_inner(reclaim_id_channel, None, None)
+        Self::new_inner(reclaim_id_channel, None, None, false)
     }
 
     pub(crate) fn new_injected(
@@ -173,6 +228,7 @@ impl Graph {
             reclaim_id_channel,
             Some((pending_return, pending_reclaims)),
             Some(publisher),
+            true,
         )
     }
 
@@ -180,23 +236,39 @@ impl Graph {
         reclaim_id_channel: llq::Producer<AudioNodeId>,
         pending_reclaims: Option<(llq::Producer<AudioNodeId>, llq::Consumer<AudioNodeId>)>,
         injected_reclaim_publisher: Option<InjectedGraphReclaimPublisher>,
+        injected: bool,
     ) -> Self {
         let (pending_reclaim_return, pending_reclaims) = pending_reclaims
             .map_or((None, None), |(producer, consumer)| {
                 (Some(producer), Some(consumer))
             });
+        let topology_capacity = if injected {
+            MAX_INJECTED_GRAPH_NODES
+        } else {
+            0
+        };
+        let new_set =
+            || AudioNodeIdSet::with_capacity_and_hasher(topology_capacity, Default::default());
         Graph {
-            nodes: NodeCollection::new(),
+            nodes: if injected {
+                NodeCollection::with_capacity(MAX_INJECTED_GRAPH_NODES)
+            } else {
+                NodeCollection::new()
+            },
             alloc: Alloc::with_capacity(64),
             reclaim_id_channel,
             pending_reclaim_return,
             pending_reclaims,
             injected_reclaim_publisher,
-            ordered: vec![],
-            marked: AudioNodeIdSet::default(),
-            marked_temp: vec![],
-            in_cycle: AudioNodeIdSet::default(),
-            cycle_breakers: vec![],
+            // The fixed store is allocated once with the Graph on the control thread. Boxing
+            // keeps legacy `ControlMessage::Startup { graph }` compact without permitting the
+            // store to grow or allocate on the render thread.
+            injected_explicit_edges: injected.then(|| Box::new(ArrayVec::new())),
+            ordered: Vec::with_capacity(topology_capacity),
+            marked: new_set(),
+            marked_temp: Vec::with_capacity(topology_capacity),
+            in_cycle: new_set(),
+            cycle_breakers: Vec::with_capacity(topology_capacity),
         }
     }
 
@@ -213,7 +285,7 @@ impl Graph {
 
         for id in self.nodes.keys() {
             let node = self.nodes.get_unchecked(id).borrow();
-            let outgoing_edges: Vec<_> = node
+            let mut outgoing_edges: Vec<_> = node
                 .outgoing_edges
                 .iter()
                 .map(|edge| AudioGraphEdgeDiagnostics {
@@ -222,6 +294,16 @@ impl Graph {
                     input: (edge.other_index != usize::MAX).then_some(edge.other_index),
                 })
                 .collect();
+
+            if let Some(explicit) = self.injected_explicit_edges.as_ref() {
+                outgoing_edges.extend(explicit.iter().filter(|edge| edge.from == id).map(|edge| {
+                    AudioGraphEdgeDiagnostics {
+                        output: edge.output,
+                        destination: edge.to.0,
+                        input: Some(edge.input),
+                    }
+                }));
+            }
 
             edge_count += outgoing_edges.len();
 
@@ -312,7 +394,39 @@ impl Graph {
         self.ordered.push(index);
     }
 
+    #[allow(dead_code)] // direct legacy graph tests use this convenience wrapper
     pub fn add_edge(&mut self, source: (AudioNodeId, usize), dest: (AudioNodeId, usize)) {
+        self.try_add_edge(source, dest)
+            .expect("legacy edge insertion accepts its prevalidated endpoint");
+    }
+
+    pub(crate) fn try_add_edge(
+        &mut self,
+        source: (AudioNodeId, usize),
+        dest: (AudioNodeId, usize),
+    ) -> Result<(), InjectedExplicitEdgeProtocolError> {
+        if self.injected_explicit_edges.is_some() {
+            if dest.1 != usize::MAX {
+                return Err(InjectedExplicitEdgeProtocolError::HiddenEdge);
+            }
+            let Some(source_node) = self.nodes.get(source.0) else {
+                return Err(InjectedExplicitEdgeProtocolError::InvalidEndpoint);
+            };
+            if source.1 >= source_node.borrow().outputs.len() || !self.nodes.contains(dest.0) {
+                return Err(InjectedExplicitEdgeProtocolError::InvalidPort);
+            }
+            let source_node = self.nodes.get_unchecked_mut(source.0);
+            if source_node.outgoing_edges.spilled()
+                || source_node.outgoing_edges.len() == source_node.outgoing_edges.inline_size()
+            {
+                return Err(InjectedExplicitEdgeProtocolError::Capacity);
+            }
+            if source_node.outgoing_edges.iter().any(|edge| {
+                edge.self_index == source.1 && edge.other_id == dest.0 && edge.other_index == dest.1
+            }) {
+                return Err(InjectedExplicitEdgeProtocolError::Duplicate);
+            }
+        }
         self.nodes
             .get_unchecked_mut(source.0)
             .outgoing_edges
@@ -323,6 +437,7 @@ impl Graph {
             });
 
         self.ordered.clear(); // void current ordering
+        Ok(())
     }
 
     pub fn remove_edge(&mut self, source: (AudioNodeId, usize), dest: (AudioNodeId, usize)) {
@@ -335,6 +450,102 @@ impl Graph {
 
         // Removing an edge cannot invalidate an existing topological order. Re-sort only when
         // this removal may release nodes that were omitted because they are part of a cycle.
+        if !self.in_cycle.is_empty() {
+            self.ordered.clear();
+        }
+    }
+
+    pub(crate) fn preflight_injected_explicit_connect(
+        &self,
+        value: InjectedExplicitConnect,
+    ) -> Result<(), InjectedExplicitEdgeProtocolError> {
+        let edge = InjectedExplicitRenderEdge::from(value);
+        if edge.input == usize::MAX {
+            return Err(InjectedExplicitEdgeProtocolError::HiddenEdge);
+        }
+        let Some(source) = self.nodes.get(edge.from) else {
+            return Err(InjectedExplicitEdgeProtocolError::InvalidEndpoint);
+        };
+        let Some(destination) = self.nodes.get(edge.to) else {
+            return Err(InjectedExplicitEdgeProtocolError::InvalidEndpoint);
+        };
+        if edge.output >= source.borrow().outputs.len()
+            || edge.input >= destination.borrow().inputs.len()
+        {
+            return Err(InjectedExplicitEdgeProtocolError::InvalidPort);
+        }
+        let Some(edges) = self.injected_explicit_edges.as_ref() else {
+            return Err(InjectedExplicitEdgeProtocolError::InvalidEndpoint);
+        };
+        if edges.contains(&edge) {
+            return Err(InjectedExplicitEdgeProtocolError::Duplicate);
+        }
+        if edges.is_full() {
+            return Err(InjectedExplicitEdgeProtocolError::Capacity);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_injected_explicit_connect(&mut self, value: InjectedExplicitConnect) {
+        self.injected_explicit_edges
+            .as_mut()
+            .expect("exact connect requires an injected graph")
+            .push(value.into());
+        self.ordered.clear();
+    }
+
+    pub(crate) fn preflight_injected_explicit_disconnects(
+        &self,
+        values: impl Iterator<Item = InjectedExplicitDisconnect> + Clone,
+    ) -> Result<(), InjectedExplicitEdgeProtocolError> {
+        let Some(edges) = self.injected_explicit_edges.as_ref() else {
+            return Err(InjectedExplicitEdgeProtocolError::InvalidEndpoint);
+        };
+        for (position, value) in values.clone().enumerate() {
+            let edge = InjectedExplicitRenderEdge::from(value);
+            if value.edge().3 == usize::MAX {
+                return Err(InjectedExplicitEdgeProtocolError::HiddenEdge);
+            }
+            if values
+                .clone()
+                .take(position)
+                .any(|prior| prior.edge() == value.edge())
+            {
+                return Err(InjectedExplicitEdgeProtocolError::DuplicateDisconnect);
+            }
+
+            let source = self.nodes.get(edge.from);
+            let destination = self.nodes.get(edge.to);
+            if let (Some(source), Some(destination)) = (source, destination) {
+                if edge.output >= source.borrow().outputs.len()
+                    || edge.input >= destination.borrow().inputs.len()
+                {
+                    return Err(InjectedExplicitEdgeProtocolError::InvalidPort);
+                }
+                if !edges.contains(&edge) {
+                    return Err(InjectedExplicitEdgeProtocolError::MissingLiveEdge);
+                }
+            }
+            // A missing edge is expected after renderer-side incident pruning only when at least
+            // one numeric endpoint has already left the Graph. The host cleanup still owns its
+            // exact generation record during this bounded gap.
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_injected_explicit_disconnects(
+        &mut self,
+        values: impl Iterator<Item = InjectedExplicitDisconnect> + Clone,
+    ) {
+        let edges = self
+            .injected_explicit_edges
+            .as_mut()
+            .expect("exact disconnect requires an injected graph");
+        edges.retain(|edge| {
+            !values
+                .clone()
+                .any(|value| *edge == InjectedExplicitRenderEdge::from(value))
+        });
         if !self.in_cycle.is_empty() {
             self.ordered.clear();
         }
@@ -421,24 +632,48 @@ impl Graph {
         // Add node to the current cycle detection list
         marked_temp.push(node_id);
 
-        // Visit outgoing nodes, and call `visit` on them recursively
-        for edge in self
-            .nodes
-            .get_unchecked(node_id)
-            .borrow()
-            .outgoing_edges
-            .iter()
-        {
-            let cycle_breaker_applied = self.visit(
-                edge.other_id,
-                marked,
-                marked_temp,
-                ordered,
-                in_cycle,
-                cycle_breakers,
-            );
-            if cycle_breaker_applied {
-                return true;
+        // Exact graphs preserve represented edges when a DelayNode breaks a cycle. Suppress that
+        // node's outgoing dependencies only for this topology pass; deleting a fixed explicit
+        // record would diverge from the later host registry. Legacy graphs retain their existing
+        // destructive cycle-break behavior below.
+        let suppress_outgoing =
+            self.injected_explicit_edges.is_some() && cycle_breakers.contains(&node_id);
+        if !suppress_outgoing {
+            // Visit outgoing nodes, and call `visit` on them recursively
+            for edge in self
+                .nodes
+                .get_unchecked(node_id)
+                .borrow()
+                .outgoing_edges
+                .iter()
+            {
+                let cycle_breaker_applied = self.visit(
+                    edge.other_id,
+                    marked,
+                    marked_temp,
+                    ordered,
+                    in_cycle,
+                    cycle_breakers,
+                );
+                if cycle_breaker_applied {
+                    return true;
+                }
+            }
+
+            if let Some(explicit) = self.injected_explicit_edges.as_ref() {
+                for edge in explicit.iter().filter(|edge| edge.from == node_id) {
+                    let cycle_breaker_applied = self.visit(
+                        edge.to,
+                        marked,
+                        marked_temp,
+                        ordered,
+                        in_cycle,
+                        cycle_breakers,
+                    );
+                    if cycle_breaker_applied {
+                        return true;
+                    }
+                }
             }
         }
 
@@ -473,6 +708,7 @@ impl Graph {
         let mut marked_temp = std::mem::take(&mut self.marked_temp);
         let mut in_cycle = std::mem::take(&mut self.in_cycle);
         let mut cycle_breakers = std::mem::take(&mut self.cycle_breakers);
+        cycle_breakers.clear();
 
         // When a cycle breaker is applied, the graph topology changes and we need to run the
         // ordering again
@@ -482,7 +718,6 @@ impl Graph {
             marked.clear();
             marked_temp.clear();
             in_cycle.clear();
-            cycle_breakers.clear();
 
             // Visit all registered nodes, and perform a depth first traversal.
             //
@@ -506,6 +741,12 @@ impl Graph {
             }
 
             if cycle_breaker_applied {
+                if self.injected_explicit_edges.is_some() {
+                    // Re-run with the newly found breaker suppressed from topology traversal.
+                    // Its fixed explicit and hidden records remain intact for routing and later
+                    // exact host-side disconnect.
+                    continue;
+                }
                 // clear the outgoing edges of the nodes that have been recognized as cycle breaker
                 cycle_breakers.iter().for_each(|node_id| {
                     self.nodes
@@ -513,6 +754,7 @@ impl Graph {
                         .outgoing_edges
                         .clear();
                 });
+                cycle_breakers.clear();
 
                 continue;
             }
@@ -548,6 +790,10 @@ impl Graph {
 
         // process every node, in topological sorted order
         self.ordered.iter().for_each(|index| {
+            let has_explicit_outgoing = self
+                .injected_explicit_edges
+                .as_ref()
+                .is_some_and(|edges| edges.iter().any(|edge| edge.from == *index));
             // acquire a mutable borrow of the current processing node
             let mut node = self.nodes.get_unchecked(*index).borrow_mut();
 
@@ -584,7 +830,20 @@ impl Graph {
                     output_node.inputs[edge.other_index].add(signal, channel_config);
                 });
 
-            let can_free = !success || node.can_free(tail_time);
+            if let Some(explicit) = self.injected_explicit_edges.as_ref() {
+                explicit
+                    .iter()
+                    .filter(|edge| edge.from == *index)
+                    .for_each(|edge| {
+                        let mut output_node = self.nodes.get_unchecked(edge.to).borrow_mut();
+                        output_node.has_inputs_connected = true;
+                        let signal = &node.outputs[edge.output];
+                        let channel_config = &output_node.channel_config.clone();
+                        output_node.inputs[edge.input].add(signal, channel_config);
+                    });
+            }
+
+            let can_free = !success || node.can_free(tail_time, has_explicit_outgoing);
 
             // Node is not dropped.
             if !can_free {
@@ -603,6 +862,9 @@ impl Graph {
             if can_free {
                 // Node is dropped, remove it from the node list
                 let mut node = self.nodes.remove(*index).into_inner();
+                if let Some(explicit) = self.injected_explicit_edges.as_mut() {
+                    explicit.retain(|edge| edge.from != *index && edge.to != *index);
+                }
                 let injected_reclaim = self.injected_reclaim_publisher.is_some();
                 let mut reclaim_id = Some(node.reclaim_id.take().unwrap());
                 if !injected_reclaim {
@@ -697,7 +959,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::context::{injected_node_id_pair, DESTINATION_NODE_ID};
+    use crate::context::{
+        injected_node_id_pair, InjectedExplicitConnect, InjectedExplicitDisconnect,
+        DESTINATION_NODE_ID,
+    };
 
     #[derive(Debug, Clone)]
     struct TestNode {
@@ -831,7 +1096,14 @@ mod tests {
     }
 
     fn add_edge(graph: &mut Graph, from: u64, to: u64) {
-        graph.add_edge((AudioNodeId(from), 0), (AudioNodeId(to), 0));
+        if graph.injected_explicit_edges.is_some() {
+            let value =
+                InjectedExplicitConnect::new_for_test(AudioNodeId(from), AudioNodeId(to), 0, 0);
+            graph.preflight_injected_explicit_connect(value).unwrap();
+            graph.apply_injected_explicit_connect(value);
+        } else {
+            graph.add_edge((AudioNodeId(from), 0), (AudioNodeId(to), 0));
+        }
     }
 
     fn add_audioparam(graph: &mut Graph, from: u64, to: u64) {
@@ -846,6 +1118,180 @@ mod tests {
             node_id: std::cell::Cell::new(AudioNodeId(0)),
             event_sender: crossbeam_channel::unbounded().0.into(),
         }
+    }
+
+    #[test]
+    fn injected_first_render_fanout_cycle_and_exact_disconnect_are_allocation_free() {
+        let (_allocator, _owner, graph_init) = injected_node_id_pair(100);
+        let mut graph = graph_init.into_graph();
+        for id in 0..=6 {
+            add_node(&mut graph, id, Box::new(TestNode { tail_time: true }));
+        }
+
+        for to in [0, 2, 3, 4] {
+            add_edge(&mut graph, 1, to);
+        }
+        add_edge(&mut graph, 2, 3);
+        add_edge(&mut graph, 3, 2);
+        graph.mark_cycle_breaker(AudioNodeId(2));
+        add_audioparam(&mut graph, 5, 1);
+        assert_eq!(graph.injected_explicit_edges.as_ref().unwrap().len(), 6);
+        assert_eq!(
+            graph
+                .nodes
+                .get_unchecked(AudioNodeId(5))
+                .borrow()
+                .outgoing_edges
+                .len(),
+            1
+        );
+
+        let render_scope = scope();
+        alloc_counter::deny_alloc(|| {
+            let _ = graph.render(&render_scope);
+        });
+        assert_eq!(
+            graph.injected_explicit_edges.as_ref().unwrap().len(),
+            6,
+            "topology cycle breaking preserves represented explicit edges"
+        );
+
+        let removals = [
+            InjectedExplicitDisconnect::new_for_test(AudioNodeId(1), AudioNodeId(2), 0, 0),
+            InjectedExplicitDisconnect::new_for_test(AudioNodeId(1), AudioNodeId(3), 0, 0),
+        ];
+        alloc_counter::deny_alloc(|| {
+            graph
+                .preflight_injected_explicit_disconnects(removals.iter().copied())
+                .unwrap();
+            graph.apply_injected_explicit_disconnects(removals.iter().copied());
+            let _ = graph.render(&render_scope);
+        });
+        assert_eq!(graph.injected_explicit_edges.as_ref().unwrap().len(), 4);
+        assert_eq!(
+            graph
+                .nodes
+                .get_unchecked(AudioNodeId(5))
+                .borrow()
+                .outgoing_edges
+                .len(),
+            1,
+            "exact disconnect never reaches the hidden parameter edge"
+        );
+    }
+
+    #[test]
+    fn injected_disconnect_preflight_is_atomic_and_allows_only_absent_endpoint_gap() {
+        let (_allocator, _owner, graph_init) = injected_node_id_pair(100);
+        let mut graph = graph_init.into_graph();
+        for id in 0..=3 {
+            add_node(&mut graph, id, Box::new(TestNode { tail_time: true }));
+        }
+        add_edge(&mut graph, 1, 2);
+        add_edge(&mut graph, 1, 3);
+
+        assert_eq!(
+            graph.preflight_injected_explicit_connect(InjectedExplicitConnect::new_for_test(
+                AudioNodeId(1),
+                AudioNodeId(99),
+                0,
+                0,
+            )),
+            Err(InjectedExplicitEdgeProtocolError::InvalidEndpoint)
+        );
+        assert_eq!(
+            graph.preflight_injected_explicit_connect(InjectedExplicitConnect::new_for_test(
+                AudioNodeId(1),
+                AudioNodeId(2),
+                1,
+                0,
+            )),
+            Err(InjectedExplicitEdgeProtocolError::InvalidPort)
+        );
+        assert_eq!(
+            graph.preflight_injected_explicit_connect(InjectedExplicitConnect::new_for_test(
+                AudioNodeId(1),
+                AudioNodeId(2),
+                0,
+                usize::MAX,
+            )),
+            Err(InjectedExplicitEdgeProtocolError::HiddenEdge)
+        );
+
+        let present =
+            InjectedExplicitDisconnect::new_for_test(AudioNodeId(1), AudioNodeId(2), 0, 0);
+        let missing_live =
+            InjectedExplicitDisconnect::new_for_test(AudioNodeId(2), AudioNodeId(3), 0, 0);
+        assert_eq!(
+            graph.preflight_injected_explicit_disconnects([present, missing_live].into_iter()),
+            Err(InjectedExplicitEdgeProtocolError::MissingLiveEdge)
+        );
+        assert_eq!(graph.injected_explicit_edges.as_ref().unwrap().len(), 2);
+
+        graph.nodes.remove(AudioNodeId(2));
+        graph
+            .injected_explicit_edges
+            .as_mut()
+            .unwrap()
+            .retain(|edge| edge.from != AudioNodeId(2) && edge.to != AudioNodeId(2));
+        graph
+            .preflight_injected_explicit_disconnects([present].into_iter())
+            .unwrap();
+        graph.apply_injected_explicit_disconnects([present].into_iter());
+        assert_eq!(graph.injected_explicit_edges.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn injected_hidden_edges_never_spill_and_explicit_capacity_is_fixed() {
+        let (_allocator, _owner, graph_init) = injected_node_id_pair(100);
+        let mut graph = graph_init.into_graph();
+        for id in 0..=MAX_INJECTED_EXPLICIT_CONNECTIONS as u64 + 2 {
+            add_node(&mut graph, id, Box::new(TestNode { tail_time: true }));
+        }
+
+        for offset in 0..MAX_INJECTED_EXPLICIT_CONNECTIONS {
+            let to = if offset == 0 { 0 } else { offset as u64 + 1 };
+            add_edge(&mut graph, 1, to);
+        }
+        let overflow = InjectedExplicitConnect::new_for_test(
+            AudioNodeId(1),
+            AudioNodeId(MAX_INJECTED_EXPLICIT_CONNECTIONS as u64 + 1),
+            0,
+            0,
+        );
+        assert_eq!(
+            graph.preflight_injected_explicit_connect(overflow),
+            Err(InjectedExplicitEdgeProtocolError::Capacity)
+        );
+
+        let removals: [_; MAX_INJECTED_EXPLICIT_CONNECTIONS] = std::array::from_fn(|offset| {
+            let to = if offset == 0 { 0 } else { offset as u64 + 1 };
+            InjectedExplicitDisconnect::new_for_test(AudioNodeId(1), AudioNodeId(to), 0, 0)
+        });
+        alloc_counter::deny_alloc(|| {
+            graph
+                .preflight_injected_explicit_disconnects(removals.iter().copied())
+                .unwrap();
+            graph.apply_injected_explicit_disconnects(removals.iter().copied());
+        });
+        assert!(graph.injected_explicit_edges.as_ref().unwrap().is_empty());
+
+        graph
+            .try_add_edge((AudioNodeId(2), 0), (AudioNodeId(3), usize::MAX))
+            .unwrap();
+        graph
+            .try_add_edge((AudioNodeId(2), 0), (AudioNodeId(4), usize::MAX))
+            .unwrap();
+        assert_eq!(
+            graph.try_add_edge((AudioNodeId(2), 0), (AudioNodeId(5), usize::MAX)),
+            Err(InjectedExplicitEdgeProtocolError::Capacity)
+        );
+        assert!(!graph
+            .nodes
+            .get_unchecked(AudioNodeId(2))
+            .borrow()
+            .outgoing_edges
+            .spilled());
     }
 
     #[test]

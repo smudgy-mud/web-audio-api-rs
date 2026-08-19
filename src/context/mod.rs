@@ -18,6 +18,12 @@ pub(crate) use injected_admission::{
 mod injected_control;
 pub(crate) use injected_control::InjectedControlRenderInit;
 
+mod injected_connections;
+pub(crate) use injected_connections::{
+    InjectedExplicitConnect, InjectedExplicitDisconnect, MAX_INJECTED_EXPLICIT_CONNECTIONS,
+    MAX_INJECTED_GRAPH_NODES,
+};
+
 mod injected_ids;
 #[cfg(test)]
 pub(crate) use injected_ids::injected_node_id_pair;
