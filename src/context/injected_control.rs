@@ -210,6 +210,21 @@ impl InjectedControlIdentity {
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.0, &other.0)
     }
+
+    /// Fail closed through this exact weak transport identity.
+    ///
+    /// This is used only when a later private capability-attachment proof discovers that two
+    /// supposedly inseparable exact owners were cross-wired. No raw producer is recovered.
+    pub(super) fn fail_closed_protocol(&self) {
+        let Some(inner) = self.0.upgrade() else {
+            return;
+        };
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.phase = TransportPhase::Failed;
+    }
 }
 
 /// Cloneable ordinary graph producer. Private fields prevent raw sender or lifecycle extraction.
@@ -855,7 +870,7 @@ pub(crate) struct ControlBatchReservation {
     command_credit: InjectedCommandCredit,
     sequence_reservation: BatchSequenceReservation,
     placement: ReservedPlacement,
-    admission: GraphControlAdmission,
+    admission: Arc<GraphControlAdmission>,
 }
 
 /// Admission-only start of one exact graph operation.
@@ -867,7 +882,13 @@ pub(crate) struct ControlBatchReservation {
 #[must_use]
 pub(super) struct AdmittedGraphOperation {
     inner: Arc<InjectedControlInner>,
-    admission: GraphControlAdmission,
+    admission: Arc<GraphControlAdmission>,
+}
+
+/// Clone of the one underlying operation admission used only to keep Close drain pending while a
+/// typed transaction moves the primary owner through reservation, commit, and rollback frames.
+pub(super) struct GraphOperationAdmissionFence {
+    _admission: Arc<GraphControlAdmission>,
 }
 
 pub(super) struct ReserveAdmittedGraphOperationFailure {
@@ -876,6 +897,12 @@ pub(super) struct ReserveAdmittedGraphOperationFailure {
 }
 
 impl AdmittedGraphOperation {
+    pub(super) fn admission_fence(&self) -> GraphOperationAdmissionFence {
+        GraphOperationAdmissionFence {
+            _admission: Arc::clone(&self.admission),
+        }
+    }
+
     pub(super) fn reserve_commands(
         self,
         command_count: usize,
@@ -928,6 +955,12 @@ impl ControlBatchReservation {
     /// Concrete typed transactions may use this only after proving the reserved count and closed
     /// command set before moving rollback tokens into `commands`.
     pub(super) fn into_prevalidated(self, commands: Vec<ControlMessage>) -> PreparedControlBatch {
+        self.into_preboxed(commands.into_boxed_slice())
+    }
+
+    /// Fixed typed transactions may preallocate and validate boxed command storage before
+    /// transferring the primary admission into the transport reservation.
+    pub(super) fn into_preboxed(self, commands: Box<[ControlMessage]>) -> PreparedControlBatch {
         let Self {
             inner,
             storage,
@@ -938,7 +971,7 @@ impl ControlBatchReservation {
             ..
         } = self;
         PreparedControlBatch {
-            commands: commands.into_boxed_slice(),
+            commands,
             inner,
             storage,
             command_credit,
@@ -989,7 +1022,7 @@ pub(crate) struct PreparedControlBatch {
     command_credit: InjectedCommandCredit,
     sequence_reservation: BatchSequenceReservation,
     placement: ReservedPlacement,
-    admission: GraphControlAdmission,
+    admission: Arc<GraphControlAdmission>,
 }
 
 impl PreparedControlBatch {
@@ -1017,7 +1050,7 @@ struct RejectedControlAuthorities {
     _command_credit: InjectedCommandCredit,
     _sequence_reservation: BatchSequenceReservation,
     _placement: ReservedPlacement,
-    _admission: GraphControlAdmission,
+    _admission: Arc<GraphControlAdmission>,
 }
 
 pub(super) enum RejectedControlRollback<R> {
@@ -1099,15 +1132,19 @@ pub(crate) enum CommitWithFinalizeFailure {
 
 /// Accepted placement whose short operation authorities deliberately remain live until the
 /// mandatory finalizer (or ordinary no-op completion) finishes.
-struct AcceptedControlCommit {
+pub(super) struct AcceptedControlCommit {
     inner: Arc<InjectedControlInner>,
     outcome: CommitControlOutcome,
     sequence_reservation: Option<BatchSequenceReservation>,
-    admission: GraphControlAdmission,
+    admission: Arc<GraphControlAdmission>,
 }
 
 impl AcceptedControlCommit {
-    fn complete(self) -> CommitControlOutcome {
+    pub(super) const fn outcome(&self) -> CommitControlOutcome {
+        self.outcome
+    }
+
+    pub(super) fn complete(self) -> CommitControlOutcome {
         self.outcome
     }
 
@@ -1249,7 +1286,7 @@ impl InjectedControlProducer {
         drop(state);
         Ok(AdmittedGraphOperation {
             inner: Arc::clone(&self.inner),
-            admission,
+            admission: Arc::new(admission),
         })
     }
 
@@ -1493,7 +1530,7 @@ impl InjectedControlProducer {
             .finalize(finalizer)
     }
 
-    fn try_commit_retained(
+    pub(super) fn try_commit_retained(
         &self,
         batch: PreparedControlBatch,
     ) -> Result<AcceptedControlCommit, CommitControlFailure> {

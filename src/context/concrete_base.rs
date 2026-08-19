@@ -1,5 +1,8 @@
 //! The `ConcreteBaseAudioContext` type
 
+use crate::context::injected_connections::{
+    InjectedConnectionEndpointKind, InjectedMagicConnectionEndpoints,
+};
 use crate::context::injected_control::InjectedConcreteEventBinding;
 use crate::context::injected_magic_construction::{
     InjectedMagicConstructionError, InjectedMagicGraph,
@@ -352,6 +355,9 @@ struct ConcreteBaseAudioContextInner {
     frames_played: Arc<AtomicU64>,
     /// AudioListener fields
     listener_params: Option<AudioListenerParams>,
+    /// Accepted permanent destination/listener-param endpoint brands. Legacy and the test-only
+    /// magic-less construction harness deliberately carry none.
+    magic_connections: Option<InjectedMagicConnectionEndpoints>,
     /// Denotes if this AudioContext is offline or not
     offline: bool,
     /// Current state of the `ConcreteBaseAudioContext`, shared with the RenderThread
@@ -518,8 +524,13 @@ impl ExactInjectedBaseBootstrap {
             constructor,
             binding,
         } = self;
-        let (destination_channel_config, listener_params, outcome, installed_magic) =
-            magic.into_host_parts();
+        let (
+            destination_channel_config,
+            listener_params,
+            outcome,
+            magic_connections,
+            installed_magic,
+        ) = magic.into_host_parts();
         let required_sequence = match outcome {
             crate::context::injected_control::CommitControlOutcome::Enqueued { sequence } => {
                 sequence
@@ -571,6 +582,7 @@ impl ExactInjectedBaseBootstrap {
                 destination_channel_config,
                 frames_played,
                 listener_params: Some(listener_params),
+                magic_connections: Some(magic_connections),
                 offline,
                 state: ConcreteContextState::Injected,
                 event_handlers: ConcreteEventHandlers::Injected(events.clone()),
@@ -718,6 +730,7 @@ impl ConcreteBaseAudioContext {
             destination_channel_config: AudioNodeOptions::default().into(),
             frames_played,
             listener_params: None,
+            magic_connections: None,
             offline,
             state: ConcreteContextState::Legacy(state),
             event_handlers: ConcreteEventHandlers::Legacy(event_loop),
@@ -820,6 +833,7 @@ impl ConcreteBaseAudioContext {
                 destination_channel_config: AudioNodeOptions::default().into(),
                 frames_played,
                 listener_params: None,
+                magic_connections: None,
                 offline,
                 state: ConcreteContextState::Legacy(state),
                 event_handlers: ConcreteEventHandlers::Legacy(event_loop),
@@ -868,6 +882,7 @@ impl ConcreteBaseAudioContext {
         let id = self.legacy_graph().audio_node_id_provider.get();
         let registration = AudioContextRegistration {
             injected_lifetime: None,
+            injected_connection: None,
             id,
             context: self.clone(),
         };
@@ -1044,16 +1059,49 @@ impl ConcreteBaseAudioContext {
         self.inner.destination_channel_config.clone()
     }
 
+    pub(super) fn destination_registration(&self) -> AudioContextRegistration {
+        match &self.inner.magic_connections {
+            Some(connections) => AudioContextRegistration::from_injected_permanent(
+                DESTINATION_NODE_ID,
+                self.clone(),
+                connections.destination(),
+                InjectedConnectionEndpointKind::AudioNode,
+                1,
+                1,
+            ),
+            None => AudioContextRegistration {
+                injected_lifetime: None,
+                injected_connection: None,
+                id: DESTINATION_NODE_ID,
+                context: self.clone(),
+            },
+        }
+    }
+
     /// Returns the `AudioListener` which is used for 3D spatialization
     pub(super) fn listener(&self) -> AudioListener {
         // instruct to BaseContext to add the AudioListener if it has not already
         self.base().ensure_audio_listener_present();
 
-        let mut ids = LISTENER_PARAM_IDS.map(|i| AudioContextRegistration {
-            injected_lifetime: None,
-            id: AudioNodeId(i),
-            context: self.clone(),
-        });
+        let mut ids = LISTENER_PARAM_IDS
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| match &self.inner.magic_connections {
+                Some(connections) => AudioContextRegistration::from_injected_permanent(
+                    AudioNodeId(id),
+                    self.clone(),
+                    connections.listener_param(index),
+                    InjectedConnectionEndpointKind::AudioParam,
+                    1,
+                    1,
+                ),
+                None => AudioContextRegistration {
+                    injected_lifetime: None,
+                    injected_connection: None,
+                    id: AudioNodeId(id),
+                    context: self.clone(),
+                },
+            });
         let params = self.inner.listener_params.as_ref().unwrap();
 
         AudioListener {
@@ -1162,6 +1210,30 @@ impl ConcreteBaseAudioContext {
         self.send_control_msg(message);
     }
 
+    /// Registration-carrying public AudioNode seam. H2a preserves the legacy path while keeping
+    /// exact endpoint brands inseparable from their handles; h2b selects the serialized exact
+    /// transaction after its overload matrix is frozen.
+    pub(crate) fn connect_registrations(
+        &self,
+        from: &AudioContextRegistration,
+        to: &AudioContextRegistration,
+        output: usize,
+        input: usize,
+    ) {
+        match &self.inner.graph_control {
+            ConcreteGraphControl::Legacy(_) => {
+                self.connect(from.id(), to.id(), output, input);
+            }
+            ConcreteGraphControl::Injected(_) => {
+                let _ = (
+                    from.injected_connection_endpoint(),
+                    to.injected_connection_endpoint(),
+                );
+                panic!("NotSupportedError - exact AudioNode connections are not selected yet")
+            }
+        }
+    }
+
     /// Schedule a connection of an `AudioParam` to the `AudioNode` it belongs to
     ///
     /// It is not performed immediately as the `AudioNode` is not registered at this point.
@@ -1215,6 +1287,33 @@ impl ConcreteBaseAudioContext {
 
         if !has_disconnected && to.is_some() {
             panic!("InvalidAccessError - attempting to disconnect unconnected nodes");
+        }
+    }
+
+    /// Registration-carrying disconnect seam paired with `connect_registrations`.
+    pub(crate) fn disconnect_registrations(
+        &self,
+        from: &AudioContextRegistration,
+        output: Option<usize>,
+        to: Option<&AudioContextRegistration>,
+        input: Option<usize>,
+    ) {
+        match &self.inner.graph_control {
+            ConcreteGraphControl::Legacy(_) => {
+                self.disconnect(
+                    from.id(),
+                    output,
+                    to.map(AudioContextRegistration::id),
+                    input,
+                );
+            }
+            ConcreteGraphControl::Injected(_) => {
+                let _ = (
+                    from.injected_connection_endpoint(),
+                    to.and_then(AudioContextRegistration::injected_connection_endpoint),
+                );
+                panic!("NotSupportedError - exact AudioNode disconnections are not selected yet")
+            }
         }
     }
 

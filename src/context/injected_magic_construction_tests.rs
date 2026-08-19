@@ -21,8 +21,8 @@ use super::injected_node_lifetime::{
     MagicInitializedInjectedOutputRenderer,
 };
 use super::{
-    AudioContextState, AudioNodeId, BaseAudioContext, ConcreteBaseAudioContext,
-    InjectedContextAdmissionGate,
+    AudioContextRegistration, AudioContextState, AudioNodeId, BaseAudioContext,
+    ConcreteBaseAudioContext, InjectedConnectionEndpointKind, InjectedContextAdmissionGate,
 };
 use crate::events::{injected_event_dispatch_setup, EventDispatch, EventLoop, EventLoopExit};
 use crate::message::{ControlBatchApplied, ControlBatchSender, ControlMessage};
@@ -166,6 +166,20 @@ fn running_magic_graph_is_applied_before_first_real_render_and_next_id_is_eleven
     assert_eq!(listener.up_x().value(), 0.);
     assert_eq!(listener.up_y().value(), 1.);
     assert_eq!(listener.up_z().value(), 0.);
+    assert_eq!(
+        [
+            listener.position_x().registration().id(),
+            listener.position_y().registration().id(),
+            listener.position_z().registration().id(),
+            listener.forward_x().registration().id(),
+            listener.forward_y().registration().id(),
+            listener.forward_z().registration().id(),
+            listener.up_x().registration().id(),
+            listener.up_y().registration().id(),
+            listener.up_z().registration().id(),
+        ],
+        [2, 3, 4, 5, 6, 7, 8, 9, 10].map(AudioNodeId)
+    );
     drop(destination);
     drop(listener);
     assert_eq!(
@@ -209,6 +223,64 @@ fn permanent_magic_listener_param_rejects_runtime_mutation_before_host_change() 
     drop(listener);
     drop(base);
     retire(initialized, true);
+}
+
+#[test]
+fn permanent_magic_attachment_rejects_foreign_base_and_misindexed_listener_cap_fail_closed() {
+    let first = initialize(harness(false));
+    let second = initialize(harness(false));
+    let destination = first.base().destination();
+    let destination_cap = destination
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let foreign = panic::catch_unwind(AssertUnwindSafe(|| {
+        AudioContextRegistration::from_injected_permanent(
+            AudioNodeId(0),
+            second.base().clone(),
+            destination_cap,
+            InjectedConnectionEndpointKind::AudioNode,
+            1,
+            1,
+        )
+    }));
+    assert!(foreign.is_err());
+    for initialized in [&first, &second] {
+        assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+            GainNode::new(initialized.base(), GainOptions::default())
+        }))
+        .is_err());
+    }
+
+    // A separately initialized context proves the accepted listener-param capability cannot be
+    // re-labelled as another magic numeric endpoint even when the semantic kind/ports match.
+    let misindexed = initialize(harness(false));
+    let listener = misindexed.base().listener();
+    let position_x = listener.position_x();
+    let param_cap = position_x
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        AudioContextRegistration::from_injected_permanent(
+            AudioNodeId(3),
+            misindexed.base().clone(),
+            param_cap,
+            InjectedConnectionEndpointKind::AudioParam,
+            1,
+            1,
+        )
+    }))
+    .is_err());
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        GainNode::new(misindexed.base(), GainOptions::default())
+    }))
+    .is_err());
+
+    // These terminal proof mismatches intentionally leave the exact render owners quarantined.
+    std::mem::forget((first, second, misindexed));
 }
 
 #[test]

@@ -20,8 +20,8 @@ pub(crate) use injected_control::InjectedControlRenderInit;
 
 mod injected_connections;
 pub(crate) use injected_connections::{
-    InjectedExplicitConnect, InjectedExplicitDisconnect, MAX_INJECTED_EXPLICIT_CONNECTIONS,
-    MAX_INJECTED_GRAPH_NODES,
+    InjectedConnectionEndpointKind, InjectedExplicitConnect, InjectedExplicitDisconnect,
+    MAX_INJECTED_EXPLICIT_CONNECTIONS, MAX_INJECTED_GRAPH_NODES,
 };
 
 mod injected_ids;
@@ -145,6 +145,9 @@ impl From<u8> for AudioContextState {
 pub struct AudioContextRegistration {
     /// Injected lifetime handle, explicitly dropped while `context` is still alive.
     injected_lifetime: Option<injected_node_lifetime::InjectedNodeRegistration>,
+    /// Exact public-edge endpoint brand. Permanent magic registrations carry this without an
+    /// ordinary lifetime slot; ordinary Gain registrations carry both capabilities.
+    injected_connection: Option<injected_connections::InjectedConnectionEndpoint>,
     /// the audio context in which nodes and connections lives
     context: ConcreteBaseAudioContext,
     /// identify a specific `AudioNode`
@@ -164,6 +167,7 @@ impl std::fmt::Debug for AudioContextRegistration {
 }
 
 impl AudioContextRegistration {
+    #[cfg(test)]
     pub(crate) fn from_injected(
         id: AudioNodeId,
         context: ConcreteBaseAudioContext,
@@ -171,6 +175,63 @@ impl AudioContextRegistration {
     ) -> Self {
         Self {
             injected_lifetime: Some(lifetime),
+            injected_connection: None,
+            context,
+            id,
+        }
+    }
+
+    pub(crate) fn from_injected_with_connection(
+        id: AudioNodeId,
+        context: ConcreteBaseAudioContext,
+        lifetime: injected_node_lifetime::InjectedNodeRegistration,
+        connection: injected_connections::InjectedConnectionEndpoint,
+        kind: injected_connections::InjectedConnectionEndpointKind,
+        inputs: usize,
+        outputs: usize,
+    ) -> Self {
+        let matches_context = context
+            .injected_node_constructor()
+            .is_some_and(|constructor| connection.matches_constructor(constructor));
+        if !matches_context
+            || !connection.matches_registration(&lifetime, id, kind, inputs, outputs)
+        {
+            connection.fail_closed_protocol();
+            if let Some(constructor) = context.injected_node_constructor() {
+                constructor.fail_closed_protocol();
+            }
+            panic!("exact connection endpoint does not match its context/live registration");
+        }
+        Self {
+            injected_lifetime: Some(lifetime),
+            injected_connection: Some(connection),
+            context,
+            id,
+        }
+    }
+
+    pub(crate) fn from_injected_permanent(
+        id: AudioNodeId,
+        context: ConcreteBaseAudioContext,
+        connection: injected_connections::InjectedConnectionEndpoint,
+        kind: injected_connections::InjectedConnectionEndpointKind,
+        inputs: usize,
+        outputs: usize,
+    ) -> Self {
+        let matches_context = context
+            .injected_node_constructor()
+            .is_some_and(|constructor| connection.matches_constructor(constructor));
+        if !matches_context || !connection.matches_permanent_registration(id, kind, inputs, outputs)
+        {
+            connection.fail_closed_protocol();
+            if let Some(constructor) = context.injected_node_constructor() {
+                constructor.fail_closed_protocol();
+            }
+            panic!("exact permanent endpoint does not match its context/magic registration");
+        }
+        Self {
+            injected_lifetime: None,
+            injected_connection: Some(connection),
             context,
             id,
         }
@@ -197,6 +258,12 @@ impl AudioContextRegistration {
             .is_some_and(|lifetime| lifetime.matches_identity(identity))
     }
 
+    pub(crate) fn injected_connection_endpoint(
+        &self,
+    ) -> Option<&injected_connections::InjectedConnectionEndpoint> {
+        self.injected_connection.as_ref()
+    }
+
     /// Send a message to the corresponding audio processor of this node
     ///
     /// The message will be handled by
@@ -216,6 +283,9 @@ impl Drop for AudioContextRegistration {
             // The exact constructor/lifetime capabilities remain alive through `context` while
             // the injected handle publishes its teardown request.
             drop(lifetime);
+        } else if self.injected_connection.is_some() {
+            // Permanent magic handles are reconstructed freely and never request ordinary node
+            // teardown. Whole-graph retirement owns their renderer and host-edge cleanup.
         } else {
             self.context.mark_node_dropped(self.id);
         }
