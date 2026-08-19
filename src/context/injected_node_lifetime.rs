@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 
 use super::injected_control::{
-    AcceptedBatchFinalizeError, DrainedControlClose, InjectedControlIdentity,
+    AcceptedBatchFinalizeError, DrainedControlClose, ExactBoundInjectedRenderer,
+    ExactInjectedRenderPairFailure, InjectedControlIdentity, InjectedControlLifecycleOwner,
     InjectedControlProducer, InjectedNodeLifetimeBootstrap,
 };
 use super::injected_ids::{
@@ -23,6 +24,10 @@ use super::injected_ids::{
     OwnedPendingNodeReclaim,
 };
 use super::AudioNodeId;
+use crate::output::{
+    AudioOutputError, AudioOutputEventSink, AudioRenderCallback, AudioRenderFormat,
+    AudioRenderOwner,
+};
 
 mod teardown;
 #[allow(unused_imports)] // consumed by the later concrete lifecycle integration
@@ -218,6 +223,112 @@ pub(crate) struct InjectedNodeLifetimeOwner {
     node_ids: Option<InjectedNodeIdOwner>,
     control: Option<InjectedControlProducer>,
     orphan_reclaim: Option<OwnedPendingNodeReclaim>,
+}
+
+/// Exact renderer/control/node-lifetime bundle before callback installation.
+#[must_use]
+pub(crate) struct BoundInjectedOutputRenderer {
+    renderer: ExactBoundInjectedRenderer,
+    control: InjectedControlLifecycleOwner,
+}
+
+pub(crate) struct BoundInjectedOutputPairFailure {
+    pub(crate) error: AudioOutputError,
+    pub(crate) renderer: BoundInjectedOutputRenderer,
+    pub(crate) events: AudioOutputEventSink,
+}
+
+/// Unique lifecycle-side owner paired with one installed injected render callback.
+///
+/// B3a deliberately provides no driver, Close transition, or whole-graph proof. Until the private
+/// lifecycle worker is added, dropping this owner quarantines the exact render, control, and
+/// node-registry authorities for the process lifetime.
+#[must_use]
+pub(crate) struct InjectedOutputRenderOwner {
+    render: Option<AudioRenderOwner>,
+    node_lifetimes: Option<InjectedNodeLifetimeOwner>,
+    control: Option<InjectedControlLifecycleOwner>,
+}
+
+impl BoundInjectedOutputRenderer {
+    pub(crate) fn new(
+        renderer: ExactBoundInjectedRenderer,
+        control: InjectedControlLifecycleOwner,
+    ) -> Self {
+        Self { renderer, control }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_gc_spawn_for_test(&mut self) {
+        self.renderer.fail_next_gc_spawn_for_test();
+    }
+
+    /// Installs the mandatory joinable GC and keeps every lifecycle authority inseparable from
+    /// the callback's exact render owner.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn try_into_audio_render_thread_pair(
+        self,
+        format: AudioRenderFormat,
+        events: AudioOutputEventSink,
+    ) -> Result<(InjectedOutputRenderOwner, AudioRenderCallback), BoundInjectedOutputPairFailure>
+    {
+        match self
+            .renderer
+            .try_into_audio_render_thread_pair(format, events)
+        {
+            Ok((render, callback, node_lifetimes)) => Ok((
+                InjectedOutputRenderOwner {
+                    render: Some(render),
+                    node_lifetimes: Some(node_lifetimes),
+                    control: Some(self.control),
+                },
+                callback,
+            )),
+            Err(ExactInjectedRenderPairFailure {
+                error,
+                renderer,
+                events,
+            }) => Err(BoundInjectedOutputPairFailure {
+                error,
+                renderer: Self {
+                    renderer,
+                    control: self.control,
+                },
+                events,
+            }),
+        }
+    }
+}
+
+fn forget_option<T>(value: &mut Option<T>) {
+    if let Some(value) = value.take() {
+        std::mem::forget(value);
+    }
+}
+
+impl Drop for InjectedOutputRenderOwner {
+    fn drop(&mut self) {
+        forget_option(&mut self.render);
+        forget_option(&mut self.node_lifetimes);
+        forget_option(&mut self.control);
+    }
+}
+
+#[cfg(test)]
+impl InjectedOutputRenderOwner {
+    pub(crate) fn into_parts_for_test(
+        mut self,
+    ) -> (
+        AudioRenderOwner,
+        InjectedNodeLifetimeOwner,
+        InjectedControlLifecycleOwner,
+    ) {
+        (
+            self.render.take().unwrap(),
+            self.node_lifetimes.take().unwrap(),
+            self.control.take().unwrap(),
+        )
+    }
 }
 
 pub(crate) fn injected_node_lifetime_registry(

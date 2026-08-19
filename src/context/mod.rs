@@ -42,6 +42,9 @@ pub use online::*;
 
 mod output_lifecycle;
 
+#[cfg(test)]
+mod injected_output_bootstrap_tests;
+
 // magic node values
 /// Destination node id is always at index 0
 pub(crate) const DESTINATION_NODE_ID: AudioNodeId = AudioNodeId(0);
