@@ -2,8 +2,8 @@
 //!
 //! [`AudioContext::builder`](crate::context::AudioContext::builder) accepts these contracts for an
 //! exact hosted context while render-thread storage and lifecycle proof types remain private. The
-//! system-device adapter remains separate; legacy constructors continue using their established
-//! backend path.
+//! [`SystemAudioOutput`] supplies the additive system-device adapter; legacy constructors continue
+//! using their established backend path.
 
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
@@ -25,10 +25,9 @@ use crate::context::{AudioContextLatencyCategory, AudioContextRenderSizeCategory
 use crate::render::RenderThread;
 use crate::{is_valid_sample_rate, MAX_CHANNELS};
 
-// Kept private until the CPAL and Cubeb adapters satisfy the same ownership contract as the
-// feature-independent silent endpoint.
-#[allow(dead_code)]
 mod system;
+
+pub use system::SystemAudioOutput;
 
 /// Hard upper bound for frames supplied to one injected output callback invocation.
 pub const MAX_AUDIO_OUTPUT_CALLBACK_FRAMES: usize = 8192;
