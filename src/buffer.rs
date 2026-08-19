@@ -40,10 +40,12 @@ pub struct AudioBufferOptions {
 ///
 /// Buffers returned by budgeted decoding retain their result-dimension and
 /// wrapper-owned PCM reservations across clones for as long as any clone remains
-/// alive. A later mutation may trigger copy-on-write storage that is not separately
-/// charged yet. Integrations that require aggregate accounting for those copies
-/// must mediate mutable access; accounting copy-on-write growth is deferred to a
-/// follow-up compatibility phase.
+/// alive. Integrations may attach another opaque [`AudioBufferStorageLease`] when
+/// externally-accounted storage must follow native clones into an audio renderer.
+/// A later mutation may trigger copy-on-write storage that is not separately charged
+/// yet. Integrations that require aggregate accounting for those copies must mediate
+/// mutable access; accounting copy-on-write growth is deferred to a follow-up
+/// compatibility phase.
 ///
 /// - MDN documentation: <https://developer.mozilla.org/en-US/docs/Web/API/AudioBuffer>
 /// - specification: <https://webaudio.github.io/web-audio-api/#AudioBuffer>
@@ -158,6 +160,22 @@ impl AudioBuffer {
         self.length() as f64 / self.sample_rate as f64
     }
 
+    /// Attach externally-owned storage accounting to this buffer.
+    ///
+    /// The lease is opaque to the audio engine. It is retained across cheap
+    /// [`AudioBuffer`] clones and copy-on-write mutations, then released only after
+    /// the last native clone carrying this buffer storage is dropped. Attaching a
+    /// second lease is additive: it never replaces an existing decoder or host
+    /// reservation.
+    ///
+    /// This is intended for host integrations whose canonical PCM allocation is
+    /// accounted outside this crate but may outlive its wrapper after the buffer is
+    /// handed to an audio node. It does not account allocations caused by later
+    /// copy-on-write mutations.
+    pub fn attach_storage_lease(&mut self, lease: AudioBufferStorageLease) {
+        self.add_accounting_lease(lease.inner);
+    }
+
     /// Copy data from a given channel to the given `Vec`
     ///
     /// # Panics
@@ -266,8 +284,12 @@ impl AudioBuffer {
     }
 
     pub(crate) fn set_accounting_lease(&mut self, lease: Arc<dyn AudioBufferAccountingLease>) {
+        self.add_accounting_lease(lease);
+    }
+
+    fn add_accounting_lease(&mut self, lease: Arc<dyn AudioBufferAccountingLease>) {
         if let Some(channel) = self.channels.first_mut() {
-            channel.set_accounting_lease(lease);
+            channel.add_accounting_lease(lease);
         }
     }
 
@@ -432,6 +454,44 @@ pub(crate) trait AudioBufferAccountingLease: Send + Sync {}
 
 impl<T: Send + Sync> AudioBufferAccountingLease for T {}
 
+struct CombinedAudioBufferAccountingLease {
+    _previous: Arc<dyn AudioBufferAccountingLease>,
+    _additional: Arc<dyn AudioBufferAccountingLease>,
+}
+
+/// An opaque external ownership lease attached to an [`AudioBuffer`].
+///
+/// This type lets an integration bind its own accounting or lifetime guard to
+/// native audio storage without exposing that guard to the renderer. Constructing
+/// a lease does not attach it; pass it to [`AudioBuffer::attach_storage_lease`].
+#[must_use = "the lease must be attached to an AudioBuffer to follow its storage"]
+pub struct AudioBufferStorageLease {
+    inner: Arc<dyn AudioBufferAccountingLease>,
+}
+
+impl AudioBufferStorageLease {
+    /// Erase an external ownership guard into an audio-buffer storage lease.
+    ///
+    /// The guard must be safe to retain and release on any non-render thread. Its
+    /// destructor should not block or panic.
+    pub fn new<T>(guard: T) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        Self {
+            inner: Arc::new(guard),
+        }
+    }
+}
+
+impl std::fmt::Debug for AudioBufferStorageLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AudioBufferStorageLease")
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for ChannelData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChannelData")
@@ -465,8 +525,14 @@ impl ChannelData {
         }
     }
 
-    pub(crate) fn set_accounting_lease(&mut self, lease: Arc<dyn AudioBufferAccountingLease>) {
-        self.accounting_lease = Some(lease);
+    pub(crate) fn add_accounting_lease(&mut self, lease: Arc<dyn AudioBufferAccountingLease>) {
+        self.accounting_lease = Some(match self.accounting_lease.take() {
+            None => lease,
+            Some(previous) => Arc::new(CombinedAudioBufferAccountingLease {
+                _previous: previous,
+                _additional: lease,
+            }),
+        });
     }
 
     pub fn len(&self) -> usize {
@@ -492,6 +558,7 @@ impl ChannelData {
 mod tests {
     use float_eq::assert_float_eq;
     use std::f32::consts::PI;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -509,6 +576,41 @@ mod tests {
         assert_eq!(audio_buffer.length(), 96000);
         assert_float_eq!(audio_buffer.sample_rate(), 48000., abs <= 0.);
         assert_float_eq!(audio_buffer.duration(), 2., abs <= 0.);
+    }
+
+    #[test]
+    fn attached_storage_leases_follow_clones_and_cow_storage() {
+        struct DropProbe(Arc<AtomicUsize>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let first_drops = Arc::new(AtomicUsize::new(0));
+        let second_drops = Arc::new(AtomicUsize::new(0));
+        let mut original = AudioBuffer::new(AudioBufferOptions {
+            number_of_channels: 2,
+            length: 8,
+            sample_rate: 48_000.,
+        });
+        original.attach_storage_lease(AudioBufferStorageLease::new(DropProbe(Arc::clone(
+            &first_drops,
+        ))));
+        original.attach_storage_lease(AudioBufferStorageLease::new(DropProbe(Arc::clone(
+            &second_drops,
+        ))));
+
+        let mut renderer_clone = original.clone();
+        renderer_clone.get_channel_data_mut(0)[0] = 1.;
+        drop(original);
+        assert_eq!(first_drops.load(Ordering::Acquire), 0);
+        assert_eq!(second_drops.load(Ordering::Acquire), 0);
+
+        drop(renderer_clone);
+        assert_eq!(first_drops.load(Ordering::Acquire), 1);
+        assert_eq!(second_drops.load(Ordering::Acquire), 1);
     }
 
     #[test]
