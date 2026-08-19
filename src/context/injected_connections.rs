@@ -23,7 +23,9 @@ use super::injected_node_lifetime::{
     NodeLifetimeInner, NodeReclaimCleanupError,
 };
 use super::{
-    AudioControlBatchReservationProvider, AudioNodeId, DESTINATION_NODE_ID, LISTENER_PARAM_IDS,
+    AudioControlBatchReservation, AudioControlBatchReservationProvider,
+    AudioExplicitConnectionReservationProvider, AudioNodeId, SharedAudioGraphConnectionReservation,
+    DESTINATION_NODE_ID, LISTENER_PARAM_IDS,
 };
 use crate::message::ControlMessage;
 
@@ -405,7 +407,49 @@ impl InjectedHostExplicitConnection {
 }
 
 struct InjectedConnectionRegistryState {
-    edges: ArrayVec<InjectedHostExplicitConnection, MAX_INJECTED_EXPLICIT_CONNECTIONS>,
+    edges: ArrayVec<InjectedHostExplicitConnectionEntry, MAX_INJECTED_EXPLICIT_CONNECTIONS>,
+}
+
+struct InjectedHostExplicitConnectionEntry {
+    record: InjectedHostExplicitConnection,
+    host_reservation: Option<SharedAudioGraphConnectionReservation>,
+}
+
+pub(crate) enum InjectedConnectReservationProvider {
+    None,
+    Control(AudioControlBatchReservationProvider),
+    Explicit(AudioExplicitConnectionReservationProvider),
+}
+
+struct AcceptedConnectionReservationGuard {
+    reservation: Option<SharedAudioGraphConnectionReservation>,
+}
+
+impl AcceptedConnectionReservationGuard {
+    fn new(reservation: Option<SharedAudioGraphConnectionReservation>) -> Self {
+        Self { reservation }
+    }
+
+    fn commit(mut self) -> Option<SharedAudioGraphConnectionReservation> {
+        self.reservation.take()
+    }
+}
+
+impl Drop for AcceptedConnectionReservationGuard {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            // The connect command is already irrevocably queue-owned. If accepted mirror mutation
+            // unwinds, retain the live-edge accounting fail closed until the accounting domain
+            // itself is discarded rather than releasing it after batch reclamation.
+            std::mem::forget(reservation);
+        }
+    }
+}
+
+struct ConnectionBatchHostReservations {
+    _control: Option<AudioControlBatchReservation>,
+    _connections:
+        ArrayVec<SharedAudioGraphConnectionReservation, MAX_INJECTED_EXPLICIT_CONNECTIONS>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -638,7 +682,7 @@ impl InjectedConnectionRegistryInner {
         destination: &InjectedConnectionEndpoint,
         output: usize,
         input: usize,
-        host_reservation: Option<AudioControlBatchReservationProvider>,
+        host_reservation: InjectedConnectReservationProvider,
     ) -> Result<InjectedConnectionOperationOutcome, InjectedConnectionOperationError> {
         let owner =
             validate_endpoints(control, node_ids, exact_registry, source, Some(destination))?;
@@ -683,7 +727,7 @@ impl InjectedConnectionRegistryInner {
             output,
             input,
         };
-        if state.edges.contains(&record) {
+        if state.edges.iter().any(|entry| entry.record == record) {
             fail_closed.disarm();
             return Ok(InjectedConnectionOperationOutcome::Noop);
         }
@@ -695,13 +739,23 @@ impl InjectedConnectionRegistryInner {
         let commands = vec![ControlMessage::InjectedConnectExplicit(expected)].into_boxed_slice();
         #[cfg(test)]
         registry.run_operation_hook_for_test(InjectedConnectionOperationTestPoint::BeforeReserve);
-        let reservation = match reserve_after_serialization(admitted, 1, host_reservation) {
-            Ok(reservation) => reservation,
+        let (host_control, graph_reservation) = match reserve_connect_host(host_reservation) {
+            Ok(reservations) => reservations,
             Err(error) => {
                 fail_closed.disarm();
                 return Err(error);
             }
         };
+        let mut connection_holds = ArrayVec::new();
+        connection_holds.extend(graph_reservation.iter().cloned());
+        let reservation =
+            match reserve_after_serialization(admitted, 1, host_control, connection_holds) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    fail_closed.disarm();
+                    return Err(error);
+                }
+            };
         let batch = reservation.into_preboxed(commands);
         #[cfg(test)]
         registry.run_operation_hook_for_test(InjectedConnectionOperationTestPoint::BeforeCommit);
@@ -742,10 +796,14 @@ impl InjectedConnectionRegistryInner {
         fail_closed.disarm();
         drop(fail_closed);
         let mut accepted_mutation = FailClosedConnectionOperation::new(&registry, control);
+        let accepted_reservation = AcceptedConnectionReservationGuard::new(graph_reservation);
         #[cfg(test)]
         registry
             .run_operation_hook_for_test(InjectedConnectionOperationTestPoint::AcceptedMutation);
-        state.edges.push(record);
+        state.edges.push(InjectedHostExplicitConnectionEntry {
+            record,
+            host_reservation: accepted_reservation.commit(),
+        });
         accepted_mutation.disarm();
         Ok(InjectedConnectionOperationOutcome::Committed(
             accepted.complete(),
@@ -810,9 +868,11 @@ impl InjectedConnectionRegistryInner {
         }
         let mut removed =
             ArrayVec::<InjectedHostExplicitConnection, MAX_INJECTED_EXPLICIT_CONNECTIONS>::new();
-        for edge in &state.edges {
-            if selector.matches(source.stamp, edge) {
-                removed.push(*edge);
+        let mut connection_holds = ArrayVec::new();
+        for entry in &state.edges {
+            if selector.matches(source.stamp, &entry.record) {
+                removed.push(entry.record);
+                connection_holds.extend(entry.host_reservation.iter().cloned());
             }
         }
         if removed.is_empty() {
@@ -837,14 +897,25 @@ impl InjectedConnectionRegistryInner {
             .into_boxed_slice();
         #[cfg(test)]
         registry.run_operation_hook_for_test(InjectedConnectionOperationTestPoint::BeforeReserve);
-        let reservation =
-            match reserve_after_serialization(admitted, removed.len(), host_reservation) {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    fail_closed.disarm();
-                    return Err(error);
-                }
-            };
+        let host_control = match reserve_disconnect_host(host_reservation, removed.len()) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                fail_closed.disarm();
+                return Err(error);
+            }
+        };
+        let reservation = match reserve_after_serialization(
+            admitted,
+            removed.len(),
+            host_control,
+            connection_holds,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                fail_closed.disarm();
+                return Err(error);
+            }
+        };
         let batch = reservation.into_preboxed(commands);
         #[cfg(test)]
         registry.run_operation_hook_for_test(InjectedConnectionOperationTestPoint::BeforeCommit);
@@ -890,7 +961,7 @@ impl InjectedConnectionRegistryInner {
         #[cfg(test)]
         registry
             .run_operation_hook_for_test(InjectedConnectionOperationTestPoint::AcceptedMutation);
-        state.edges.retain(|edge| !removed.contains(edge));
+        state.edges.retain(|entry| !removed.contains(&entry.record));
         accepted_mutation.disarm();
         Ok(InjectedConnectionOperationOutcome::Committed(
             accepted.complete(),
@@ -953,11 +1024,14 @@ impl InjectedConnectionRegistryInner {
             .lock()
             .unwrap()
             .edges
-            .push(InjectedHostExplicitConnection {
-                source,
-                destination,
-                output: 0,
-                input: 0,
+            .push(InjectedHostExplicitConnectionEntry {
+                record: InjectedHostExplicitConnection {
+                    source,
+                    destination,
+                    output: 0,
+                    input: 0,
+                },
+                host_reservation: None,
             });
     }
 
@@ -1012,15 +1086,21 @@ fn validate_endpoints(
 fn reserve_after_serialization(
     mut admitted: super::injected_control::AdmittedGraphOperation,
     command_count: usize,
-    host_reservation: Option<AudioControlBatchReservationProvider>,
+    host_control: Option<AudioControlBatchReservation>,
+    connection_holds: ArrayVec<
+        SharedAudioGraphConnectionReservation,
+        MAX_INJECTED_EXPLICIT_CONNECTIONS,
+    >,
 ) -> Result<super::injected_control::ControlBatchReservation, InjectedConnectionOperationError> {
-    let host_reservation = match host_reservation {
-        Some(provider) => Some(
-            provider
-                .reserve(command_count)
-                .ok_or(InjectedConnectionOperationError::HostReservationRejected)?,
-        ),
-        None => None,
+    let host_reservation = if host_control.is_some() || !connection_holds.is_empty() {
+        Some(AudioControlBatchReservation::new(
+            ConnectionBatchHostReservations {
+                _control: host_control,
+                _connections: connection_holds,
+            },
+        ))
+    } else {
+        None
     };
     loop {
         match admitted.reserve_commands(command_count) {
@@ -1041,6 +1121,48 @@ fn reserve_after_serialization(
             }
         }
     }
+}
+
+fn reserve_connect_host(
+    provider: InjectedConnectReservationProvider,
+) -> Result<
+    (
+        Option<AudioControlBatchReservation>,
+        Option<SharedAudioGraphConnectionReservation>,
+    ),
+    InjectedConnectionOperationError,
+> {
+    match provider {
+        InjectedConnectReservationProvider::None => Ok((None, None)),
+        InjectedConnectReservationProvider::Control(provider) => provider
+            .reserve(1)
+            .map(|reservation| (Some(reservation), None))
+            .ok_or(InjectedConnectionOperationError::HostReservationRejected),
+        InjectedConnectReservationProvider::Explicit(provider) => {
+            let reservation = provider
+                .reserve()
+                .ok_or(InjectedConnectionOperationError::HostReservationRejected)?;
+            Ok((
+                Some(reservation.control),
+                Some(SharedAudioGraphConnectionReservation::new(
+                    reservation.graph,
+                )),
+            ))
+        }
+    }
+}
+
+fn reserve_disconnect_host(
+    provider: Option<AudioControlBatchReservationProvider>,
+    command_count: usize,
+) -> Result<Option<AudioControlBatchReservation>, InjectedConnectionOperationError> {
+    provider
+        .map(|provider| {
+            provider
+                .reserve(command_count)
+                .ok_or(InjectedConnectionOperationError::HostReservationRejected)
+        })
+        .transpose()
 }
 
 struct InjectedIncidentConnectionCleanup {
@@ -1067,7 +1189,7 @@ impl InjectedNodeReclaimCleanup for InjectedIncidentConnectionCleanup {
         };
         state
             .edges
-            .retain(|edge| !edge.is_incident_to(self.endpoint));
+            .retain(|entry| !entry.record.is_incident_to(self.endpoint));
         Ok(())
     }
 }

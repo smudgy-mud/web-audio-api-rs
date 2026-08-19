@@ -24,7 +24,9 @@ use super::injected_node_lifetime::{
     NodeLifetimeDriveOutcome,
 };
 use super::{
-    AudioContextRegistration, AudioContextState, AudioNodeId, ConcreteBaseAudioContext,
+    AudioContextRegistration, AudioContextState, AudioControlBatchReservation,
+    AudioExplicitConnectionReservation, AudioExplicitConnectionReservationProvider,
+    AudioGraphConnectionReservation, AudioNodeId, ConcreteBaseAudioContext,
     InjectedContextAdmissionGate,
 };
 use crate::events::{EventDispatch, EventLoop};
@@ -1000,6 +1002,14 @@ fn post_seal_duplicate_and_no_match_are_rejected_before_noop_inspection() {
 
 #[test]
 fn incident_cleanup_wins_serializer_then_stale_generation_cannot_send_after_id_reuse() {
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     let mut harness = Harness::new(8);
     harness.install_persistent_destination_for_recycle_test();
     let source = GainNode::new(harness.base(), GainOptions::default());
@@ -1019,12 +1029,31 @@ fn incident_cleanup_wins_serializer_then_stale_generation_cannot_send_after_id_r
         .clone();
     let exact_base = harness.base().clone();
     let constructor = exact_base.injected_node_constructor().unwrap();
+    let graph_reservation_dropped = Arc::new(AtomicBool::new(false));
+    let control_reservation_dropped = Arc::new(AtomicBool::new(false));
     constructor
-        .connect_exact(&source_cap, &destination_cap, 0, 0)
+        .connect_exact_with_explicit_reservation(
+            &source_cap,
+            &destination_cap,
+            0,
+            0,
+            AudioExplicitConnectionReservationProvider::new({
+                let graph_reservation_dropped = Arc::clone(&graph_reservation_dropped);
+                let control_reservation_dropped = Arc::clone(&control_reservation_dropped);
+                move || {
+                    Some(AudioExplicitConnectionReservation::new(
+                        AudioGraphConnectionReservation::new(DropProbe(graph_reservation_dropped)),
+                        AudioControlBatchReservation::new(DropProbe(control_reservation_dropped)),
+                    ))
+                }
+            }),
+        )
         .unwrap();
     harness.callback();
     harness.wait_for_transport_idle();
     assert_eq!(constructor.connection_edge_count_for_test(), 1);
+    assert!(!graph_reservation_dropped.load(Ordering::Acquire));
+    assert!(control_reservation_dropped.load(Ordering::Acquire));
 
     let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
     let (release_send, release_recv) = crossbeam_channel::bounded(1);
@@ -1048,6 +1077,7 @@ fn incident_cleanup_wins_serializer_then_stale_generation_cannot_send_after_id_r
     drop(source);
     harness.drive_node_lifetimes_until_counts([SLOT_CAPACITY - 2, 0, 2, 0, 0, 0]);
     assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    assert!(graph_reservation_dropped.load(Ordering::Acquire));
     let replacement = GainNode::new(harness.base(), GainOptions::default());
     assert_eq!(replacement.registration().id(), source_id);
     harness.callback();
@@ -1064,6 +1094,118 @@ fn incident_cleanup_wins_serializer_then_stale_generation_cannot_send_after_id_r
         sequence_before_stale_release
     );
     assert_eq!(constructor.connection_edge_count_for_test(), 0);
+}
+
+#[test]
+fn not_accepted_explicit_connect_releases_both_host_reservations_without_mirror_mutation() {
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    let mut harness = Harness::new(8);
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let source_cap = source
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_cap = destination
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+    let sequence_before = constructor.last_submitted_batch_sequence();
+    let graph_reservation_dropped = Arc::new(AtomicBool::new(false));
+    let control_reservation_dropped = Arc::new(AtomicBool::new(false));
+
+    let (commit_send, commit_recv) = crossbeam_channel::bounded(1);
+    let (commit_release_send, commit_release_recv) = crossbeam_channel::bounded(1);
+    constructor.hold_connection_operation_for_test(
+        InjectedConnectionOperationTestPoint::BeforeCommit,
+        commit_send,
+        commit_release_recv,
+        false,
+    );
+    let (rollback_send, rollback_recv) = crossbeam_channel::bounded(1);
+    let (rollback_release_send, rollback_release_recv) = crossbeam_channel::bounded(1);
+    constructor.hold_connection_operation_for_test(
+        InjectedConnectionOperationTestPoint::RejectedRollback,
+        rollback_send,
+        rollback_release_recv,
+        false,
+    );
+    let operation_base = harness.base().clone();
+    let recovery_source_cap = source_cap.clone();
+    let recovery_destination_cap = destination_cap.clone();
+    let operation_graph_reservation_dropped = Arc::clone(&graph_reservation_dropped);
+    let operation_control_reservation_dropped = Arc::clone(&control_reservation_dropped);
+    let operation = thread::spawn(move || {
+        operation_base
+            .injected_node_constructor()
+            .unwrap()
+            .connect_exact_with_explicit_reservation(
+                &source_cap,
+                &destination_cap,
+                0,
+                0,
+                AudioExplicitConnectionReservationProvider::new(move || {
+                    Some(AudioExplicitConnectionReservation::new(
+                        AudioGraphConnectionReservation::new(DropProbe(
+                            operation_graph_reservation_dropped,
+                        )),
+                        AudioControlBatchReservation::new(DropProbe(
+                            operation_control_reservation_dropped,
+                        )),
+                    ))
+                }),
+            )
+    });
+    commit_recv.recv().unwrap();
+    assert_eq!(harness.producer.accounting(), (1, 1, 1, 0));
+    assert!(!graph_reservation_dropped.load(Ordering::Acquire));
+    assert!(!control_reservation_dropped.load(Ordering::Acquire));
+
+    let (state_entered_send, state_entered_recv) = crossbeam_channel::bounded(1);
+    let (state_release_send, state_release_recv) = crossbeam_channel::bounded(1);
+    let state_producer = harness.producer.clone();
+    let state_holder = thread::spawn(move || {
+        state_producer.hold_transport_state_for_test(state_entered_send, state_release_recv);
+    });
+    state_entered_recv.recv().unwrap();
+    commit_release_send.send(()).unwrap();
+    rollback_recv.recv().unwrap();
+    assert_eq!(harness.producer.accounting(), (1, 1, 1, 0));
+    assert!(!graph_reservation_dropped.load(Ordering::Acquire));
+    assert!(!control_reservation_dropped.load(Ordering::Acquire));
+    state_release_send.send(()).unwrap();
+    state_holder.join().unwrap();
+    rollback_release_send.send(()).unwrap();
+
+    assert_eq!(
+        operation.join().unwrap(),
+        Err(InjectedConnectionOperationError::Control(
+            super::injected_control::InjectedControlError::Contended
+        ))
+    );
+    assert!(graph_reservation_dropped.load(Ordering::Acquire));
+    assert!(control_reservation_dropped.load(Ordering::Acquire));
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    assert_eq!(constructor.last_submitted_batch_sequence(), sequence_before);
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+
+    assert!(matches!(
+        constructor.connect_exact(&recovery_source_cap, &recovery_destination_cap, 0, 0),
+        Ok(InjectedConnectionOperationOutcome::Committed(_))
+    ));
 }
 
 #[test]
@@ -1367,6 +1509,14 @@ fn rejected_rollback_panic_keeps_failure_admission_until_fail_closed_latch() {
 
 #[test]
 fn accepted_mirror_panic_latches_before_accepted_admission_and_keeps_payload_queue_owned() {
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     let mut harness = Harness::new(8);
     let source = GainNode::new(harness.base(), GainOptions::default());
     let destination = GainNode::new(harness.base(), GainOptions::default());
@@ -1384,6 +1534,7 @@ fn accepted_mirror_panic_latches_before_accepted_admission_and_keeps_payload_que
         .clone();
     let exact_base = harness.base().clone();
     let constructor = exact_base.injected_node_constructor().unwrap();
+    let graph_reservation_dropped = Arc::new(AtomicBool::new(false));
     let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
     let (release_send, release_recv) = crossbeam_channel::bounded(1);
     constructor.hold_connection_operation_for_test(
@@ -1393,12 +1544,29 @@ fn accepted_mirror_panic_latches_before_accepted_admission_and_keeps_payload_que
         true,
     );
     let operation_base = harness.base().clone();
+    let operation_graph_reservation_dropped = Arc::clone(&graph_reservation_dropped);
     let operation = thread::spawn(move || {
         panic::catch_unwind(AssertUnwindSafe(|| {
             operation_base
                 .injected_node_constructor()
                 .unwrap()
-                .connect_exact(&source_cap, &destination_cap, 0, 0)
+                .connect_exact_with_explicit_reservation(
+                    &source_cap,
+                    &destination_cap,
+                    0,
+                    0,
+                    AudioExplicitConnectionReservationProvider::new({
+                        let graph_reservation_dropped = operation_graph_reservation_dropped;
+                        move || {
+                            Some(AudioExplicitConnectionReservation::new(
+                                AudioGraphConnectionReservation::new(DropProbe(
+                                    graph_reservation_dropped,
+                                )),
+                                AudioControlBatchReservation::new(()),
+                            ))
+                        }
+                    }),
+                )
         }))
     });
     entered_recv.recv().unwrap();
@@ -1439,6 +1607,10 @@ fn accepted_mirror_panic_latches_before_accepted_admission_and_keeps_payload_que
         );
         thread::yield_now();
     }
+    assert!(
+        !graph_reservation_dropped.load(Ordering::Acquire),
+        "irrevocably accepted edge accounting must stay quarantined after mirror unwind"
+    );
 }
 
 #[test]

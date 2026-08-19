@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use crate::context::{
-    AudioContextRegistration, AudioControlBatchReservationProvider, ConcreteBaseAudioContext,
+    AudioContextRegistration, AudioControlBatchReservationProvider,
+    AudioExplicitConnectionReservationProvider, ConcreteBaseAudioContext,
 };
 use crate::events::{ErrorEvent, EventHandler, EventPayload, EventType};
 use crate::message::ControlMessage;
@@ -385,6 +386,50 @@ pub trait AudioNode {
                 input,
                 provider,
             );
+        dest
+    }
+
+    /// Connects two exact hosted nodes and lazily acquires both live-edge and command accounting
+    /// only when the edge is not already represented.
+    ///
+    /// The provider is dropped unused for a duplicate edge. On success, its explicit-connection
+    /// reservation remains in the engine's authoritative host registry until renderer-applied
+    /// disconnect, incident pruning, or whole-graph retirement; its control reservation follows
+    /// the connect batch. This method is intended for hosted embedders that account both live
+    /// graph edges and bounded control work.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a legacy context, invalid endpoint or port, rejected host reservation, or a
+    /// terminal exact transaction failure.
+    fn connect_from_output_to_input_with_reservations<'a>(
+        &self,
+        dest: &'a dyn AudioNode,
+        output: usize,
+        input: usize,
+        provider: AudioExplicitConnectionReservationProvider,
+    ) -> &'a dyn AudioNode {
+        assert!(
+            self.context() == dest.context(),
+            "InvalidAccessError - Attempting to connect nodes from different contexts",
+        );
+        assert!(
+            self.number_of_outputs() > output,
+            "IndexSizeError - output port {} is out of bounds",
+            output
+        );
+        assert!(
+            dest.number_of_inputs() > input,
+            "IndexSizeError - input port {} is out of bounds",
+            input
+        );
+        self.context().connect_registrations_with_reservations(
+            self.registration(),
+            dest.registration(),
+            output,
+            input,
+            provider,
+        );
         dest
     }
 

@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 use arrayvec::ArrayVec;
 
 use super::injected_connections::{
-    InjectedConnectionEndpoint, InjectedConnectionEndpointKind, InjectedConnectionOperationError,
-    InjectedConnectionOperationOutcome, InjectedConnectionRegistryInner,
-    InjectedDisconnectSelector,
+    InjectedConnectReservationProvider, InjectedConnectionEndpoint, InjectedConnectionEndpointKind,
+    InjectedConnectionOperationError, InjectedConnectionOperationOutcome,
+    InjectedConnectionRegistryInner, InjectedDisconnectSelector,
 };
 use super::injected_control::{
     AcceptedBatchFinalizeFailure, CommitControlOutcome, CommitWithFinalizeFailure,
@@ -31,7 +31,8 @@ use super::injected_node_lifetime::{
 };
 use super::{
     AudioContextRegistration, AudioControlBatchReservation, AudioControlBatchReservationProvider,
-    AudioNodeId, AudioNodeLifetimeReservation, SharedAudioNodeLifetimeReservation,
+    AudioExplicitConnectionReservationProvider, AudioNodeId, AudioNodeLifetimeReservation,
+    SharedAudioNodeLifetimeReservation,
 };
 use crate::events::{ExactEndedEventKey, InjectedExactEndedEventTarget};
 use crate::message::ControlMessage;
@@ -1507,7 +1508,7 @@ impl InjectedNodeConstructor {
             destination,
             output,
             input,
-            None,
+            InjectedConnectReservationProvider::None,
         )
     }
 
@@ -1527,7 +1528,27 @@ impl InjectedNodeConstructor {
             destination,
             output,
             input,
-            Some(host_reservation),
+            InjectedConnectReservationProvider::Control(host_reservation),
+        )
+    }
+
+    pub(crate) fn connect_exact_with_explicit_reservation(
+        &self,
+        source: &InjectedConnectionEndpoint,
+        destination: &InjectedConnectionEndpoint,
+        output: usize,
+        input: usize,
+        host_reservation: AudioExplicitConnectionReservationProvider,
+    ) -> Result<InjectedConnectionOperationOutcome, InjectedConnectionOperationError> {
+        InjectedConnectionRegistryInner::connect(
+            &self.control,
+            &self.allocator.identity(),
+            &self.lifetimes.registry_identity(),
+            source,
+            destination,
+            output,
+            input,
+            InjectedConnectReservationProvider::Explicit(host_reservation),
         )
     }
 

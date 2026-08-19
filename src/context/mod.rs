@@ -61,10 +61,13 @@ mod online;
 pub use online::*;
 
 mod resource;
-pub(crate) use resource::SharedAudioNodeLifetimeReservation;
 pub use resource::{
     AudioControlBatchReservation, AudioControlBatchReservationProvider,
-    AudioNodeLifetimeReservation,
+    AudioExplicitConnectionReservation, AudioExplicitConnectionReservationProvider,
+    AudioGraphConnectionReservation, AudioNodeLifetimeReservation,
+};
+pub(crate) use resource::{
+    SharedAudioGraphConnectionReservation, SharedAudioNodeLifetimeReservation,
 };
 
 mod hosted;
