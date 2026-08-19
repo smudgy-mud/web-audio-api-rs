@@ -23,14 +23,16 @@ use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 ///
 /// Legacy and offline contexts retain their blocking sender behavior. The private injected form
 /// never exposes its raw sender: every attempt first acquires a short admission and holds it until
-/// a rejected record has been destroyed on the caller thread. Render-owned event producers keep a
-/// separate raw sender in `RenderThreadInit` and deliberately do not use this capability.
+/// a rejected record has been destroyed on the caller thread. In B3b this injected variant is
+/// test-only: the production render path consumes a single-use opaque producer, and a future
+/// concrete context must receive an admission-gated branch from the same exact bootstrap.
 #[derive(Clone)]
 pub(crate) struct ControlEventDispatch {
     mode: ControlEventDispatchMode,
 }
 
 #[derive(Clone)]
+#[allow(dead_code)] // injected variants remain private migration-test scaffolding in B3b
 enum ControlEventDispatchMode {
     Legacy(Sender<EventDispatch>),
     Injected {
@@ -61,7 +63,9 @@ impl ControlEventDispatch {
         Self::legacy(sender)
     }
 
-    #[allow(dead_code)] // selected by the pending private injected AudioContext constructor
+    /// Test-only precursor to the future exact event-bootstrap split. Production B3b never
+    /// accepts a raw control-side event sender.
+    #[cfg(test)]
     pub(crate) fn injected(
         sender: Sender<EventDispatch>,
         gate: InjectedContextAdmissionGate,
@@ -271,6 +275,7 @@ struct LegacyGraphControl {
 // The whole base is already behind one Arc; boxing legacy state again would add an allocation to
 // every existing context merely to shrink this private discriminated field.
 #[allow(clippy::large_enum_variant)]
+#[allow(dead_code)] // injected base selection remains test-only until the public context slice
 enum ConcreteGraphControl {
     Legacy(LegacyGraphControl),
     /// Exact branded batch/id/lifetime capability; deliberately contains no raw render sender or
@@ -340,7 +345,7 @@ impl ConcreteBaseAudioContext {
     /// Event-injection seam used by the existing context migration. Graph construction remains
     /// entirely legacy here; in particular the resulting base still owns a raw render sender and
     /// legacy ID provider.
-    #[allow(dead_code)] // selected by the pending private injected AudioContext constructor
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_injected(
         sample_rate: f32,
@@ -483,7 +488,7 @@ impl ConcreteBaseAudioContext {
     /// remain callable, but listener creation, other node constructors, explicit connections, and
     /// post-construction automation panic instead of falling back to a raw sender. A complete
     /// injected AudioContext is deferred, and no public path can select this base in this slice.
-    #[allow(dead_code)] // exercised by private Gain integration tests in this slice
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_injected_node_construction_base(
         sample_rate: f32,

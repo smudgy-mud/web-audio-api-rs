@@ -1,11 +1,11 @@
 //! Audio processing code that runs on the audio rendering thread
 use crate::context::{AudioNodeId, AudioParamId};
 use crate::events::{AudioProcessingEvent, ErrorEvent, EventDispatch};
+use crate::render::thread::EventDispatchSender;
 use crate::{AudioBuffer, Event, RENDER_QUANTUM_SIZE};
 
 use super::{graph::Node, AudioRenderQuantum, NodeCollection};
 
-use crossbeam_channel::Sender;
 use std::cell::Cell;
 
 use std::any::Any;
@@ -23,7 +23,7 @@ pub struct AudioWorkletGlobalScope {
     pub sample_rate: f32,
 
     pub(crate) node_id: Cell<AudioNodeId>,
-    pub(crate) event_sender: Sender<EventDispatch>,
+    pub(crate) event_sender: EventDispatchSender,
 }
 
 impl std::fmt::Debug for AudioWorkletGlobalScope {

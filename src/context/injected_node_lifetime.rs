@@ -4,8 +4,8 @@
 //! and live registrations retain only a weak registry capability; a unique lifecycle-side owner
 //! holds the fixed slot storage, exact graph-reclaim owner, and authoritative wake receivers.
 //! No ordinary graph-control credit is retained for a node lifetime. Requested teardown is driven
-//! explicitly by the lifecycle caller through bounded, retryable operations; this slice does not
-//! create a worker or wire a public context constructor.
+//! explicitly through bounded, retryable operations. B3b's private output lifecycle worker drives
+//! those operations automatically; wiring a public injected context remains deferred.
 
 #![allow(dead_code)]
 
@@ -15,18 +15,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 
 use super::injected_control::{
-    AcceptedBatchFinalizeError, DrainedControlClose, ExactBoundInjectedRenderer,
-    ExactInjectedRenderPairFailure, InjectedControlIdentity, InjectedControlLifecycleOwner,
-    InjectedControlProducer, InjectedNodeLifetimeBootstrap,
+    AcceptedBatchFinalizeError, BeginControlCloseFailure, ControlCloseDegradation,
+    ControlCloseRetirement, DrainedControlClose, ExactBoundInjectedRenderer,
+    ExactInjectedRenderPairFailure, ExtractedControlPayloads, FinishControlCloseFailure,
+    InjectedControlError, InjectedControlIdentity, InjectedControlLifecycleOwner,
+    InjectedControlProducer, InjectedNodeLifetimeBootstrap, ObserveControlCloseFailure,
+    SubmittedControlClose,
 };
 use super::injected_ids::{
     InjectedGraphReclaimInit, InjectedNodeIdAllocator, InjectedNodeIdIdentity, InjectedNodeIdOwner,
     OwnedPendingNodeReclaim,
 };
 use super::AudioNodeId;
+use crate::events::InjectedJoinableEventLoop;
 use crate::output::{
     AudioOutputError, AudioOutputEventSink, AudioRenderCallback, AudioRenderFormat,
-    AudioRenderOwner,
+    AudioRenderOwner, EndpointShutdownConfirmed,
 };
 
 mod teardown;
@@ -217,6 +221,11 @@ pub(crate) struct InjectedNodeLifetimeRegistrar {
     inner: Weak<NodeLifetimeInner>,
 }
 
+#[cfg(test)]
+pub(crate) struct ActiveRegistryUpgradeForTest {
+    _inner: Arc<NodeLifetimeInner>,
+}
+
 pub(crate) struct InjectedNodeLifetimeOwner {
     inner: Option<Arc<NodeLifetimeInner>>,
     request_wake: Option<crossbeam_channel::Receiver<()>>,
@@ -230,6 +239,16 @@ pub(crate) struct InjectedNodeLifetimeOwner {
 pub(crate) struct BoundInjectedOutputRenderer {
     renderer: ExactBoundInjectedRenderer,
     control: InjectedControlLifecycleOwner,
+    event_loop: InjectedJoinableEventLoop,
+}
+
+/// Eventless B3a bootstrap seam. It is test-only and structurally cannot enter B3b lifecycle
+/// startup, whose bound type always owns the exact event-loop consumer.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct TestBoundInjectedOutputRenderer {
+    renderer: ExactBoundInjectedRenderer,
+    control: InjectedControlLifecycleOwner,
 }
 
 pub(crate) struct BoundInjectedOutputPairFailure {
@@ -240,9 +259,9 @@ pub(crate) struct BoundInjectedOutputPairFailure {
 
 /// Unique lifecycle-side owner paired with one installed injected render callback.
 ///
-/// B3a deliberately provides no driver, Close transition, or whole-graph proof. Until the private
-/// lifecycle worker is added, dropping this owner quarantines the exact render, control, and
-/// node-registry authorities for the process lifetime.
+/// The private injected lifecycle worker is the only production consumer. Dropping this owner
+/// outside its consuming close typestates quarantines the exact render, control, and node-registry
+/// authorities for the process lifetime.
 #[must_use]
 pub(crate) struct InjectedOutputRenderOwner {
     render: Option<AudioRenderOwner>,
@@ -254,8 +273,13 @@ impl BoundInjectedOutputRenderer {
     pub(crate) fn new(
         renderer: ExactBoundInjectedRenderer,
         control: InjectedControlLifecycleOwner,
+        event_loop: InjectedJoinableEventLoop,
     ) -> Self {
-        Self { renderer, control }
+        Self {
+            renderer,
+            control,
+            event_loop,
+        }
     }
 
     #[cfg(test)]
@@ -263,14 +287,88 @@ impl BoundInjectedOutputRenderer {
         self.renderer.fail_next_gc_spawn_for_test();
     }
 
-    /// Installs the mandatory joinable GC and keeps every lifecycle authority inseparable from
-    /// the callback's exact render owner.
+    #[cfg(test)]
+    pub(crate) fn disconnect_lifecycle_on_next_render_for_test(&mut self) {
+        self.renderer.disconnect_lifecycle_on_next_render_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_reclaim_for_test(&mut self) {
+        self.renderer.fail_reclaim_for_test();
+    }
+
+    /// Installs callback+GC only after the exact event-loop consumer is inseparably bound.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn try_into_audio_output_pair(
+        self,
+        format: AudioRenderFormat,
+        events: AudioOutputEventSink,
+    ) -> Result<
+        (
+            InjectedOutputRenderOwner,
+            AudioRenderCallback,
+            crate::events::JoinableEventLoop,
+        ),
+        BoundInjectedOutputPairFailure,
+    > {
+        let Self {
+            renderer,
+            control,
+            event_loop,
+        } = self;
+        match renderer.try_into_audio_render_thread_pair(format, events) {
+            Ok((render, callback, node_lifetimes)) => Ok((
+                InjectedOutputRenderOwner {
+                    render: Some(render),
+                    node_lifetimes: Some(node_lifetimes),
+                    control: Some(control),
+                },
+                callback,
+                event_loop.into_event_loop(),
+            )),
+            Err(ExactInjectedRenderPairFailure {
+                error,
+                renderer,
+                events,
+            }) => Err(BoundInjectedOutputPairFailure {
+                error,
+                renderer: Self {
+                    renderer,
+                    control,
+                    event_loop,
+                },
+                events,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestBoundInjectedOutputPairFailure {
+    pub(crate) error: AudioOutputError,
+    pub(crate) renderer: TestBoundInjectedOutputRenderer,
+    pub(crate) events: AudioOutputEventSink,
+}
+
+#[cfg(test)]
+impl TestBoundInjectedOutputRenderer {
+    pub(crate) fn new(
+        renderer: ExactBoundInjectedRenderer,
+        control: InjectedControlLifecycleOwner,
+    ) -> Self {
+        Self { renderer, control }
+    }
+
+    pub(crate) fn fail_next_gc_spawn_for_test(&mut self) {
+        self.renderer.fail_next_gc_spawn_for_test();
+    }
+
     #[allow(clippy::result_large_err)]
     pub(crate) fn try_into_audio_render_thread_pair(
         self,
         format: AudioRenderFormat,
         events: AudioOutputEventSink,
-    ) -> Result<(InjectedOutputRenderOwner, AudioRenderCallback), BoundInjectedOutputPairFailure>
+    ) -> Result<(InjectedOutputRenderOwner, AudioRenderCallback), TestBoundInjectedOutputPairFailure>
     {
         match self
             .renderer
@@ -288,7 +386,7 @@ impl BoundInjectedOutputRenderer {
                 error,
                 renderer,
                 events,
-            }) => Err(BoundInjectedOutputPairFailure {
+            }) => Err(TestBoundInjectedOutputPairFailure {
                 error,
                 renderer: Self {
                     renderer,
@@ -330,6 +428,454 @@ impl InjectedOutputRenderOwner {
         )
     }
 }
+
+pub(crate) struct BeginInjectedOutputCloseFailure {
+    pub(crate) error: InjectedControlError,
+    owner: Option<InjectedOutputRenderOwner>,
+}
+
+#[must_use]
+pub(crate) struct InjectedOutputCloseRetirement {
+    render: Option<AudioRenderOwner>,
+    node_lifetimes: Option<InjectedNodeLifetimeOwner>,
+    control: Option<ControlCloseRetirement>,
+}
+
+#[must_use]
+pub(crate) struct DrainedInjectedOutputClose {
+    render: Option<AudioRenderOwner>,
+    node_lifetimes: Option<InjectedNodeLifetimeOwner>,
+    control: Option<DrainedControlClose>,
+}
+
+pub(crate) struct InjectedOutputSealFailure {
+    pub(crate) error: NodeLifetimeSealError,
+    render: Option<AudioRenderOwner>,
+    node_lifetimes: Option<InjectedNodeLifetimeOwner>,
+    control: Option<DrainedControlClose>,
+}
+
+pub(crate) struct InjectedOutputFinishFailure {
+    pub(crate) error: InjectedControlError,
+    payloads: Option<ExtractedControlPayloads>,
+    render: Option<AudioRenderOwner>,
+    registry: Option<SealedNodeLifetimeRegistry>,
+    degradation: ControlCloseDegradation,
+}
+
+/// Submitted Close plus staged payloads which must be retired before either ordered or silent
+/// endpoint shutdown can proceed.
+#[must_use]
+pub(crate) struct PendingExtractedInjectedOutput {
+    sealed: Option<SealedInjectedOutput>,
+    payloads: Option<ExtractedControlPayloads>,
+}
+
+pub(crate) struct InjectedPayloadRetirementFailure {
+    sealed: Option<SealedInjectedOutput>,
+}
+
+#[must_use]
+pub(crate) struct SealedInjectedOutput {
+    render: Option<AudioRenderOwner>,
+    registry: Option<SealedNodeLifetimeRegistry>,
+    close: Option<SubmittedControlClose>,
+    degradation: ControlCloseDegradation,
+}
+
+pub(crate) enum InjectedCloseObservation {
+    Pending(SealedInjectedOutput),
+    Applied(ReadyForInjectedPhysicalReclaim),
+    Terminal(SealedInjectedOutput),
+}
+
+/// Admission is drained, staging is extracted and retired, and endpoint shutdown may now begin.
+/// `close_applied` distinguishes the ordered graceful route from the silent physical-only route.
+#[must_use]
+pub(crate) struct ReadyForInjectedPhysicalReclaim {
+    render: Option<AudioRenderOwner>,
+    registry: Option<SealedNodeLifetimeRegistry>,
+    close: Option<SubmittedControlClose>,
+    degradation: ControlCloseDegradation,
+    close_applied: bool,
+}
+
+pub(crate) enum InjectedRenderReclaimOutcome {
+    Reclaimed(ReclaimedInjectedGraph),
+    Degraded {
+        registry: SealedNodeLifetimeRegistry,
+        error: AudioOutputError,
+        degradation: ControlCloseDegradation,
+        close_applied: bool,
+    },
+    CallbackRetained(ReadyForInjectedPhysicalReclaim),
+}
+
+/// Exact post-render proof remains inseparable from its registry until node retirement succeeds.
+#[must_use]
+pub(crate) struct ReclaimedInjectedGraph {
+    registry: Option<SealedNodeLifetimeRegistry>,
+    proof: Option<WholeGraphRetired>,
+    degradation: ControlCloseDegradation,
+    close_applied: bool,
+}
+
+pub(crate) enum InjectedNodeRetireOutcome {
+    Retired(RetiredInjectedGraph),
+    Retry(ReclaimedInjectedGraph),
+    Terminal(ReclaimedInjectedGraph),
+}
+
+pub(crate) struct RetiredInjectedGraph {
+    nodes: WholeGraphNodeRetirement,
+    degradation: ControlCloseDegradation,
+    close_applied: bool,
+    retired: (),
+}
+
+impl RetiredInjectedGraph {
+    pub(crate) fn nodes(&self) -> WholeGraphNodeRetirement {
+        self.nodes
+    }
+
+    pub(crate) fn control_degradation(&self) -> ControlCloseDegradation {
+        self.degradation
+    }
+
+    pub(crate) fn close_applied(&self) -> bool {
+        self.close_applied
+    }
+}
+
+impl InjectedOutputRenderOwner {
+    pub(crate) fn try_drive_node_lifetimes(&mut self) -> NodeLifetimeDriveOutcome {
+        self.node_lifetimes
+            .as_mut()
+            .expect("open injected output retains node lifetimes")
+            .try_drive_once()
+    }
+
+    pub(crate) fn wait_for_node_lifetime_activity(&self) -> NodeLifetimeActivity {
+        let control = self
+            .control
+            .as_ref()
+            .expect("open injected output retains control lifecycle");
+        self.node_lifetimes
+            .as_ref()
+            .expect("open injected output retains node lifetimes")
+            .wait_for_activity(control.credit_activity_receiver())
+    }
+
+    #[allow(clippy::result_large_err)] // contention returns the exact unboxed owner for retry
+    pub(crate) fn try_begin_close(
+        mut self,
+    ) -> Result<InjectedOutputCloseRetirement, BeginInjectedOutputCloseFailure> {
+        let control = self.control.take().unwrap();
+        let control = match control.try_begin_close() {
+            Ok(control) => control,
+            Err(BeginControlCloseFailure { error, owner }) => {
+                self.control = Some(owner);
+                return Err(BeginInjectedOutputCloseFailure {
+                    error,
+                    owner: Some(self),
+                });
+            }
+        };
+        Ok(InjectedOutputCloseRetirement {
+            render: self.render.take(),
+            node_lifetimes: self.node_lifetimes.take(),
+            control: Some(control),
+        })
+    }
+
+    pub(crate) fn quarantine_into_render_owner(mut self) -> AudioRenderOwner {
+        let render = self.render.take().unwrap();
+        std::mem::forget(self);
+        render
+    }
+}
+
+impl BeginInjectedOutputCloseFailure {
+    pub(crate) fn into_owner(mut self) -> InjectedOutputRenderOwner {
+        self.owner.take().unwrap()
+    }
+
+    pub(crate) fn quarantine_into_render_owner(mut self) -> AudioRenderOwner {
+        let owner = self.owner.take().unwrap();
+        std::mem::forget(self);
+        owner.quarantine_into_render_owner()
+    }
+}
+
+impl InjectedOutputCloseRetirement {
+    pub(crate) fn retire_and_wait(mut self) -> DrainedInjectedOutputClose {
+        let (_snapshot, control) = self.control.take().unwrap().retire_and_wait();
+        DrainedInjectedOutputClose {
+            render: self.render.take(),
+            node_lifetimes: self.node_lifetimes.take(),
+            control: Some(control),
+        }
+    }
+}
+
+impl DrainedInjectedOutputClose {
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn seal_and_finish(
+        mut self,
+    ) -> Result<
+        PendingExtractedInjectedOutput,
+        Result<InjectedOutputSealFailure, InjectedOutputFinishFailure>,
+    > {
+        let node_lifetimes = self.node_lifetimes.take().unwrap();
+        let registry = match node_lifetimes.seal_after_control_drain(self.control.as_ref().unwrap())
+        {
+            Ok(registry) => registry,
+            Err(NodeLifetimeSealFailure { error, owner }) => {
+                return Err(Ok(InjectedOutputSealFailure {
+                    error,
+                    render: self.render.take(),
+                    node_lifetimes: Some(owner),
+                    control: self.control.take(),
+                }));
+            }
+        };
+        match self.control.take().unwrap().finish() {
+            Ok(transport) => Ok(PendingExtractedInjectedOutput {
+                sealed: Some(SealedInjectedOutput {
+                    render: self.render.take(),
+                    registry: Some(registry),
+                    close: Some(transport.close),
+                    degradation: transport.degradation,
+                }),
+                payloads: Some(transport.payloads),
+            }),
+            Err(FinishControlCloseFailure {
+                error,
+                payloads,
+                degradation,
+            }) => Err(Err(InjectedOutputFinishFailure {
+                error,
+                payloads: Some(payloads),
+                render: self.render.take(),
+                registry: Some(registry),
+                degradation,
+            })),
+        }
+    }
+}
+
+impl PendingExtractedInjectedOutput {
+    #[allow(clippy::result_large_err)] // recovery retains the exact sealed authority unboxed
+    pub(crate) fn retire_payloads(
+        mut self,
+    ) -> Result<SealedInjectedOutput, InjectedPayloadRetirementFailure> {
+        let retirement = self.payloads.take().unwrap().retire_off_thread();
+        let sealed = self.sealed.take().unwrap();
+        if retirement.panicked {
+            Err(InjectedPayloadRetirementFailure {
+                sealed: Some(sealed),
+            })
+        } else {
+            Ok(sealed)
+        }
+    }
+}
+
+impl InjectedOutputFinishFailure {
+    #[allow(clippy::result_large_err)] // recovery retains the exact sealed authority unboxed
+    pub(crate) fn retire_payloads_for_silent(
+        mut self,
+    ) -> Result<ReadyForInjectedPhysicalReclaim, InjectedPayloadRetirementFailure> {
+        let retirement = self.payloads.take().unwrap().retire_off_thread();
+        if retirement.panicked {
+            let sealed = SealedInjectedOutput {
+                render: self.render.take(),
+                registry: self.registry.take(),
+                close: None,
+                degradation: self.degradation,
+            };
+            Err(InjectedPayloadRetirementFailure {
+                sealed: Some(sealed),
+            })
+        } else {
+            Ok(ReadyForInjectedPhysicalReclaim {
+                render: self.render.take(),
+                registry: self.registry.take(),
+                close: None,
+                degradation: self.degradation,
+                close_applied: false,
+            })
+        }
+    }
+}
+
+impl SealedInjectedOutput {
+    pub(crate) fn close_wake_receiver(&self) -> &crossbeam_channel::Receiver<()> {
+        self.close.as_ref().unwrap().wake_receiver()
+    }
+
+    pub(crate) fn begin_render_shutdown(&self) {
+        self.render.as_ref().unwrap().begin_shutdown();
+    }
+
+    pub(crate) fn render_callback_quiescent(&self) -> bool {
+        self.render.as_ref().unwrap().callback_producer_quiescent()
+    }
+
+    pub(crate) fn try_observe_close(mut self) -> InjectedCloseObservation {
+        match self.close.take().unwrap().try_observe_exact() {
+            Ok(_observed) => InjectedCloseObservation::Applied(ReadyForInjectedPhysicalReclaim {
+                render: self.render.take(),
+                registry: self.registry.take(),
+                close: None,
+                degradation: self.degradation,
+                close_applied: true,
+            }),
+            Err(ObserveControlCloseFailure::Pending(close)) => {
+                self.close = Some(close);
+                InjectedCloseObservation::Pending(self)
+            }
+            Err(ObserveControlCloseFailure::Terminal { close, .. }) => {
+                self.close = Some(close);
+                InjectedCloseObservation::Terminal(self)
+            }
+        }
+    }
+
+    pub(crate) fn into_silent_reclaim(mut self) -> ReadyForInjectedPhysicalReclaim {
+        ReadyForInjectedPhysicalReclaim {
+            render: self.render.take(),
+            registry: self.registry.take(),
+            close: self.close.take(),
+            degradation: self.degradation,
+            close_applied: false,
+        }
+    }
+
+    pub(crate) fn quarantine_into_render_owner(mut self) -> AudioRenderOwner {
+        let render = self.render.take().unwrap();
+        std::mem::forget(self);
+        render
+    }
+}
+
+impl InjectedPayloadRetirementFailure {
+    pub(crate) fn quarantine_into_render_owner(mut self) -> AudioRenderOwner {
+        let sealed = self.sealed.take().unwrap();
+        std::mem::forget(self);
+        sealed.quarantine_into_render_owner()
+    }
+}
+
+impl InjectedOutputSealFailure {
+    pub(crate) fn quarantine_into_render_owner(mut self) -> AudioRenderOwner {
+        let render = self.render.take().unwrap();
+        std::mem::forget(self);
+        render
+    }
+}
+
+impl ReadyForInjectedPhysicalReclaim {
+    pub(crate) fn begin_render_shutdown(&self) {
+        self.render.as_ref().unwrap().begin_shutdown();
+    }
+
+    pub(crate) fn render_callback_quiescent(&self) -> bool {
+        self.render.as_ref().unwrap().callback_producer_quiescent()
+    }
+
+    pub(crate) fn try_reclaim_after_shutdown(
+        mut self,
+        confirmed: EndpointShutdownConfirmed,
+    ) -> InjectedRenderReclaimOutcome {
+        let render = self.render.take().unwrap();
+        match render.try_reclaim_after_shutdown(confirmed) {
+            Err(render) => {
+                self.render = Some(render);
+                InjectedRenderReclaimOutcome::CallbackRetained(self)
+            }
+            Ok(Err(error)) => InjectedRenderReclaimOutcome::Degraded {
+                registry: self.registry.take().unwrap(),
+                error,
+                degradation: self.degradation,
+                close_applied: self.close_applied,
+            },
+            Ok(Ok(())) => {
+                let registry = self.registry.take().unwrap();
+                let inner = registry.inner.as_ref().unwrap();
+                let proof = WholeGraphRetired {
+                    registry_identity: Arc::downgrade(inner),
+                    control_identity: inner.control_identity.clone(),
+                    node_id_identity: inner.node_id_identity.clone(),
+                };
+                self.close.take();
+                InjectedRenderReclaimOutcome::Reclaimed(ReclaimedInjectedGraph {
+                    registry: Some(registry),
+                    proof: Some(proof),
+                    degradation: self.degradation,
+                    close_applied: self.close_applied,
+                })
+            }
+        }
+    }
+}
+
+impl ReclaimedInjectedGraph {
+    pub(crate) fn try_retire_nodes(mut self) -> InjectedNodeRetireOutcome {
+        let registry = self.registry.take().unwrap();
+        let proof = self.proof.take().unwrap();
+        match registry.retire_after_whole_graph(proof) {
+            Ok(nodes) => InjectedNodeRetireOutcome::Retired(RetiredInjectedGraph {
+                nodes,
+                degradation: self.degradation,
+                close_applied: self.close_applied,
+                retired: (),
+            }),
+            Err(WholeGraphNodeRetireFailure {
+                error,
+                registry,
+                proof,
+            }) => {
+                self.registry = Some(registry);
+                self.proof = Some(proof);
+                match error {
+                    WholeGraphNodeRetireError::ActiveRegistryUpgrade => {
+                        InjectedNodeRetireOutcome::Retry(self)
+                    }
+                    WholeGraphNodeRetireError::ForeignProof => {
+                        InjectedNodeRetireOutcome::Terminal(self)
+                    }
+                }
+            }
+        }
+    }
+}
+
+macro_rules! quarantine_drop {
+    ($type:ty, $($field:ident),+ $(,)?) => {
+        impl Drop for $type {
+            fn drop(&mut self) {
+                $(forget_option(&mut self.$field);)+
+            }
+        }
+    };
+}
+
+quarantine_drop!(BeginInjectedOutputCloseFailure, owner);
+quarantine_drop!(
+    InjectedOutputCloseRetirement,
+    render,
+    node_lifetimes,
+    control
+);
+quarantine_drop!(DrainedInjectedOutputClose, render, node_lifetimes, control);
+quarantine_drop!(InjectedOutputSealFailure, render, node_lifetimes, control);
+quarantine_drop!(InjectedOutputFinishFailure, payloads, render, registry);
+quarantine_drop!(PendingExtractedInjectedOutput, sealed, payloads);
+quarantine_drop!(InjectedPayloadRetirementFailure, sealed);
+quarantine_drop!(SealedInjectedOutput, render, registry, close);
+quarantine_drop!(ReadyForInjectedPhysicalReclaim, render, registry, close);
+quarantine_drop!(ReclaimedInjectedGraph, registry, proof);
 
 pub(crate) fn injected_node_lifetime_registry(
     capacity: usize,
@@ -436,6 +982,33 @@ pub(crate) struct NodeRegistrationFailure {
 }
 
 impl InjectedNodeLifetimeRegistrar {
+    #[cfg(test)]
+    pub(crate) fn hold_active_registry_upgrade_for_test(
+        &self,
+    ) -> Option<ActiveRegistryUpgradeForTest> {
+        self.inner
+            .upgrade()
+            .map(|inner| ActiveRegistryUpgradeForTest { _inner: inner })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn slot_phase_counts_for_test(&self) -> Option<[usize; 6]> {
+        let inner = self.inner.upgrade()?;
+        let mut counts = [0; 6];
+        for slot in &inner.slots {
+            let index = match SlotPhase::from_word(slot.word.load(Ordering::Acquire)) {
+                SlotPhase::Vacant => 0,
+                SlotPhase::Provisional => 1,
+                SlotPhase::Live => 2,
+                SlotPhase::Requested => 3,
+                SlotPhase::Quarantined => 4,
+                _ => 5,
+            };
+            counts[index] += 1;
+        }
+        Some(counts)
+    }
+
     /// Exact constructor branding: this registry was built from the same control transport and
     /// node-id owner represented by these two weak construction capabilities.
     pub(crate) fn matches_constructor(
@@ -1224,9 +1797,9 @@ impl SealedNodeLifetimeRegistry {
         self.registry_quarantined
     }
 
-    /// Releases all remaining bounded slot payloads only after a future lifecycle integration has
-    /// proved the renderer, graph, and GC are retired. No production constructor for that proof
-    /// exists in this slice.
+    /// Releases all remaining bounded slot payloads only after the exact injected output lifecycle
+    /// has reclaimed its renderer, whole graph, and mandatory GC sidecar. B3b mints the branded
+    /// proof internally from that consuming physical-reclaim path; callers cannot construct it.
     #[allow(clippy::result_large_err)] // a retry must retain the exact registry and proof unboxed
     pub(crate) fn retire_after_whole_graph(
         mut self,
@@ -1336,8 +1909,8 @@ impl Drop for SealedNodeLifetimeRegistry {
     }
 }
 
-/// Future lifecycle proof that the injected renderer, whole graph, and mandatory GC are retired.
-/// This slice intentionally provides no production constructor.
+/// Lifecycle proof that the exact injected renderer, whole graph, and mandatory GC are retired.
+/// Its sole production constructor is the consuming B3b physical-reclaim path.
 pub(crate) struct WholeGraphRetired {
     registry_identity: Weak<NodeLifetimeInner>,
     control_identity: InjectedControlIdentity,

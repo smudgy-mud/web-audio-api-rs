@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use dasp_sample::FromSample;
 use futures_channel::{mpsc, oneshot};
 use futures_util::StreamExt as _;
@@ -21,7 +21,7 @@ use crate::context::{
     AudioContextState, AudioNodeId, InjectedGraphReclaimInit, OfflineAudioContext,
     OfflineAudioContextCallback,
 };
-use crate::events::{EventDispatch, EventLoop};
+use crate::events::{EventDispatch, EventLoop, InjectedJoinableEventLoop};
 use crate::message::{
     control_batch_storage, control_batch_storage_mut, ControlBatchApplied, ControlBatchNode,
     ControlMessage, GraphLifecycleBarrier, GraphLifecycleOutcome, GraphLifecyclePublisher,
@@ -33,6 +33,61 @@ use crate::stats::AudioStats;
 use crate::RENDER_QUANTUM_SIZE;
 
 use super::graph::Graph;
+
+/// Single-use bootstrap producer for one injected context's exact event loop.
+///
+/// Only [`RenderThread::new_injected`] can consume this non-clone capability. Bootstrap callers
+/// cannot turn it into the internally cloneable render producer or retain an ungated sender after
+/// publishing the renderer.
+pub(crate) struct InjectedEventDispatchSender {
+    sender: Sender<EventDispatch>,
+    identity: Arc<()>,
+}
+
+impl InjectedEventDispatchSender {
+    pub(crate) fn from_event_loop_pair(sender: Sender<EventDispatch>, identity: Arc<()>) -> Self {
+        Self { sender, identity }
+    }
+}
+
+/// Render-owned producer retaining either the unchanged legacy sender or an exact injected brand.
+#[derive(Clone)]
+pub(crate) struct EventDispatchSender(EventDispatchSenderKind);
+
+#[derive(Clone)]
+enum EventDispatchSenderKind {
+    Legacy(Sender<EventDispatch>),
+    Injected {
+        sender: Sender<EventDispatch>,
+        identity: Arc<()>,
+    },
+}
+
+impl EventDispatchSender {
+    fn from_injected(sender: InjectedEventDispatchSender) -> Self {
+        Self(EventDispatchSenderKind::Injected {
+            sender: sender.sender,
+            identity: sender.identity,
+        })
+    }
+
+    pub(crate) fn try_send(&self, event: EventDispatch) -> Result<(), TrySendError<EventDispatch>> {
+        match &self.0 {
+            EventDispatchSenderKind::Legacy(sender)
+            | EventDispatchSenderKind::Injected { sender, .. } => sender.try_send(event),
+        }
+    }
+
+    fn matches_injected(&self, event_loop: &InjectedJoinableEventLoop) -> bool {
+        matches!(&self.0, EventDispatchSenderKind::Injected { identity, .. } if event_loop.matches_identity(identity))
+    }
+}
+
+impl From<Sender<EventDispatch>> for EventDispatchSender {
+    fn from(sender: Sender<EventDispatch>) -> Self {
+        Self(EventDispatchSenderKind::Legacy(sender))
+    }
+}
 
 /// Operations running off the system-level audio callback
 pub(crate) struct RenderThread {
@@ -51,7 +106,7 @@ pub(crate) struct RenderThread {
     receiver_retirement: Option<llq::Node<Box<dyn Any + Send>>>,
     buffer_offset: Option<(usize, AudioRenderQuantum)>,
     stats: AudioStats,
-    event_sender: Sender<EventDispatch>,
+    event_sender: EventDispatchSender,
     garbage_collector: Option<llq::Producer<Box<dyn Any + Send>>>,
     /// Preallocated poison record; render-side shutdown must not allocate its GC notification.
     garbage_collector_termination: Option<llq::Node<Box<dyn Any + Send>>>,
@@ -65,6 +120,10 @@ pub(crate) struct RenderThread {
     graph_lifecycle_next_sequence: u64,
     #[cfg(test)]
     fail_next_gc_spawn: bool,
+    #[cfg(test)]
+    fail_reclaim: bool,
+    #[cfg(test)]
+    disconnect_lifecycle_on_next_render: bool,
 }
 
 // SAFETY:
@@ -92,6 +151,15 @@ impl std::fmt::Debug for RenderThread {
 }
 
 impl RenderThread {
+    pub(crate) fn matches_output_format(
+        &self,
+        sample_rate: f32,
+        number_of_channels: usize,
+    ) -> bool {
+        self.sample_rate.to_bits() == sample_rate.to_bits()
+            && self.number_of_channels == number_of_channels
+    }
+
     /// Installs the only graph accepted by the injected renderer foundation. Consuming the opaque
     /// initializer binds its exact reclaim queue and activity publisher; injected construction
     /// cannot create a renderer while omitting that publisher.
@@ -132,7 +200,7 @@ impl RenderThread {
         state: Arc<AtomicU8>,
         frames_played: Arc<AtomicU64>,
         stats: AudioStats,
-        event_sender: Sender<EventDispatch>,
+        event_sender: impl Into<EventDispatchSender>,
         control_batch_applied: ControlBatchApplied,
     ) -> Self {
         Self {
@@ -148,7 +216,7 @@ impl RenderThread {
             receiver_retirement: Some(llq::Node::new(Box::new(ControlReceiverRetirement(None)))),
             buffer_offset: None,
             stats,
-            event_sender,
+            event_sender: event_sender.into(),
             garbage_collector: None,
             garbage_collector_termination: Some(llq::Node::new(Box::new(
                 TerminateGarbageCollectorThread,
@@ -160,7 +228,34 @@ impl RenderThread {
             graph_lifecycle_next_sequence: 1,
             #[cfg(test)]
             fail_next_gc_spawn: false,
+            #[cfg(test)]
+            fail_reclaim: false,
+            #[cfg(test)]
+            disconnect_lifecycle_on_next_render: false,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_injected(
+        sample_rate: f32,
+        number_of_channels: usize,
+        receiver: Receiver<ControlMessage>,
+        state: Arc<AtomicU8>,
+        frames_played: Arc<AtomicU64>,
+        stats: AudioStats,
+        event_sender: InjectedEventDispatchSender,
+        control_batch_applied: ControlBatchApplied,
+    ) -> Self {
+        Self::new(
+            sample_rate,
+            number_of_channels,
+            receiver,
+            state,
+            frames_played,
+            stats,
+            EventDispatchSender::from_injected(event_sender),
+            control_batch_applied,
+        )
     }
 
     pub(crate) fn set_startup_pending(&mut self, startup_pending: Arc<AtomicBool>) {
@@ -178,6 +273,13 @@ impl RenderThread {
         }
         self.graph_lifecycle_publisher = Some(publisher);
         Ok(())
+    }
+
+    pub(crate) fn matches_injected_event_loop(
+        &self,
+        event_loop: &InjectedJoinableEventLoop,
+    ) -> bool {
+        self.event_sender.matches_injected(event_loop)
     }
 
     /// Installs the render-side lifetime owners required before injected records can be received.
@@ -233,6 +335,16 @@ impl RenderThread {
     #[cfg(test)]
     pub(crate) fn fail_next_gc_spawn_for_test(&mut self) {
         self.fail_next_gc_spawn = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_reclaim_for_test(&mut self) {
+        self.fail_reclaim = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnect_lifecycle_on_next_render_for_test(&mut self) {
+        self.disconnect_lifecycle_on_next_render = true;
     }
 
     #[inline(always)]
@@ -741,6 +853,10 @@ impl RenderThread {
     /// Taking the graph first makes this idempotent even when a node hook panics: unwinding drops
     /// the detached graph here rather than later in `RenderThread::drop`.
     pub(crate) fn prepare_for_reclaim(&mut self) {
+        #[cfg(test)]
+        if self.fail_reclaim {
+            panic!("forced injected renderer reclaim failure");
+        }
         let Some(mut graph) = self.graph.take() else {
             return;
         };
@@ -763,6 +879,11 @@ impl RenderThread {
     }
 
     pub fn render<S: FromSample<f32> + Clone>(&mut self, output_buffer: &mut [S]) {
+        #[cfg(test)]
+        if std::mem::take(&mut self.disconnect_lifecycle_on_next_render) {
+            self.graph_lifecycle_publisher.take();
+        }
+
         // Collect timing information
         let render_start = Instant::now();
         let frames = output_buffer.len() / self.number_of_channels;
@@ -967,6 +1088,7 @@ fn run_garbage_collector_thread(mut consumer: llq::Consumer<Box<dyn Any + Send>>
 
 #[cfg(test)]
 mod tests {
+    use crossbeam_channel::Sender;
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, SyncSender};

@@ -27,7 +27,9 @@ use super::injected_node_lifetime::{
 };
 use super::injected_node_lifetime::{BoundInjectedOutputRenderer, InjectedNodeLifetimeOwner};
 use super::{InjectedContextAdmissionGate, InjectedGraphReclaimInit};
+#[cfg(test)]
 use crate::events::EventDispatch;
+use crate::events::InjectedJoinableEventLoop;
 use crate::message::{
     control_batch_storage_mut, graph_lifecycle_ack_pair, injected_control_batch_node,
     recover_unsubmitted_injected_batch, ControlBatchApplied, ControlBatchNode, ControlBatchPermit,
@@ -43,7 +45,7 @@ use crate::output::{
     try_audio_render_thread_pair, AudioOutputError, AudioOutputEventSink, AudioRenderCallback,
     AudioRenderFormat, AudioRenderOwner, AudioRenderThreadPairFailure,
 };
-use crate::render::RenderThread;
+use crate::render::{InjectedEventDispatchSender, RenderThread};
 use crate::stats::AudioStats;
 
 const LOGICAL_COMMAND_LIMIT: usize = CONTROL_BATCH_CAPACITY;
@@ -247,8 +249,8 @@ pub(crate) struct BuildInjectedRenderFailure {
     pub(crate) node_lifetimes: InjectedNodeLifetimeBootstrap,
 }
 
-/// Opaque renderer with receiver and owners already bound. The future injected constructor passes
-/// this renderer to `audio_render_thread_pair`, which remains the sole GC-spawn/join owner.
+/// Opaque renderer with receiver and node owner already bound. B3b next consumes this value with
+/// the exact control and event-loop owners before the sole fallible callback/GC installation.
 #[must_use]
 pub(crate) struct BoundInjectedRenderer {
     renderer: RenderThread,
@@ -274,6 +276,16 @@ impl ExactBoundInjectedRenderer {
         self.renderer.fail_next_gc_spawn_for_test();
     }
 
+    #[cfg(test)]
+    pub(crate) fn disconnect_lifecycle_on_next_render_for_test(&mut self) {
+        self.renderer.disconnect_lifecycle_on_next_render_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_reclaim_for_test(&mut self) {
+        self.renderer.fail_reclaim_for_test();
+    }
+
     #[allow(clippy::result_large_err)] // failure returns the exact unboxed renderer and node owner
     pub(crate) fn try_into_audio_render_thread_pair(
         self,
@@ -287,6 +299,19 @@ impl ExactBoundInjectedRenderer {
         ),
         ExactInjectedRenderPairFailure,
     > {
+        if !self
+            .renderer
+            .matches_output_format(format.sample_rate(), format.number_of_channels())
+        {
+            return Err(ExactInjectedRenderPairFailure {
+                error: AudioOutputError::new(
+                    crate::output::AudioOutputErrorKind::InvalidArgument,
+                    "prepared output format does not match the injected renderer",
+                ),
+                renderer: self,
+                events,
+            });
+        }
         match try_audio_render_thread_pair(format, self.renderer, events) {
             Ok((owner, callback)) => Ok((owner, callback, self.node_lifetimes)),
             Err(AudioRenderThreadPairFailure {
@@ -310,6 +335,28 @@ pub(crate) struct BindInjectedOutputRendererFailure {
     pub(crate) control: InjectedControlLifecycleOwner,
 }
 
+pub(crate) struct BindInjectedOutputEventsFailure {
+    renderer: Option<BoundInjectedRenderer>,
+    control: Option<InjectedControlLifecycleOwner>,
+    event_loop: Option<InjectedJoinableEventLoop>,
+}
+
+impl BindInjectedOutputEventsFailure {
+    pub(crate) fn into_parts(
+        mut self,
+    ) -> (
+        BoundInjectedRenderer,
+        InjectedControlLifecycleOwner,
+        InjectedJoinableEventLoop,
+    ) {
+        (
+            self.renderer.take().unwrap(),
+            self.control.take().unwrap(),
+            self.event_loop.take().unwrap(),
+        )
+    }
+}
+
 impl BoundInjectedRenderer {
     #[cfg(test)]
     pub(crate) fn into_audio_render_thread_pair(
@@ -326,11 +373,15 @@ impl BoundInjectedRenderer {
     }
 
     /// Binds the sole lifecycle owner for this exact transport before callback installation.
+    #[cfg(test)]
     #[allow(clippy::result_large_err)]
     pub(crate) fn bind_output_lifecycle(
         self,
         control: InjectedControlLifecycleOwner,
-    ) -> Result<BoundInjectedOutputRenderer, BindInjectedOutputRendererFailure> {
+    ) -> Result<
+        super::injected_node_lifetime::TestBoundInjectedOutputRenderer,
+        BindInjectedOutputRendererFailure,
+    > {
         if !self
             .node_lifetimes
             .control_identity()
@@ -341,12 +392,43 @@ impl BoundInjectedRenderer {
                 control,
             });
         }
+        Ok(
+            super::injected_node_lifetime::TestBoundInjectedOutputRenderer::new(
+                ExactBoundInjectedRenderer {
+                    renderer: self.renderer,
+                    node_lifetimes: self.node_lifetimes,
+                },
+                control,
+            ),
+        )
+    }
+
+    /// Binds the exact event consumer and control owner before callback or GC publication.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn bind_output_lifecycle_and_events(
+        self,
+        control: InjectedControlLifecycleOwner,
+        event_loop: InjectedJoinableEventLoop,
+    ) -> Result<BoundInjectedOutputRenderer, BindInjectedOutputEventsFailure> {
+        if !self
+            .node_lifetimes
+            .control_identity()
+            .ptr_eq(&control.identity())
+            || !self.renderer.matches_injected_event_loop(&event_loop)
+        {
+            return Err(BindInjectedOutputEventsFailure {
+                renderer: Some(self),
+                control: Some(control),
+                event_loop: Some(event_loop),
+            });
+        }
         Ok(BoundInjectedOutputRenderer::new(
             ExactBoundInjectedRenderer {
                 renderer: self.renderer,
                 node_lifetimes: self.node_lifetimes,
             },
             control,
+            event_loop,
         ))
     }
 
@@ -375,6 +457,7 @@ impl InjectedControlRenderInit {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::result_large_err)] // retry must return the exact init and bootstrap intact
+    #[cfg(test)]
     pub(crate) fn build_render_thread(
         self,
         node_lifetimes: InjectedNodeLifetimeBootstrap,
@@ -394,20 +477,89 @@ impl InjectedControlRenderInit {
                 node_lifetimes,
             });
         }
+        Ok(self.build_render_thread_unchecked(
+            node_lifetimes,
+            sample_rate,
+            number_of_channels,
+            state,
+            frames_played,
+            stats,
+            InjectedRenderEvents::Legacy(event_sender),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn build_output_render_thread(
+        self,
+        node_lifetimes: InjectedNodeLifetimeBootstrap,
+        sample_rate: f32,
+        number_of_channels: usize,
+        state: Arc<std::sync::atomic::AtomicU8>,
+        frames_played: Arc<AtomicU64>,
+        stats: AudioStats,
+        events: InjectedEventDispatchSender,
+    ) -> Result<BoundInjectedRenderer, BuildInjectedOutputRenderFailure> {
+        if !self
+            .identity
+            .ptr_eq(node_lifetimes.owner.control_identity())
+        {
+            return Err(BuildInjectedOutputRenderFailure {
+                init: self,
+                node_lifetimes,
+                events,
+            });
+        }
+        let bound = self.build_render_thread_unchecked(
+            node_lifetimes,
+            sample_rate,
+            number_of_channels,
+            state,
+            frames_played,
+            stats,
+            InjectedRenderEvents::Output(events),
+        );
+        Ok(bound)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_render_thread_unchecked(
+        self,
+        node_lifetimes: InjectedNodeLifetimeBootstrap,
+        sample_rate: f32,
+        number_of_channels: usize,
+        state: Arc<std::sync::atomic::AtomicU8>,
+        frames_played: Arc<AtomicU64>,
+        stats: AudioStats,
+        event_sender: InjectedRenderEvents,
+    ) -> BoundInjectedRenderer {
         let InjectedNodeLifetimeBootstrap {
             owner: node_lifetimes,
             graph,
         } = node_lifetimes;
-        let mut renderer = RenderThread::new(
-            sample_rate,
-            number_of_channels,
-            self.receiver,
-            state,
-            frames_played,
-            stats,
-            event_sender,
-            self.applied,
-        );
+        let mut renderer = match event_sender {
+            #[cfg(test)]
+            InjectedRenderEvents::Legacy(event_sender) => RenderThread::new(
+                sample_rate,
+                number_of_channels,
+                self.receiver,
+                state,
+                frames_played,
+                stats,
+                event_sender,
+                self.applied,
+            ),
+            InjectedRenderEvents::Output(event_sender) => RenderThread::new_injected(
+                sample_rate,
+                number_of_channels,
+                self.receiver,
+                state,
+                frames_played,
+                stats,
+                event_sender,
+                self.applied,
+            ),
+        };
         if renderer.install_injected_graph(graph).is_err() {
             unreachable!("new injected renderer has no graph");
         }
@@ -423,11 +575,23 @@ impl InjectedControlRenderInit {
         {
             unreachable!("new renderer has no lifecycle publisher");
         }
-        Ok(BoundInjectedRenderer {
+        BoundInjectedRenderer {
             renderer,
             node_lifetimes,
-        })
+        }
     }
+}
+
+enum InjectedRenderEvents {
+    #[cfg(test)]
+    Legacy(Sender<EventDispatch>),
+    Output(InjectedEventDispatchSender),
+}
+
+pub(crate) struct BuildInjectedOutputRenderFailure {
+    pub(crate) init: InjectedControlRenderInit,
+    pub(crate) node_lifetimes: InjectedNodeLifetimeBootstrap,
+    pub(crate) events: InjectedEventDispatchSender,
 }
 
 /// Constructs an exact `N + 1` channel: N ordinary envelopes plus one Close-only reservation.
@@ -776,6 +940,16 @@ pub(crate) struct FlushControlOutcome {
 }
 
 impl InjectedControlProducer {
+    #[cfg(test)]
+    pub(crate) fn try_commit_prevalidated_for_test(
+        &self,
+        commands: Vec<ControlMessage>,
+    ) -> Result<CommitControlOutcome, InjectedControlError> {
+        let reservation = self.try_begin_operation(commands.len())?;
+        let prepared = reservation.into_prevalidated(commands);
+        self.try_commit(prepared).map_err(|failure| failure.error)
+    }
+
     pub(crate) fn admission_gate(&self) -> InjectedContextAdmissionGate {
         self.inner.gate.clone()
     }
@@ -1249,10 +1423,9 @@ impl InjectedControlLifecycleOwner {
         InjectedControlIdentity(Arc::downgrade(&self.inner))
     }
 
-    /// Best-effort credit-release hint for the future non-RT lifecycle driver. The receiver is
-    /// borrowed so no competing consumer can be retained through this API. Callers must retry
+    /// Best-effort credit-release hint for the private B3b non-RT lifecycle driver. The receiver
+    /// is borrowed so no competing consumer can be retained through this API. Callers must retry
     /// from authoritative teardown/transport state; a wake is never an acknowledgement.
-    #[allow(dead_code)] // selected by the future injected teardown/lifecycle driver
     pub(crate) const fn credit_activity_receiver(&self) -> &crossbeam_channel::Receiver<()> {
         &self.activity
     }
@@ -1346,6 +1519,25 @@ impl ExtractedControlPayloads {
     pub(crate) fn last_submitted_batch_sequence(&self) -> u64 {
         self.last_submitted_batch_sequence
     }
+
+    /// Retires every staged envelope on the lifecycle thread while containing hostile payload
+    /// destructors. A panic makes later whole-graph proof ineligible because an exact accepted
+    /// payload may have been leaked during unwinding.
+    pub(crate) fn retire_off_thread(mut self) -> ExtractedPayloadRetirement {
+        let mut panicked = false;
+        while let Some(batch) = self.staged.pop_front() {
+            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(batch))) {
+                std::mem::forget(payload);
+                panicked = true;
+            }
+        }
+        ExtractedPayloadRetirement { panicked }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExtractedPayloadRetirement {
+    pub(crate) panicked: bool,
 }
 
 struct CloseLifecycleLease {
