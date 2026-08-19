@@ -1297,7 +1297,8 @@ mod tests {
     use crate::context::{
         AudioContextBuildErrorKind, AudioContextShutdownIssueKind, AudioContextShutdownMode,
         AudioContextShutdownOutcome, AudioContextStateChangeOutcome,
-        AudioControlBatchReservationProvider, AudioNodeId,
+        AudioControlBatchReservationProvider, AudioExplicitConnectionReservation,
+        AudioExplicitConnectionReservationProvider, AudioGraphConnectionReservation, AudioNodeId,
     };
     use crate::message::ControlBatchSender;
     use crate::node::{AudioNode, AudioNodeDisconnectSelector, AudioScheduledSourceNode};
@@ -1935,6 +1936,20 @@ mod tests {
             })
         }
 
+        fn explicit_provider(
+            called: Arc<AtomicBool>,
+            command_dropped: Arc<AtomicBool>,
+            graph_dropped: Arc<AtomicBool>,
+        ) -> AudioExplicitConnectionReservationProvider {
+            AudioExplicitConnectionReservationProvider::new(move || {
+                called.store(true, AtomicOrdering::Release);
+                Some(AudioExplicitConnectionReservation::new(
+                    AudioGraphConnectionReservation::new(DropProbe(graph_dropped)),
+                    AudioControlBatchReservation::new(DropProbe(command_dropped)),
+                ))
+            })
+        }
+
         let (suspend_release, suspend_wait) = crossbeam_channel::bounded(1);
         let mut factory = InjectedTestFactory::new(false);
         factory.suspend_release = Some(suspend_wait);
@@ -1966,22 +1981,27 @@ mod tests {
 
         let first_called = Arc::new(AtomicBool::new(false));
         let first_dropped = Arc::new(AtomicBool::new(false));
-        oscillator.connect_from_output_to_input_with_control_reservation(
+        let first_graph_dropped = Arc::new(AtomicBool::new(false));
+        oscillator.connect_from_output_to_input_with_reservations(
             &gain,
             0,
             0,
-            provider(1, Arc::clone(&first_called), Arc::clone(&first_dropped)),
+            explicit_provider(
+                Arc::clone(&first_called),
+                Arc::clone(&first_dropped),
+                Arc::clone(&first_graph_dropped),
+            ),
         );
         assert!(first_called.load(AtomicOrdering::Acquire));
 
         let duplicate_called = Arc::new(AtomicBool::new(false));
-        oscillator.connect_from_output_to_input_with_control_reservation(
+        oscillator.connect_from_output_to_input_with_reservations(
             &gain,
             0,
             0,
-            AudioControlBatchReservationProvider::new({
+            AudioExplicitConnectionReservationProvider::new({
                 let duplicate_called = Arc::clone(&duplicate_called);
-                move |_| {
+                move || {
                     duplicate_called.store(true, AtomicOrdering::Release);
                     None
                 }
@@ -2026,6 +2046,7 @@ mod tests {
 
         assert!(!param_dropped.load(AtomicOrdering::Acquire));
         assert!(!first_dropped.load(AtomicOrdering::Acquire));
+        assert!(!first_graph_dropped.load(AtomicOrdering::Acquire));
         assert!(!second_dropped.load(AtomicOrdering::Acquire));
         assert!(!disconnect_dropped.load(AtomicOrdering::Acquire));
 
@@ -2036,6 +2057,7 @@ mod tests {
         );
         while !param_dropped.load(AtomicOrdering::Acquire)
             || !first_dropped.load(AtomicOrdering::Acquire)
+            || !first_graph_dropped.load(AtomicOrdering::Acquire)
             || !second_dropped.load(AtomicOrdering::Acquire)
             || !disconnect_dropped.load(AtomicOrdering::Acquire)
         {
@@ -2076,12 +2098,11 @@ mod tests {
         let rejection = panic_message(std::panic::catch_unwind(AssertUnwindSafe({
             let rejected_connect_called = Arc::clone(&rejected_connect_called);
             || {
-                oscillator.connect_from_output_to_input_with_control_reservation(
+                oscillator.connect_from_output_to_input_with_reservations(
                     &gain,
                     0,
                     0,
-                    AudioControlBatchReservationProvider::new(move |command_count| {
-                        assert_eq!(command_count, 1);
+                    AudioExplicitConnectionReservationProvider::new(move || {
                         rejected_connect_called.store(true, AtomicOrdering::Release);
                         None
                     }),
@@ -2170,6 +2191,45 @@ mod tests {
             context.request_close().unwrap().wait(),
             AudioContextShutdownOutcome::Confirmed(_)
         ));
+    }
+
+    #[test]
+    fn hosted_whole_graph_retirement_releases_residual_explicit_connection_reservation() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, AtomicOrdering::Release);
+            }
+        }
+
+        let context = AudioContext::builder(Arc::new(InjectedTestFactory::new(false)))
+            .build()
+            .unwrap();
+        let oscillator = context.create_oscillator();
+        let gain = context.create_gain();
+        let graph_dropped = Arc::new(AtomicBool::new(false));
+        oscillator.connect_from_output_to_input_with_reservations(
+            &gain,
+            0,
+            0,
+            AudioExplicitConnectionReservationProvider::new({
+                let graph_dropped = Arc::clone(&graph_dropped);
+                move || {
+                    Some(AudioExplicitConnectionReservation::new(
+                        AudioGraphConnectionReservation::new(DropProbe(graph_dropped)),
+                        AudioControlBatchReservation::new(()),
+                    ))
+                }
+            }),
+        );
+        assert!(!graph_dropped.load(AtomicOrdering::Acquire));
+
+        assert!(matches!(
+            context.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert!(graph_dropped.load(AtomicOrdering::Acquire));
     }
 
     #[test]

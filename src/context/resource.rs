@@ -100,6 +100,113 @@ impl Drop for AudioControlBatchReservation {
     }
 }
 
+/// A host-owned reservation released with one exact hosted explicit connection.
+///
+/// This is an accounting attachment, not graph authority. A successful exact connect stores the
+/// reservation in the engine's authoritative host connection registry. An explicit disconnect
+/// keeps shared ownership in its submitted batch until the renderer has applied or retired that
+/// batch; autonomous incident pruning releases the reservation during off-render-thread node
+/// reconciliation. Whole-graph retirement clears every residual reservation only after physical
+/// graph ownership has been proven.
+///
+/// The wrapped value must have a nonblocking destructor. A destructor panic is contained rather
+/// than allowed to unwind through connection rollback, node reconciliation, or graph retirement.
+pub struct AudioGraphConnectionReservation {
+    value: Option<Box<dyn Send + 'static>>,
+}
+
+impl AudioGraphConnectionReservation {
+    /// Wraps one or more host accounting guards for a single explicit edge.
+    pub fn new<T>(value: T) -> Self
+    where
+        T: Send + 'static,
+    {
+        Self {
+            value: Some(Box::new(value)),
+        }
+    }
+}
+
+impl fmt::Debug for AudioGraphConnectionReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AudioGraphConnectionReservation")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AudioGraphConnectionReservation {
+    fn drop(&mut self) {
+        let Some(value) = self.value.take() else {
+            return;
+        };
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(value))) {
+            std::mem::forget(payload);
+        }
+    }
+}
+
+/// Opaque host ownership acquired lazily for one non-duplicate explicit connect.
+///
+/// The graph reservation follows the represented edge, while the control reservation follows the
+/// one-command connect batch. Keeping them in one value makes partial host admission rollback
+/// explicit before either owner reaches the engine transaction.
+pub struct AudioExplicitConnectionReservation {
+    pub(crate) graph: AudioGraphConnectionReservation,
+    pub(crate) control: AudioControlBatchReservation,
+}
+
+impl AudioExplicitConnectionReservation {
+    /// Combines one live-edge reservation with the matching connect-command reservation.
+    pub fn new(
+        graph: AudioGraphConnectionReservation,
+        control: AudioControlBatchReservation,
+    ) -> Self {
+        Self { graph, control }
+    }
+}
+
+impl fmt::Debug for AudioExplicitConnectionReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AudioExplicitConnectionReservation")
+            .finish_non_exhaustive()
+    }
+}
+
+/// A one-shot host callback invoked only for a non-duplicate exact explicit connection.
+///
+/// Returning `None` rejects the connect before transport reservation or host-graph mutation. The
+/// callback runs under the exact connection serializer, may be invoked at most once, and must not
+/// block. A callback panic fails the hosted transaction closed.
+pub struct AudioExplicitConnectionReservationProvider {
+    provider: Box<dyn FnOnce() -> Option<AudioExplicitConnectionReservation> + Send + 'static>,
+}
+
+impl AudioExplicitConnectionReservationProvider {
+    /// Wraps a one-shot explicit-connection reservation callback.
+    pub fn new<F>(provider: F) -> Self
+    where
+        F: FnOnce() -> Option<AudioExplicitConnectionReservation> + Send + 'static,
+    {
+        Self {
+            provider: Box::new(provider),
+        }
+    }
+
+    pub(crate) fn reserve(self) -> Option<AudioExplicitConnectionReservation> {
+        (self.provider)()
+    }
+}
+
+impl fmt::Debug for AudioExplicitConnectionReservationProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AudioExplicitConnectionReservationProvider")
+            .finish_non_exhaustive()
+    }
+}
+
 /// A one-shot host callback that reserves accounting for the exact size of a control batch.
 ///
 /// Some hosted operations, notably broad `AudioNode::disconnect` calls, cannot know their
@@ -148,6 +255,21 @@ pub(crate) struct SharedAudioNodeLifetimeReservation {
     _inner: Arc<Mutex<AudioNodeLifetimeReservation>>,
 }
 
+/// Shared between the authoritative host edge and an accepted connect/disconnect batch. The
+/// mutex permits a merely `Send` embedder guard to cross the engine's worker-safe ownership graph.
+#[derive(Clone)]
+pub(crate) struct SharedAudioGraphConnectionReservation {
+    _inner: Arc<Mutex<AudioGraphConnectionReservation>>,
+}
+
+impl SharedAudioGraphConnectionReservation {
+    pub(crate) fn new(reservation: AudioGraphConnectionReservation) -> Self {
+        Self {
+            _inner: Arc::new(Mutex::new(reservation)),
+        }
+    }
+}
+
 impl SharedAudioNodeLifetimeReservation {
     pub(crate) fn new(reservation: AudioNodeLifetimeReservation) -> Self {
         Self {
@@ -177,6 +299,11 @@ mod tests {
 
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             drop(AudioControlBatchReservation::new(PanicOnDrop));
+        }));
+        assert!(result.is_ok());
+
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            drop(AudioGraphConnectionReservation::new(PanicOnDrop));
         }));
         assert!(result.is_ok());
     }
