@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::AudioNode;
-use crate::events::{Event, EventHandler, EventType};
+use crate::events::{Event, EventHandler, ExactEndedEventKey};
 use crate::render::AudioWorkletGlobalScope;
 
 /// A cloneable handle for observing a scheduled source's terminal state.
@@ -17,12 +17,21 @@ use crate::render::AudioWorkletGlobalScope;
 #[derive(Clone, Debug)]
 pub struct ScheduledSourceCompletionToken {
     complete: Arc<AtomicBool>,
+    exact_ended: Option<ExactEndedEventKey>,
 }
 
 impl ScheduledSourceCompletionToken {
     pub(crate) fn new() -> Self {
         Self {
             complete: Arc::new(AtomicBool::new(false)),
+            exact_ended: None,
+        }
+    }
+
+    pub(crate) fn new_exact(key: ExactEndedEventKey) -> Self {
+        Self {
+            complete: Arc::new(AtomicBool::new(false)),
+            exact_ended: Some(key),
         }
     }
 
@@ -32,7 +41,11 @@ impl ScheduledSourceCompletionToken {
 
     pub(crate) fn mark_complete_and_wake(&self, scope: &AudioWorkletGlobalScope) {
         self.mark_complete();
-        scope.send_ended_event();
+        if let Some(key) = self.exact_ended {
+            scope.send_exact_ended_event(key);
+        } else {
+            scope.send_ended_event();
+        }
     }
 
     /// Returns whether the associated source has reached its terminal state.
@@ -47,6 +60,12 @@ impl ScheduledSourceCompletionToken {
 
 /// Interface of source nodes, controlling start and stop times.
 /// The node will emit silence before it is started, and after it has ended.
+///
+/// The private exact hosted-output integration does not yet provide the public-wrapper root which
+/// keeps a disconnected, future-start source alive after its final node handle is dropped. That
+/// rooting and per-source reconciliation of best-effort `ended` delivery remain work for the later
+/// scheduled-source registry; connected started/stopped sources retain the established graph
+/// lifetime behavior in this native layer.
 pub trait AudioScheduledSourceNode: AudioNode {
     /// Play immediately
     ///
@@ -87,17 +106,13 @@ pub trait AudioScheduledSourceNode: AudioNode {
     /// override the previous event handler.
     fn set_onended<F: FnOnce(Event) + Send + 'static>(&self, callback: F) {
         let callback = move |_| callback(Event { type_: "ended" });
-
-        self.context().set_event_handler(
-            EventType::Ended(self.registration().id()),
-            EventHandler::Once(Box::new(callback)),
-        );
+        self.registration()
+            .set_ended_handler(EventHandler::Once(Box::new(callback)));
     }
 
     /// Unset the callback to run when the source node has stopped playing
     fn clear_onended(&self) {
-        self.context()
-            .clear_event_handler(EventType::Ended(self.registration().id()));
+        self.registration().clear_ended_handler();
     }
 }
 

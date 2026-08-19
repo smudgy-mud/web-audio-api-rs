@@ -386,6 +386,7 @@ pub trait BaseAudioContext {
         AudioContextRegistration {
             injected_lifetime: None,
             injected_connection: None,
+            injected_ended: None,
             id: crate::context::AudioNodeId(0),
             context: self.base().clone(),
         }

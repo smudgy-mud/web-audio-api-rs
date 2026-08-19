@@ -73,6 +73,9 @@ impl EventDispatchSender {
         Self(EventDispatchSenderKind::Injected { sender, identity })
     }
 
+    // Returning the rejected event by value keeps the render-thread failure path allocation-free;
+    // boxing this intentionally larger exact-event payload would violate that contract.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn try_send(&self, event: EventDispatch) -> Result<(), TrySendError<EventDispatch>> {
         match &self.0 {
             EventDispatchSenderKind::Legacy(sender)
@@ -556,13 +559,14 @@ impl RenderThread {
     #[cold]
     #[inline(never)]
     fn fail_injected_render_protocol(&mut self) -> ! {
-        // Do not publish the pending sequence: no explicit Graph mutation was applied. The
-        // absorbing latch is authoritative even when the best-effort event hint is saturated.
+        // Do not publish the failing envelope's sequence. The absorbing latch is authoritative
+        // even when the best-effort event hint is saturated; earlier envelopes may already have
+        // changed the Graph before this separately bounded exact operation failed.
         self.control_batch_applied.fail_render_protocol();
         self.event_sender
             .try_send(EventDispatch::control_batch_activity())
             .ok();
-        panic!("injected explicit-edge protocol violation");
+        panic!("injected render protocol violation");
     }
 
     /// Applies a complete injected bootstrap envelope before an audio callback can be published.
@@ -827,6 +831,16 @@ impl RenderThread {
             }
             InjectedAudioParamValue { id, mut value } => {
                 self.graph.as_mut().unwrap().route_message(id, &mut value);
+            }
+            InjectedOscillator(value) => {
+                let mut message = value.into_render_message();
+                let routed = self
+                    .graph
+                    .as_mut()
+                    .is_some_and(|graph| graph.try_route_message(message.id(), &mut message));
+                if !routed || !message.was_applied() {
+                    self.fail_injected_render_protocol();
+                }
             }
             #[cfg(feature = "diagnostics")]
             RunDiagnostics { backend } => {

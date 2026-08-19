@@ -3,8 +3,13 @@ use std::f32::consts::PI;
 use std::fmt::Debug;
 use std::sync::OnceLock;
 
-use crate::context::{AudioContextRegistration, AudioParamId, BaseAudioContext};
-use crate::param::{AudioParam, AudioParamDescriptor, AutomationRate};
+use crate::context::{
+    AudioContextRegistration, AudioParamId, BaseAudioContext, ConcreteBaseAudioContext,
+    InjectedOscillatorControl, InjectedOscillatorMutationError, InjectedOscillatorPayload,
+};
+use crate::param::{
+    injected_audio_param_raw_parts, AudioParam, AudioParamDescriptor, AutomationRate,
+};
 use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope,
 };
@@ -73,6 +78,7 @@ impl Default for OscillatorOptions {
 }
 
 /// Type of the waveform rendered by an `OscillatorNode`
+#[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum OscillatorType {
     /// Sine wave
@@ -111,6 +117,10 @@ enum Schedule {
 /// `OscillatorNode` represents an audio source generating a periodic waveform.
 /// It can generate a few common waveforms (i.e. sine, square, sawtooth, triangle),
 /// or can be set to an arbitrary periodic waveform using a [`PeriodicWave`] object.
+///
+/// The private exact hosted-output path currently supports only the four fixed waveforms. Custom
+/// `PeriodicWave` construction and [`OscillatorNode::set_periodic_wave`] remain available to
+/// legacy contexts and are deliberately rejected before mutation on that exact path.
 ///
 /// - MDN documentation: <https://developer.mozilla.org/en-US/docs/Web/API/OscillatorNode>
 /// - specification: <https://webaudio.github.io/web-audio-api/#OscillatorNode>
@@ -153,6 +163,8 @@ pub struct OscillatorNode {
     has_start: bool,
     /// Shared terminal state for native consumers.
     completion: ScheduledSourceCompletionToken,
+    /// Accepted exact command authority. Legacy nodes keep `None` and their original mirrors.
+    injected_control: Option<InjectedOscillatorControl>,
 }
 
 impl AudioNode for OscillatorNode {
@@ -183,6 +195,10 @@ impl AudioScheduledSourceNode for OscillatorNode {
 
     fn start_at(&mut self, when: f64) {
         assert_valid_time_value(when);
+        if let Some(control) = &self.injected_control {
+            finish_exact_oscillator_mutation(control.try_start(when));
+            return;
+        }
         assert!(
             !self.has_start,
             "InvalidStateError - Cannot call `start` twice"
@@ -199,6 +215,10 @@ impl AudioScheduledSourceNode for OscillatorNode {
 
     fn stop_at(&mut self, when: f64) {
         assert_valid_time_value(when);
+        if let Some(control) = &self.injected_control {
+            finish_exact_oscillator_mutation(control.try_stop(when));
+            return;
+        }
         assert!(
             self.has_start,
             "InvalidStateError - cannot stop before start"
@@ -222,6 +242,9 @@ impl OscillatorNode {
     /// * `context` - The `AudioContext`
     /// * `options` - The OscillatorOptions
     pub fn new<C: BaseAudioContext>(context: &C, options: OscillatorOptions) -> Self {
+        if context.base().injected_node_constructor().is_some() {
+            return Self::new_injected(context.base(), options);
+        }
         let OscillatorOptions {
             type_,
             frequency,
@@ -271,6 +294,7 @@ impl OscillatorNode {
                 ended_triggered: false,
                 completion: completion.clone(),
                 sine_table: precomputed_sine_table(),
+                exact_key: None,
             };
 
             let node = Self {
@@ -281,6 +305,7 @@ impl OscillatorNode {
                 type_,
                 has_start: false,
                 completion,
+                injected_control: None,
             };
 
             (node, Box::new(renderer))
@@ -292,6 +317,134 @@ impl OscillatorNode {
         }
 
         node
+    }
+
+    fn new_injected(context: &ConcreteBaseAudioContext, options: OscillatorOptions) -> Self {
+        let OscillatorOptions {
+            type_,
+            frequency,
+            detune,
+            audio_node_options,
+            periodic_wave,
+        } = options;
+        assert!(
+            periodic_wave.is_none() && type_ != OscillatorType::Custom,
+            "NotSupportedError - custom PeriodicWave oscillators are not available on the exact injected context"
+        );
+        let transaction = context
+            .try_begin_injected_oscillator(type_)
+            .unwrap_or_else(|error| panic!("injected Oscillator admission failed: {error:?}"));
+        let oscillator_id = transaction.oscillator_id();
+        let frequency_id = transaction.frequency_id();
+        let detune_id = transaction.detune_id();
+        let completion = ScheduledSourceCompletionToken::new_exact(transaction.completion_key());
+
+        let nyquist = context.sample_rate() / 2.;
+        let frequency_descriptor = AudioParamDescriptor {
+            name: String::new(),
+            min_value: -nyquist,
+            max_value: nyquist,
+            default_value: 440.,
+            automation_rate: AutomationRate::A,
+        };
+        let detune_descriptor = AudioParamDescriptor {
+            name: String::new(),
+            min_value: -153_600.,
+            max_value: 153_600.,
+            default_value: 0.,
+            automation_rate: AutomationRate::A,
+        };
+        let (frequency_raw, frequency_processor) =
+            injected_audio_param_raw_parts(frequency_descriptor);
+        let frequency_initial_value = frequency_raw.set_initial_value_for_injected(frequency);
+        let (detune_raw, detune_processor) = injected_audio_param_raw_parts(detune_descriptor);
+        let detune_initial_value = detune_raw.set_initial_value_for_injected(detune);
+        let channel_config: ChannelConfig = audio_node_options.into();
+        let param_channel_config: ChannelConfig = AudioNodeOptions {
+            channel_count: 1,
+            channel_count_mode: super::ChannelCountMode::Explicit,
+            channel_interpretation: super::ChannelInterpretation::Discrete,
+        }
+        .into();
+        let renderer = Box::new(OscillatorRenderer::new_exact(
+            type_,
+            AudioParamId::from_node_id(frequency_id),
+            AudioParamId::from_node_id(detune_id),
+            completion.clone(),
+            transaction.completion_key(),
+        ));
+        let constructed = transaction
+            .commit(InjectedOscillatorPayload {
+                frequency_processor,
+                detune_processor,
+                oscillator_processor: renderer,
+                param_channel_config: param_channel_config.inner(),
+                oscillator_channel_config: channel_config.inner(),
+                frequency_initial_value,
+                detune_initial_value,
+            })
+            .unwrap_or_else(|error| panic!("injected Oscillator construction failed: {error:?}"));
+        debug_assert_eq!(constructed.oscillator_id, oscillator_id);
+        debug_assert_eq!(constructed.frequency_id, frequency_id);
+        debug_assert_eq!(constructed.detune_id, detune_id);
+        let _accepted_placement = constructed.outcome;
+
+        let frequency_registration = AudioContextRegistration::from_injected_with_connection(
+            frequency_id,
+            context.clone(),
+            constructed.frequency_registration,
+            constructed.frequency_connection,
+            crate::context::InjectedConnectionEndpointKind::AudioParam,
+            1,
+            1,
+        );
+        let detune_registration = AudioContextRegistration::from_injected_with_connection(
+            detune_id,
+            context.clone(),
+            constructed.detune_registration,
+            constructed.detune_connection,
+            crate::context::InjectedConnectionEndpointKind::AudioParam,
+            1,
+            1,
+        );
+        let registration = AudioContextRegistration::from_injected_oscillator(
+            oscillator_id,
+            context.clone(),
+            constructed.oscillator_registration,
+            constructed.oscillator_connection,
+            constructed.oscillator_control.ended_target(),
+        );
+        let constructor = context
+            .injected_node_constructor()
+            .expect("exact oscillator context retains constructor");
+        if !constructed
+            .oscillator_control
+            .matches_registration(&registration, constructor)
+        {
+            context.fail_closed_injected_protocol();
+            panic!("exact oscillator control does not match its registration");
+        }
+        let frequency = AudioParam::from_injected_raw_parts(
+            frequency_registration,
+            frequency_raw,
+            constructed.frequency_mutation,
+        );
+        let detune = AudioParam::from_injected_raw_parts(
+            detune_registration,
+            detune_raw,
+            constructed.detune_mutation,
+        );
+
+        Self {
+            registration,
+            channel_config,
+            frequency,
+            detune,
+            type_,
+            has_start: false,
+            completion,
+            injected_control: Some(constructed.oscillator_control),
+        }
     }
 
     /// A-rate [`AudioParam`] that defines the fundamental frequency of the
@@ -317,7 +470,16 @@ impl OscillatorNode {
     /// Returns the oscillator type
     #[must_use]
     pub fn type_(&self) -> OscillatorType {
-        self.type_
+        self.injected_control
+            .as_ref()
+            .map_or(self.type_, InjectedOscillatorControl::type_)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn injected_control_for_test(&self) -> &InjectedOscillatorControl {
+        self.injected_control
+            .as_ref()
+            .expect("test requires an exact injected oscillator")
     }
 
     /// Set the oscillator type
@@ -336,6 +498,11 @@ impl OscillatorNode {
             "InvalidStateError: Custom type cannot be set manually"
         );
 
+        if let Some(control) = &self.injected_control {
+            finish_exact_oscillator_mutation(control.try_set_type(type_));
+            return;
+        }
+
         // if periodic wave has been set specified, type_ changes are ignored
         if self.type_ == OscillatorType::Custom {
             return;
@@ -349,14 +516,47 @@ impl OscillatorNode {
     ///
     /// Calling this sets the oscillator type to `custom`, once set to `custom`
     /// the oscillator cannot be reverted back to a standard waveform.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `NotSupportedError` on the private exact injected context, whose current
+    /// fixed-wave slice deliberately excludes custom `PeriodicWave` storage and transport.
     pub fn set_periodic_wave(&mut self, periodic_wave: PeriodicWave) {
+        assert!(
+            self.injected_control.is_none(),
+            "NotSupportedError - custom PeriodicWave oscillators are not available on the exact injected context"
+        );
         self.type_ = OscillatorType::Custom;
         self.registration.post_message(periodic_wave);
     }
 }
 
+fn finish_exact_oscillator_mutation(
+    result: Result<crate::context::CommitControlOutcome, InjectedOscillatorMutationError>,
+) {
+    match result {
+        Ok(_) => {}
+        Err(InjectedOscillatorMutationError::DuplicateStart) => {
+            panic!("InvalidStateError - Cannot call `start` twice")
+        }
+        Err(InjectedOscillatorMutationError::StopBeforeStart) => {
+            panic!("InvalidStateError - cannot stop before start")
+        }
+        Err(InjectedOscillatorMutationError::CustomType) => {
+            panic!("InvalidStateError: Custom type cannot be set manually")
+        }
+        Err(InjectedOscillatorMutationError::Inactive) => {
+            panic!("InvalidStateError - exact oscillator is no longer active")
+        }
+        Err(InjectedOscillatorMutationError::Control(error)) => {
+            panic!("InvalidStateError - exact oscillator command was rejected: {error:?}")
+        }
+        Err(error) => panic!("InvalidStateError - exact oscillator transaction failed: {error:?}"),
+    }
+}
+
 /// Rendering component of the oscillator node
-struct OscillatorRenderer {
+pub(crate) struct OscillatorRenderer {
     /// The shape of the periodic waveform
     type_: OscillatorType,
     /// The frequency of the fundamental frequency.
@@ -379,6 +579,8 @@ struct OscillatorRenderer {
     completion: ScheduledSourceCompletionToken,
     /// Precomputed sine table
     sine_table: &'static [f32],
+    /// Present only for the exact hosted constructor; authenticates fixed runtime commands.
+    exact_key: Option<crate::events::ExactEndedEventKey>,
 }
 
 impl AudioProcessor for OscillatorRenderer {
@@ -482,6 +684,26 @@ impl AudioProcessor for OscillatorRenderer {
     }
 
     fn onmessage(&mut self, msg: &mut dyn Any) {
+        if let Some(message) = msg.downcast_mut::<crate::context::InjectedOscillatorRenderMessage>()
+        {
+            let Some(key) = self.exact_key else {
+                return;
+            };
+            let Some(command) = message.apply_to(key) else {
+                return;
+            };
+            match command {
+                crate::context::InjectedOscillatorCommandKind::Start(value) => {
+                    self.start_time = value
+                }
+                crate::context::InjectedOscillatorCommandKind::Stop(value) => {
+                    self.stop_time = value
+                }
+                crate::context::InjectedOscillatorCommandKind::SetType(value) => self.type_ = value,
+            }
+            return;
+        }
+
         if let Some(&type_) = msg.downcast_ref::<OscillatorType>() {
             self.type_ = type_;
             return;
@@ -519,6 +741,29 @@ impl AudioProcessor for OscillatorRenderer {
     }
 }
 impl OscillatorRenderer {
+    pub(crate) fn new_exact(
+        type_: OscillatorType,
+        frequency: AudioParamId,
+        detune: AudioParamId,
+        completion: ScheduledSourceCompletionToken,
+        exact_key: crate::events::ExactEndedEventKey,
+    ) -> Self {
+        Self {
+            type_,
+            frequency,
+            detune,
+            phase: 0.,
+            start_time: f64::MAX,
+            stop_time: f64::MAX,
+            started: false,
+            periodic_wave: None,
+            ended_triggered: false,
+            completion,
+            sine_table: precomputed_sine_table(),
+            exact_key: Some(exact_key),
+        }
+    }
+
     fn trigger_ended(&mut self, scope: &AudioWorkletGlobalScope) {
         if !self.ended_triggered {
             self.ended_triggered = true;
