@@ -1,12 +1,12 @@
 //! Branded, private injected-node construction transactions.
 //!
 //! This is a production capability but not a public context constructor. It binds the exact
-//! control transport, node-id allocator, and lifetime registry, then implements the first concrete
-//! two-node Gain transaction without exposing any of those authorities separately.
+//! control transport, node-id allocator, and lifetime registry. It implements exact two-node Gain
+//! and three-node fixed-wave Oscillator transactions without exposing any of those authorities
+//! separately. Custom `PeriodicWave` oscillators remain outside this private slice.
 
 use std::panic::{self, AssertUnwindSafe};
-#[cfg(test)]
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrayvec::ArrayVec;
@@ -30,8 +30,9 @@ use super::injected_node_lifetime::{
     ProvisionalNodeRegistration,
 };
 use super::{AudioContextRegistration, AudioNodeId};
+use crate::events::{ExactEndedEventKey, InjectedExactEndedEventTarget};
 use crate::message::ControlMessage;
-use crate::node::ChannelConfigInner;
+use crate::node::{ChannelConfigInner, OscillatorType};
 use crate::param::{
     AudioParamInitialValue, AudioParamInner, InjectedAudioParamMirror, InjectedAudioParamProcessor,
     InjectedAudioParamValue,
@@ -42,6 +43,1086 @@ const GAIN_COMMAND_COUNT: usize = 4;
 const GAIN_NODE_COUNT: usize = 2;
 const GAIN_ID_INDEX: usize = 0;
 const PARAM_ID_INDEX: usize = 1;
+
+const OSCILLATOR_COMMAND_COUNT: usize = 7;
+const OSCILLATOR_NODE_COUNT: usize = 3;
+const OSCILLATOR_ID_INDEX: usize = 0;
+const FREQUENCY_ID_INDEX: usize = 1;
+const DETUNE_ID_INDEX: usize = 2;
+
+/// Single-use exact ended-key mint carried only by an admitted oscillator construction.
+/// Its private fields prevent raw id/lifetime pairing elsewhere in the crate.
+pub(crate) struct InjectedOscillatorEventMint {
+    id: AudioNodeId,
+    lifetime: InjectedNodeRegistrationIdentity,
+}
+
+impl InjectedOscillatorEventMint {
+    pub(crate) fn into_parts(self) -> (AudioNodeId, InjectedNodeRegistrationIdentity) {
+        (self.id, self.lifetime)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum InjectedOscillatorCommandKind {
+    Start(f64),
+    Stop(f64),
+    SetType(OscillatorType),
+}
+
+/// Fixed wire command constructible only by an accepted exact oscillator capability.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InjectedOscillatorWireCommand {
+    id: AudioNodeId,
+    key: ExactEndedEventKey,
+    command: InjectedOscillatorCommandKind,
+}
+
+/// Stack-only renderer dispatch wrapper. The oscillator processor must consume and authenticate
+/// it; otherwise the render thread latches protocol failure before publishing the batch watermark.
+pub(crate) struct InjectedOscillatorRenderMessage {
+    wire: InjectedOscillatorWireCommand,
+    applied: bool,
+}
+
+impl InjectedOscillatorWireCommand {
+    pub(crate) fn into_render_message(self) -> InjectedOscillatorRenderMessage {
+        InjectedOscillatorRenderMessage {
+            wire: self,
+            applied: false,
+        }
+    }
+}
+
+impl InjectedOscillatorRenderMessage {
+    pub(crate) const fn id(&self) -> AudioNodeId {
+        self.wire.id
+    }
+
+    pub(crate) fn apply_to(
+        &mut self,
+        expected: ExactEndedEventKey,
+    ) -> Option<InjectedOscillatorCommandKind> {
+        if self.wire.key != expected || self.applied {
+            return None;
+        }
+        self.applied = true;
+        Some(self.wire.command)
+    }
+
+    pub(crate) const fn was_applied(&self) -> bool {
+        self.applied
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedOscillatorMutationError {
+    Control(InjectedControlError),
+    AcceptedFinalizer(AcceptedBatchFinalizeFailure),
+    DuplicateStart,
+    StopBeforeStart,
+    CustomType,
+    Inactive,
+    SerializerPoisoned,
+    RejectedPayloadPanicked,
+    ProtocolViolation,
+}
+
+/// Weak post-construction command capability for one exact oscillator generation.
+/// Clones are not exposed by the public node. It retains no admission or lifetime credit.
+pub(crate) struct InjectedOscillatorControl {
+    control: InjectedControlProducer,
+    node_ids: InjectedNodeIdIdentity,
+    id: AudioNodeId,
+    lifetime: InjectedNodeRegistrationIdentity,
+    ended: InjectedExactEndedEventTarget,
+    serializer: Arc<Mutex<()>>,
+    has_start: Arc<AtomicBool>,
+    type_: Arc<AtomicU8>,
+    #[cfg(test)]
+    runtime_behavior: Arc<AtomicU8>,
+}
+
+impl std::fmt::Debug for InjectedOscillatorControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InjectedOscillatorControl")
+            .field("id", &self.id)
+            .field("has_start", &self.has_start())
+            .field("type", &self.type_())
+            .finish_non_exhaustive()
+    }
+}
+
+impl InjectedOscillatorControl {
+    #[cfg(test)]
+    pub(crate) fn fail_next_runtime_commit_for_test(&self) {
+        self.runtime_behavior.store(1, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_next_runtime_finalizer_for_test(&self) {
+        self.runtime_behavior.store(2, Ordering::Release);
+    }
+
+    pub(crate) fn ended_target(&self) -> InjectedExactEndedEventTarget {
+        self.ended.clone()
+    }
+
+    pub(crate) fn matches_registration(
+        &self,
+        registration: &AudioContextRegistration,
+        constructor: &InjectedNodeConstructor,
+    ) -> bool {
+        self.id == registration.id()
+            && constructor.matches_control_identity(&self.control.identity())
+            && constructor.matches_node_id_identity(&self.node_ids)
+            && registration.matches_injected_lifetime_identity(&self.lifetime)
+    }
+
+    pub(crate) fn has_start(&self) -> bool {
+        self.has_start.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn type_(&self) -> OscillatorType {
+        OscillatorType::from(u32::from(self.type_.load(Ordering::Acquire)))
+    }
+
+    pub(crate) fn try_start(
+        &self,
+        when: f64,
+    ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
+        self.try_command(InjectedOscillatorCommandKind::Start(when))
+    }
+
+    pub(crate) fn try_stop(
+        &self,
+        when: f64,
+    ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
+        self.try_command(InjectedOscillatorCommandKind::Stop(when))
+    }
+
+    pub(crate) fn try_set_type(
+        &self,
+        type_: OscillatorType,
+    ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
+        self.try_command(InjectedOscillatorCommandKind::SetType(type_))
+    }
+
+    fn try_command(
+        &self,
+        command: InjectedOscillatorCommandKind,
+    ) -> Result<CommitControlOutcome, InjectedOscillatorMutationError> {
+        let result = {
+            let _serialized = self
+                .serializer
+                .lock()
+                .map_err(|_| InjectedOscillatorMutationError::SerializerPoisoned)?;
+            match command {
+                InjectedOscillatorCommandKind::Start(_) if self.has_start() => {
+                    return Err(InjectedOscillatorMutationError::DuplicateStart)
+                }
+                InjectedOscillatorCommandKind::Stop(_) if !self.has_start() => {
+                    return Err(InjectedOscillatorMutationError::StopBeforeStart)
+                }
+                InjectedOscillatorCommandKind::SetType(OscillatorType::Custom) => {
+                    return Err(InjectedOscillatorMutationError::CustomType)
+                }
+                _ => {}
+            }
+            let reservation = self
+                .control
+                .try_begin_oscillator_command()
+                .map_err(InjectedOscillatorMutationError::Control)?;
+            if !self.lifetime.is_live_for(self.id) {
+                return Err(InjectedOscillatorMutationError::Inactive);
+            }
+            let wire = InjectedOscillatorWireCommand {
+                id: self.id,
+                key: self.ended.render_key(),
+                command,
+            };
+            let prepared = reservation.prepare(wire);
+            #[cfg(test)]
+            if self
+                .runtime_behavior
+                .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.control.fail_closed_protocol();
+            }
+            let has_start = &self.has_start;
+            let type_ = &self.type_;
+            #[cfg(test)]
+            let runtime_behavior = &self.runtime_behavior;
+            match self.control.try_commit_with_finalize(prepared, move |_| {
+                match command {
+                    InjectedOscillatorCommandKind::Start(_) => {
+                        has_start.store(true, Ordering::Release)
+                    }
+                    InjectedOscillatorCommandKind::SetType(value) => {
+                        type_.store(value as u8, Ordering::Release)
+                    }
+                    InjectedOscillatorCommandKind::Stop(_) => {}
+                }
+                #[cfg(test)]
+                if runtime_behavior.swap(0, Ordering::AcqRel) == 2 {
+                    panic!("forced exact oscillator accepted-finalizer panic");
+                }
+                Ok(())
+            }) {
+                Ok(outcome) => Ok(outcome),
+                Err(CommitWithFinalizeFailure::AcceptedFinalizer(failure)) => {
+                    Err(InjectedOscillatorMutationError::AcceptedFinalizer(failure))
+                }
+                Err(CommitWithFinalizeFailure::NotAccepted(failure)) => {
+                    let control = self.control.clone();
+                    let id = self.id;
+                    let key = self.ended.render_key();
+                    let (error, rollback) = failure.rollback_with_commands(move |commands| {
+                        let mut fail_closed = FailClosedOscillatorRollback::new(control);
+                        let mut commands = commands.into_vec().into_iter();
+                        let exact = matches!(
+                            (commands.next(), commands.next()),
+                            (Some(ControlMessage::InjectedOscillator(value)), None)
+                                if value.id == id
+                                    && value.key == key
+                                    && oscillator_commands_match(value.command, command)
+                        );
+                        if exact {
+                            fail_closed.disarm();
+                        }
+                        exact
+                    });
+                    match rollback {
+                        RejectedControlRollback::Completed(true) => {
+                            Err(InjectedOscillatorMutationError::Control(error))
+                        }
+                        RejectedControlRollback::Completed(false) => {
+                            Err(InjectedOscillatorMutationError::ProtocolViolation)
+                        }
+                        RejectedControlRollback::Panicked => {
+                            Err(InjectedOscillatorMutationError::RejectedPayloadPanicked)
+                        }
+                    }
+                }
+            }
+        };
+        result
+    }
+}
+
+fn oscillator_commands_match(
+    left: InjectedOscillatorCommandKind,
+    right: InjectedOscillatorCommandKind,
+) -> bool {
+    match (left, right) {
+        (
+            InjectedOscillatorCommandKind::Start(left),
+            InjectedOscillatorCommandKind::Start(right),
+        )
+        | (InjectedOscillatorCommandKind::Stop(left), InjectedOscillatorCommandKind::Stop(right)) => {
+            left.to_bits() == right.to_bits()
+        }
+        (
+            InjectedOscillatorCommandKind::SetType(left),
+            InjectedOscillatorCommandKind::SetType(right),
+        ) => left == right,
+        _ => false,
+    }
+}
+
+struct FailClosedOscillatorRollback {
+    control: InjectedControlProducer,
+    armed: bool,
+}
+
+impl FailClosedOscillatorRollback {
+    fn new(control: InjectedControlProducer) -> Self {
+        Self {
+            control,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailClosedOscillatorRollback {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control.fail_closed_protocol();
+        }
+    }
+}
+
+pub(crate) struct InjectedOscillatorPayload {
+    pub(crate) frequency_processor: InjectedAudioParamProcessor,
+    pub(crate) detune_processor: InjectedAudioParamProcessor,
+    pub(crate) oscillator_processor: Box<dyn AudioProcessor>,
+    pub(crate) param_channel_config: ChannelConfigInner,
+    pub(crate) oscillator_channel_config: ChannelConfigInner,
+    pub(crate) frequency_initial_value: AudioParamInitialValue,
+    pub(crate) detune_initial_value: AudioParamInitialValue,
+}
+
+pub(crate) struct InjectedConstructedOscillator {
+    pub(crate) oscillator_id: AudioNodeId,
+    pub(crate) frequency_id: AudioNodeId,
+    pub(crate) detune_id: AudioNodeId,
+    pub(crate) oscillator_registration: InjectedNodeRegistration,
+    pub(crate) frequency_registration: InjectedNodeRegistration,
+    pub(crate) detune_registration: InjectedNodeRegistration,
+    pub(crate) oscillator_connection: InjectedConnectionEndpoint,
+    pub(crate) frequency_connection: InjectedConnectionEndpoint,
+    pub(crate) detune_connection: InjectedConnectionEndpoint,
+    pub(crate) frequency_mutation: InjectedAudioParamMutation,
+    pub(crate) detune_mutation: InjectedAudioParamMutation,
+    pub(crate) oscillator_control: InjectedOscillatorControl,
+    pub(crate) outcome: CommitControlOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedOscillatorConstructionError {
+    Control(InjectedControlError),
+    NodeIds(ProvisionalNodeIdError),
+    Registration(NodeRegistrationError),
+    EventIdentityExhausted,
+    AcceptedFinalizer(AcceptedBatchFinalizeFailure),
+    RejectedPayloadPanicked,
+    ProtocolViolation,
+}
+
+/// One admitted three-node oscillator constructor. The reservation is last so every provisional,
+/// mirror, serializer, and payload guard is destroyed before graph admission releases.
+pub(crate) struct InjectedOscillatorConstruction {
+    control: InjectedControlProducer,
+    ids: ProvisionalNodeIds,
+    oscillator: ProvisionalNodeRegistration,
+    frequency: ProvisionalNodeRegistration,
+    detune: ProvisionalNodeRegistration,
+    oscillator_connection: InjectedConnectionEndpoint,
+    frequency_connection: InjectedConnectionEndpoint,
+    detune_connection: InjectedConnectionEndpoint,
+    oscillator_id: AudioNodeId,
+    frequency_id: AudioNodeId,
+    detune_id: AudioNodeId,
+    ended: InjectedExactEndedEventTarget,
+    oscillator_serializer: Arc<Mutex<()>>,
+    frequency_serializer: Arc<Mutex<()>>,
+    detune_serializer: Arc<Mutex<()>>,
+    has_start: Arc<AtomicBool>,
+    type_: Arc<AtomicU8>,
+    #[cfg(test)]
+    rollback_tokens_restored: Option<Arc<AtomicBool>>,
+    reservation: Option<ControlBatchReservation>,
+}
+
+impl InjectedNodeConstructor {
+    pub(super) fn try_begin_oscillator(
+        &self,
+        events: &crate::events::InjectedControlEventDispatch,
+        initial_type: OscillatorType,
+    ) -> Result<InjectedOscillatorConstruction, InjectedOscillatorConstructionError> {
+        if initial_type == OscillatorType::Custom || !events.matches_gate(&self.admission_gate()) {
+            return Err(InjectedOscillatorConstructionError::ProtocolViolation);
+        }
+        let reservation = self
+            .control
+            .try_begin_operation(OSCILLATOR_COMMAND_COUNT)
+            .map_err(InjectedOscillatorConstructionError::Control)?;
+        let oscillator_serializer = Arc::new(Mutex::new(()));
+        let frequency_serializer = Arc::new(Mutex::new(()));
+        let detune_serializer = Arc::new(Mutex::new(()));
+        let has_start = Arc::new(AtomicBool::new(false));
+        let type_ = Arc::new(AtomicU8::new(initial_type as u8));
+        let ids = self
+            .allocator
+            .try_reserve(OSCILLATOR_NODE_COUNT)
+            .map_err(InjectedOscillatorConstructionError::NodeIds)?;
+        let oscillator_id = ids.id(OSCILLATOR_ID_INDEX);
+        let frequency_id = ids.id(FREQUENCY_ID_INDEX);
+        let detune_id = ids.id(DETUNE_ID_INDEX);
+
+        let (oscillator, oscillator_connection) = self.register_oscillator_endpoint(
+            oscillator_id,
+            InjectedConnectionEndpointKind::AudioNode,
+            0,
+            1,
+        )?;
+        let (frequency, frequency_connection) = self.register_oscillator_endpoint(
+            frequency_id,
+            InjectedConnectionEndpointKind::AudioParam,
+            1,
+            1,
+        )?;
+        let (detune, detune_connection) = self.register_oscillator_endpoint(
+            detune_id,
+            InjectedConnectionEndpointKind::AudioParam,
+            1,
+            1,
+        )?;
+        let mint = InjectedOscillatorEventMint {
+            id: oscillator_id,
+            lifetime: oscillator.identity(),
+        };
+        let Some(ended) = InjectedExactEndedEventTarget::from_oscillator_mint(events, mint) else {
+            self.fail_closed_protocol();
+            ids.retain_unavailable();
+            return Err(InjectedOscillatorConstructionError::EventIdentityExhausted);
+        };
+
+        Ok(InjectedOscillatorConstruction {
+            control: self.control.clone(),
+            ids,
+            oscillator,
+            frequency,
+            detune,
+            oscillator_connection,
+            frequency_connection,
+            detune_connection,
+            oscillator_id,
+            frequency_id,
+            detune_id,
+            ended,
+            oscillator_serializer,
+            frequency_serializer,
+            detune_serializer,
+            has_start,
+            type_,
+            #[cfg(test)]
+            rollback_tokens_restored: None,
+            reservation: Some(reservation),
+        })
+    }
+
+    fn register_oscillator_endpoint(
+        &self,
+        id: AudioNodeId,
+        kind: InjectedConnectionEndpointKind,
+        inputs: usize,
+        outputs: usize,
+    ) -> Result<
+        (ProvisionalNodeRegistration, InjectedConnectionEndpoint),
+        InjectedOscillatorConstructionError,
+    > {
+        let cleanup: Box<dyn InjectedNodeReclaimCleanup> =
+            Box::new(DeferredIncidentConnectionCleanup { id });
+        let provisional = self
+            .lifetimes
+            .try_register(id, cleanup)
+            .map_err(|failure| {
+                let error = failure.error;
+                drop(failure);
+                InjectedOscillatorConstructionError::Registration(error)
+            })?;
+        let endpoint = InjectedConnectionEndpoint::new_ordinary(
+            self.lifetimes.registry_identity(),
+            self.control.identity(),
+            self.allocator.identity(),
+            kind,
+            inputs,
+            outputs,
+            provisional.stamp(),
+        );
+        let Some(cleanup) = endpoint.incident_cleanup() else {
+            drop(provisional);
+            return Err(InjectedOscillatorConstructionError::Registration(
+                NodeRegistrationError::OwnerGone,
+            ));
+        };
+        let previous = provisional
+            .replace_cleanup_before_acceptance(cleanup)
+            .map_err(|cleanup| {
+                drop(cleanup);
+                InjectedOscillatorConstructionError::Registration(
+                    NodeRegistrationError::ProtocolViolation,
+                )
+            })?;
+        drop(previous);
+        Ok((provisional, endpoint))
+    }
+}
+
+impl InjectedOscillatorConstruction {
+    pub(crate) const fn oscillator_id(&self) -> AudioNodeId {
+        self.oscillator_id
+    }
+
+    pub(crate) const fn frequency_id(&self) -> AudioNodeId {
+        self.frequency_id
+    }
+
+    pub(crate) const fn detune_id(&self) -> AudioNodeId {
+        self.detune_id
+    }
+
+    pub(crate) fn completion_key(&self) -> ExactEndedEventKey {
+        self.ended.render_key()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_rollback_tokens_restored_for_test(&mut self, flag: Arc<AtomicBool>) {
+        self.rollback_tokens_restored = Some(flag);
+    }
+
+    pub(crate) fn commit(
+        mut self,
+        payload: InjectedOscillatorPayload,
+    ) -> Result<InjectedConstructedOscillator, InjectedOscillatorConstructionError> {
+        let InjectedOscillatorPayload {
+            frequency_processor,
+            detune_processor,
+            oscillator_processor,
+            param_channel_config,
+            oscillator_channel_config,
+            frequency_initial_value,
+            detune_initial_value,
+        } = payload;
+        let (frequency_processor, frequency_mirror) =
+            match frequency_processor.into_boxed_prevalidated() {
+                Ok(parts) => parts,
+                Err(processor) => {
+                    return Err(self.reject_unboxed_processors(
+                        processor,
+                        detune_processor,
+                        oscillator_processor,
+                    ));
+                }
+            };
+        let (detune_processor, detune_mirror) = match detune_processor.into_boxed_prevalidated() {
+            Ok(parts) => parts,
+            Err(processor) => {
+                return Err(self.reject_boxed_processors(
+                    frequency_processor,
+                    processor,
+                    oscillator_processor,
+                ));
+            }
+        };
+
+        let frequency_mutation = InjectedAudioParamMutation {
+            control: self.control.clone(),
+            node_ids: self.ids.identity(),
+            param_id: self.frequency_id,
+            lifetime: self.frequency.identity(),
+            serializer: Arc::clone(&self.frequency_serializer),
+            mirror: frequency_mirror,
+            #[cfg(test)]
+            finalizer_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            rollback_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            serializer_attempt: Arc::new(Mutex::new(None)),
+        };
+        let detune_mutation = InjectedAudioParamMutation {
+            control: self.control.clone(),
+            node_ids: self.ids.identity(),
+            param_id: self.detune_id,
+            lifetime: self.detune.identity(),
+            serializer: Arc::clone(&self.detune_serializer),
+            mirror: detune_mirror,
+            #[cfg(test)]
+            finalizer_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            rollback_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            serializer_attempt: Arc::new(Mutex::new(None)),
+        };
+        let oscillator_control = InjectedOscillatorControl {
+            control: self.control.clone(),
+            node_ids: self.ids.identity(),
+            id: self.oscillator_id,
+            lifetime: self.oscillator.identity(),
+            ended: self.ended.clone(),
+            serializer: Arc::clone(&self.oscillator_serializer),
+            has_start: Arc::clone(&self.has_start),
+            type_: Arc::clone(&self.type_),
+            #[cfg(test)]
+            runtime_behavior: Arc::new(AtomicU8::new(0)),
+        };
+
+        let mut commands = Vec::with_capacity(OSCILLATOR_COMMAND_COUNT);
+        let frequency_reclaim = self.take_reclaim(FREQUENCY_ID_INDEX)?;
+        let detune_reclaim = self.take_reclaim(DETUNE_ID_INDEX)?;
+        let oscillator_reclaim = self.take_reclaim(OSCILLATOR_ID_INDEX)?;
+        commands.push(ControlMessage::RegisterNode {
+            id: self.frequency_id,
+            reclaim_id: frequency_reclaim,
+            node: frequency_processor,
+            inputs: 1,
+            outputs: 1,
+            channel_config: param_channel_config.clone(),
+        });
+        commands.push(ControlMessage::AudioParamInitialValue {
+            id: self.frequency_id,
+            value: frequency_initial_value,
+        });
+        commands.push(ControlMessage::RegisterNode {
+            id: self.detune_id,
+            reclaim_id: detune_reclaim,
+            node: detune_processor,
+            inputs: 1,
+            outputs: 1,
+            channel_config: param_channel_config,
+        });
+        commands.push(ControlMessage::AudioParamInitialValue {
+            id: self.detune_id,
+            value: detune_initial_value,
+        });
+        commands.push(ControlMessage::RegisterNode {
+            id: self.oscillator_id,
+            reclaim_id: oscillator_reclaim,
+            node: oscillator_processor,
+            inputs: 0,
+            outputs: 1,
+            channel_config: oscillator_channel_config,
+        });
+        commands.push(ControlMessage::ConnectNode {
+            from: self.frequency_id,
+            to: self.oscillator_id,
+            output: 0,
+            input: usize::MAX,
+        });
+        commands.push(ControlMessage::ConnectNode {
+            from: self.detune_id,
+            to: self.oscillator_id,
+            output: 0,
+            input: usize::MAX,
+        });
+
+        let id_commit = self.ids.commit_token().map_err(|error| {
+            self.ids.retain_unavailable();
+            self.control.fail_closed_protocol();
+            InjectedOscillatorConstructionError::NodeIds(error)
+        })?;
+        let arms = [
+            self.oscillator.arm_token(),
+            self.frequency.arm_token(),
+            self.detune.arm_token(),
+        ];
+        let batch = self
+            .reservation
+            .take()
+            .expect("one oscillator transaction owns one reservation")
+            .into_prevalidated(commands);
+        let committed = self.control.try_commit_with_finalize(batch, move |_| {
+            for arm in arms {
+                arm.mark_accepted();
+            }
+            id_commit.commit_accepted();
+            super::injected_node_lifetime::NodeRegistrationArm::arm_accepted_batch(arms)
+        });
+        match committed {
+            Ok(outcome) => self.finish_oscillator_accepted(
+                outcome,
+                frequency_mutation,
+                detune_mutation,
+                oscillator_control,
+            ),
+            Err(CommitWithFinalizeFailure::AcceptedFinalizer(failure)) => Err(
+                InjectedOscillatorConstructionError::AcceptedFinalizer(failure),
+            ),
+            Err(CommitWithFinalizeFailure::NotAccepted(failure)) => self
+                .rollback_oscillator_not_accepted(
+                    failure,
+                    frequency_mutation,
+                    detune_mutation,
+                    oscillator_control,
+                ),
+        }
+    }
+
+    fn take_reclaim(
+        &mut self,
+        index: usize,
+    ) -> Result<llq::Node<AudioNodeId>, InjectedOscillatorConstructionError> {
+        self.ids.take_reclaim_node(index).map_err(|error| {
+            self.ids.retain_unavailable();
+            self.control.fail_closed_protocol();
+            InjectedOscillatorConstructionError::NodeIds(error)
+        })
+    }
+
+    fn finish_oscillator_accepted(
+        self,
+        outcome: CommitControlOutcome,
+        frequency_mutation: InjectedAudioParamMutation,
+        detune_mutation: InjectedAudioParamMutation,
+        oscillator_control: InjectedOscillatorControl,
+    ) -> Result<InjectedConstructedOscillator, InjectedOscillatorConstructionError> {
+        let Self {
+            control: _,
+            ids,
+            oscillator,
+            frequency,
+            detune,
+            oscillator_connection,
+            frequency_connection,
+            detune_connection,
+            oscillator_id,
+            frequency_id,
+            detune_id,
+            ended: _,
+            oscillator_serializer: _,
+            frequency_serializer: _,
+            detune_serializer: _,
+            has_start: _,
+            type_: _,
+            #[cfg(test)]
+                rollback_tokens_restored: _,
+            reservation: _,
+        } = self;
+        drop(ids);
+        if !oscillator.ready_for_registration()
+            || !frequency.ready_for_registration()
+            || !detune.ready_for_registration()
+        {
+            for arm in [
+                oscillator.arm_token(),
+                frequency.arm_token(),
+                detune.arm_token(),
+            ] {
+                arm.quarantine_accepted();
+            }
+            return Err(InjectedOscillatorConstructionError::ProtocolViolation);
+        }
+        Ok(InjectedConstructedOscillator {
+            oscillator_id,
+            frequency_id,
+            detune_id,
+            oscillator_registration: oscillator
+                .into_registration()
+                .expect("preflighted exact oscillator registration"),
+            frequency_registration: frequency
+                .into_registration()
+                .expect("preflighted exact frequency registration"),
+            detune_registration: detune
+                .into_registration()
+                .expect("preflighted exact detune registration"),
+            oscillator_connection,
+            frequency_connection,
+            detune_connection,
+            frequency_mutation,
+            detune_mutation,
+            oscillator_control,
+            outcome,
+        })
+    }
+
+    fn rollback_oscillator_not_accepted(
+        self,
+        failure: super::injected_control::CommitControlFailure,
+        frequency_mutation: InjectedAudioParamMutation,
+        detune_mutation: InjectedAudioParamMutation,
+        oscillator_control: InjectedOscillatorControl,
+    ) -> Result<InjectedConstructedOscillator, InjectedOscillatorConstructionError> {
+        let Self {
+            control,
+            ids,
+            oscillator,
+            frequency,
+            detune,
+            oscillator_connection: _,
+            frequency_connection: _,
+            detune_connection: _,
+            oscillator_id,
+            frequency_id,
+            detune_id,
+            ended: _,
+            oscillator_serializer: _,
+            frequency_serializer: _,
+            detune_serializer: _,
+            has_start: _,
+            type_: _,
+            #[cfg(test)]
+            rollback_tokens_restored,
+            reservation: _,
+        } = self;
+        let destructor_panicked = std::cell::Cell::new(false);
+        let destructor_panicked_in_rollback = &destructor_panicked;
+        let (error, rollback) = failure.rollback_with_commands(move |commands| {
+            let mut guard = FailClosedOscillatorConstructionRollback::new(control, ids);
+            let recovery = recover_oscillator_commands(
+                commands,
+                guard.ids_mut(),
+                oscillator_id,
+                frequency_id,
+                detune_id,
+                #[cfg(test)]
+                rollback_tokens_restored.as_deref(),
+            );
+            destructor_panicked_in_rollback.set(recovery.destructor_panicked);
+            drop(frequency_mutation);
+            drop(detune_mutation);
+            drop(oscillator_control);
+            drop(oscillator);
+            drop(frequency);
+            drop(detune);
+            if recovery.exact && !recovery.destructor_panicked {
+                guard.disarm();
+            }
+            recovery.exact && !recovery.destructor_panicked
+        });
+        match rollback {
+            RejectedControlRollback::Completed(true) => {
+                Err(InjectedOscillatorConstructionError::Control(error))
+            }
+            RejectedControlRollback::Completed(false) => {
+                if destructor_panicked.get() {
+                    Err(InjectedOscillatorConstructionError::RejectedPayloadPanicked)
+                } else {
+                    Err(InjectedOscillatorConstructionError::ProtocolViolation)
+                }
+            }
+            RejectedControlRollback::Panicked => {
+                Err(InjectedOscillatorConstructionError::RejectedPayloadPanicked)
+            }
+        }
+    }
+
+    fn reject_boxed_processors(
+        self,
+        frequency: Box<dyn AudioProcessor>,
+        detune: InjectedAudioParamProcessor,
+        oscillator: Box<dyn AudioProcessor>,
+    ) -> InjectedOscillatorConstructionError {
+        let (control, reservation) = self.rollback_before_rejected_processor_drop();
+        let panicked = catch_individual_payload_drop(frequency)
+            | catch_individual_payload_drop(detune)
+            | catch_individual_payload_drop(oscillator);
+        if panicked {
+            control.fail_closed_protocol();
+        }
+        drop(reservation);
+        if panicked {
+            InjectedOscillatorConstructionError::RejectedPayloadPanicked
+        } else {
+            InjectedOscillatorConstructionError::ProtocolViolation
+        }
+    }
+
+    fn reject_unboxed_processors(
+        self,
+        frequency: InjectedAudioParamProcessor,
+        detune: InjectedAudioParamProcessor,
+        oscillator: Box<dyn AudioProcessor>,
+    ) -> InjectedOscillatorConstructionError {
+        let (control, reservation) = self.rollback_before_rejected_processor_drop();
+        let panicked = catch_individual_payload_drop(frequency)
+            | catch_individual_payload_drop(detune)
+            | catch_individual_payload_drop(oscillator);
+        if panicked {
+            control.fail_closed_protocol();
+        }
+        drop(reservation);
+        if panicked {
+            InjectedOscillatorConstructionError::RejectedPayloadPanicked
+        } else {
+            InjectedOscillatorConstructionError::ProtocolViolation
+        }
+    }
+
+    /// Cancels the three provisional registrations and restores all three IDs while graph
+    /// admission is still retained. Hostile caller-supplied processors are destroyed only after
+    /// this returns; the reservation is returned separately so it remains the last-drop owner.
+    fn rollback_before_rejected_processor_drop(
+        self,
+    ) -> (InjectedControlProducer, Option<ControlBatchReservation>) {
+        let Self {
+            control,
+            ids,
+            oscillator,
+            frequency,
+            detune,
+            oscillator_connection,
+            frequency_connection,
+            detune_connection,
+            oscillator_id: _,
+            frequency_id: _,
+            detune_id: _,
+            ended,
+            oscillator_serializer,
+            frequency_serializer,
+            detune_serializer,
+            has_start,
+            type_,
+            #[cfg(test)]
+                rollback_tokens_restored: _,
+            reservation,
+        } = self;
+        drop(oscillator);
+        drop(frequency);
+        drop(detune);
+        drop(ids);
+        drop(oscillator_connection);
+        drop(frequency_connection);
+        drop(detune_connection);
+        drop(ended);
+        drop(oscillator_serializer);
+        drop(frequency_serializer);
+        drop(detune_serializer);
+        drop(has_start);
+        drop(type_);
+        (control, reservation)
+    }
+}
+
+fn catch_individual_payload_drop<T>(payload: T) -> bool {
+    panic::catch_unwind(AssertUnwindSafe(|| drop(payload))).map_or_else(
+        |panic_payload| {
+            std::mem::forget(panic_payload);
+            true
+        },
+        |()| false,
+    )
+}
+
+struct FailClosedOscillatorConstructionRollback {
+    control: InjectedControlProducer,
+    ids: ProvisionalNodeIds,
+    armed: bool,
+}
+
+impl FailClosedOscillatorConstructionRollback {
+    fn new(control: InjectedControlProducer, ids: ProvisionalNodeIds) -> Self {
+        Self {
+            control,
+            ids,
+            armed: true,
+        }
+    }
+
+    fn ids_mut(&mut self) -> &mut ProvisionalNodeIds {
+        &mut self.ids
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailClosedOscillatorConstructionRollback {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ids.retain_unavailable();
+            self.control.fail_closed_protocol();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RejectedOscillatorRecovery {
+    exact: bool,
+    destructor_panicked: bool,
+}
+
+fn recover_oscillator_commands(
+    commands: Box<[ControlMessage]>,
+    ids: &mut ProvisionalNodeIds,
+    oscillator_id: AudioNodeId,
+    frequency_id: AudioNodeId,
+    detune_id: AudioNodeId,
+    #[cfg(test)] rollback_tokens_restored: Option<&AtomicBool>,
+) -> RejectedOscillatorRecovery {
+    let mut exact = commands.len() == OSCILLATOR_COMMAND_COUNT;
+    let mut saw = [false; OSCILLATOR_NODE_COUNT];
+    let mut processors: ArrayVec<Box<dyn AudioProcessor>, OSCILLATOR_NODE_COUNT> = ArrayVec::new();
+    let mut other: ArrayVec<ControlMessage, OSCILLATOR_COMMAND_COUNT> = ArrayVec::new();
+    for (index, command) in commands.into_vec().into_iter().enumerate() {
+        match command {
+            ControlMessage::RegisterNode {
+                id,
+                reclaim_id,
+                node,
+                inputs,
+                outputs,
+                channel_config: _,
+            } => {
+                let (slot, expected_index, expected_inputs) = if id == frequency_id {
+                    (FREQUENCY_ID_INDEX, 0, 1)
+                } else if id == detune_id {
+                    (DETUNE_ID_INDEX, 2, 1)
+                } else if id == oscillator_id {
+                    (OSCILLATOR_ID_INDEX, 4, 0)
+                } else {
+                    exact = false;
+                    std::mem::forget(reclaim_id);
+                    if let Err(error) = processors.try_push(node) {
+                        std::mem::forget(error.element());
+                    }
+                    continue;
+                };
+                exact &= !saw[slot]
+                    && index == expected_index
+                    && inputs == expected_inputs
+                    && outputs == 1
+                    && *reclaim_id == id;
+                saw[slot] = true;
+                if *reclaim_id == id {
+                    if let Err(failure) = ids.restore_reclaim_node(slot, reclaim_id) {
+                        exact = false;
+                        std::mem::forget(failure.node);
+                    }
+                } else {
+                    std::mem::forget(reclaim_id);
+                }
+                if let Err(error) = processors.try_push(node) {
+                    exact = false;
+                    std::mem::forget(error.element());
+                }
+            }
+            command @ ControlMessage::AudioParamInitialValue { id, .. } => {
+                exact &= (index == 1 && id == frequency_id) || (index == 3 && id == detune_id);
+                if let Err(error) = other.try_push(command) {
+                    exact = false;
+                    std::mem::forget(error.element());
+                }
+            }
+            command @ ControlMessage::ConnectNode {
+                from,
+                to,
+                output,
+                input,
+            } => {
+                exact &= ((index == 5 && from == frequency_id)
+                    || (index == 6 && from == detune_id))
+                    && to == oscillator_id
+                    && output == 0
+                    && input == usize::MAX;
+                if let Err(error) = other.try_push(command) {
+                    exact = false;
+                    std::mem::forget(error.element());
+                }
+            }
+            command => {
+                exact = false;
+                if let Err(error) = other.try_push(command) {
+                    std::mem::forget(error.element());
+                }
+            }
+        }
+    }
+    exact &= saw.iter().all(|value| *value);
+    #[cfg(test)]
+    if exact {
+        if let Some(restored) = rollback_tokens_restored {
+            restored.store(true, Ordering::Release);
+        }
+    }
+    let mut destructor_panicked = false;
+    while let Some(command) = other.pop() {
+        destructor_panicked |= catch_individual_payload_drop(command);
+    }
+    while let Some(processor) = processors.pop() {
+        destructor_panicked |= catch_individual_payload_drop(processor);
+    }
+    RejectedOscillatorRecovery {
+        exact,
+        destructor_panicked,
+    }
+}
 
 /// Opaque capability created only after exact control, allocator, and lifetime identities match.
 pub(crate) struct InjectedNodeConstructor {

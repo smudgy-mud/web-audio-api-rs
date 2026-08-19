@@ -922,6 +922,10 @@ pub(crate) struct ControlHandleDroppedReservation(ControlBatchReservation);
 #[must_use]
 pub(crate) struct InjectedAudioParamValueReservation(ControlBatchReservation);
 
+/// Dedicated one-command reservation for an exact oscillator start/stop/type update.
+#[must_use]
+pub(crate) struct InjectedOscillatorCommandReservation(ControlBatchReservation);
+
 impl ControlBatchReservation {
     pub(crate) fn prepare_with<F>(
         self,
@@ -997,6 +1001,16 @@ impl InjectedAudioParamValueReservation {
     ) -> PreparedControlBatch {
         self.0
             .into_prevalidated(vec![ControlMessage::InjectedAudioParamValue { id, value }])
+    }
+}
+
+impl InjectedOscillatorCommandReservation {
+    pub(crate) fn prepare(
+        self,
+        value: super::injected_node_construction::InjectedOscillatorWireCommand,
+    ) -> PreparedControlBatch {
+        self.0
+            .into_prevalidated(vec![ControlMessage::InjectedOscillator(value)])
     }
 }
 
@@ -1246,6 +1260,11 @@ fn flush_staged_locked(
 
 impl InjectedControlProducer {
     #[cfg(test)]
+    pub(crate) fn render_protocol_failed_for_test(&self) -> bool {
+        self.inner.applied.render_protocol_failed()
+    }
+
+    #[cfg(test)]
     pub(crate) fn try_commit_prevalidated_for_test(
         &self,
         commands: Vec<ControlMessage>,
@@ -1482,6 +1501,13 @@ impl InjectedControlProducer {
             release.recv().unwrap();
         }
         Ok(InjectedAudioParamValueReservation(reservation))
+    }
+
+    pub(crate) fn try_begin_oscillator_command(
+        &self,
+    ) -> Result<InjectedOscillatorCommandReservation, InjectedControlError> {
+        self.try_begin_operation(1)
+            .map(InjectedOscillatorCommandReservation)
     }
 
     /// Latches an impossible typed-transaction shape mismatch as terminal while its caller still

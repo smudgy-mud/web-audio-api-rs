@@ -996,6 +996,9 @@ pub(crate) enum ControlMessage {
         value: crate::param::InjectedAudioParamValue,
     },
 
+    /// Fixed, non-general exact oscillator start/stop/type command.
+    InjectedOscillator(crate::context::InjectedOscillatorWireCommand),
+
     /// Request a diagnostic report of the audio graph
     #[cfg(feature = "diagnostics")]
     RunDiagnostics { backend: AudioBackendDiagnostics },
