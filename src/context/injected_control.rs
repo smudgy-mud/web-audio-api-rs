@@ -858,6 +858,32 @@ pub(crate) struct ControlBatchReservation {
     admission: GraphControlAdmission,
 }
 
+/// Admission-only start of one exact graph operation.
+///
+/// This non-clone token is acquired before a host-side serializer. It makes a caller which is
+/// waiting to determine its exact command count visible to Close without consuming any bounded
+/// transport capacity. `reserve_commands` moves the same admission into the resulting batch; it
+/// never releases and reacquires the gate across that upgrade.
+#[must_use]
+pub(super) struct AdmittedGraphOperation {
+    inner: Arc<InjectedControlInner>,
+    admission: GraphControlAdmission,
+}
+
+pub(super) struct ReserveAdmittedGraphOperationFailure {
+    pub(super) error: InjectedControlError,
+    pub(super) operation: AdmittedGraphOperation,
+}
+
+impl AdmittedGraphOperation {
+    pub(super) fn reserve_commands(
+        self,
+        command_count: usize,
+    ) -> Result<ControlBatchReservation, ReserveAdmittedGraphOperationFailure> {
+        InjectedControlProducer::reserve_admitted_operation(self, command_count)
+    }
+}
+
 /// Dedicated one-command reservation for node-handle teardown. Keeping this wrapper separate from
 /// ordinary batch preparation prevents `ControlHandleDropped` from entering the general mutation
 /// whitelist while still using the same bounded transport and admission accounting.
@@ -1200,19 +1226,11 @@ impl InjectedControlProducer {
         InjectedControlIdentity(Arc::downgrade(&self.inner))
     }
 
-    /// Reserves logical, storage, and state-specific placement capacity before caller mutation.
-    /// Physical FIFO and sequence order are commit order. A future mirror transaction must
-    /// serialize its mirror mutation plus commit if concurrent callers require mutation order.
-    pub(crate) fn try_begin_operation(
+    /// Acquires only the exact graph admission for an operation whose bounded command count is
+    /// not known until after serialized host inspection.
+    pub(super) fn try_admit_graph_operation(
         &self,
-        command_count: usize,
-    ) -> Result<ControlBatchReservation, InjectedControlError> {
-        if command_count == 0 {
-            return Err(InjectedControlError::Empty);
-        }
-        if command_count > CONTROL_BATCH_CAPACITY {
-            return Err(InjectedControlError::TooLarge);
-        }
+    ) -> Result<AdmittedGraphOperation, InjectedControlError> {
         let admission = self.inner.gate.try_graph_control()?;
         let state = try_state(&self.inner)?;
         if state.disconnected {
@@ -1224,57 +1242,177 @@ impl InjectedControlProducer {
             return Err(InjectedControlError::ProtocolViolation);
         }
         match state.phase {
-            TransportPhase::Open => {}
-            TransportPhase::Transitioning => return Err(InjectedControlError::Contended),
-            TransportPhase::SealStarted | TransportPhase::Sealed => {
-                return Err(InjectedControlError::Sealed)
-            }
+            TransportPhase::Open | TransportPhase::Transitioning | TransportPhase::SealStarted => {}
+            TransportPhase::Sealed => return Err(InjectedControlError::Sealed),
             TransportPhase::Failed => return Err(InjectedControlError::ProtocolViolation),
         }
-        let command_credit = self
-            .inner
-            .logical_commands
-            .try_acquire(command_count)
-            .ok_or(InjectedControlError::LogicalCommandCredits)?;
-        let storage = self
-            .inner
-            .batch_storage
-            .try_acquire()
-            .ok_or(InjectedControlError::BatchStorageCredits)?;
-        let outstanding = self
-            .inner
-            .batch_sequence_reservations
-            .load(Ordering::Acquire);
+        drop(state);
+        Ok(AdmittedGraphOperation {
+            inner: Arc::clone(&self.inner),
+            admission,
+        })
+    }
+
+    /// Reserves logical, storage, and state-specific placement capacity before caller mutation.
+    /// Physical FIFO and sequence order are commit order. A future mirror transaction must
+    /// serialize its mirror mutation plus commit if concurrent callers require mutation order.
+    pub(crate) fn try_begin_operation(
+        &self,
+        command_count: usize,
+    ) -> Result<ControlBatchReservation, InjectedControlError> {
+        // Preserve the established generic API precedence: invalid counts never consult or
+        // mutate admission/transport state. The admitted exact path repeats this validation
+        // because its count is deliberately learned only after admission.
+        if command_count == 0 {
+            return Err(InjectedControlError::Empty);
+        }
+        if command_count > CONTROL_BATCH_CAPACITY {
+            return Err(InjectedControlError::TooLarge);
+        }
+        let admitted = self.try_admit_graph_operation()?;
+        admitted
+            .reserve_commands(command_count)
+            .map_err(|failure| failure.error)
+    }
+
+    pub(super) fn matches_admitted_operation(&self, operation: &AdmittedGraphOperation) -> bool {
+        Arc::ptr_eq(&self.inner, &operation.inner)
+    }
+
+    fn reserve_admitted_operation(
+        operation: AdmittedGraphOperation,
+        command_count: usize,
+    ) -> Result<ControlBatchReservation, ReserveAdmittedGraphOperationFailure> {
+        if command_count == 0 {
+            return Err(ReserveAdmittedGraphOperationFailure {
+                error: InjectedControlError::Empty,
+                operation,
+            });
+        }
+        if command_count > CONTROL_BATCH_CAPACITY {
+            return Err(ReserveAdmittedGraphOperationFailure {
+                error: InjectedControlError::TooLarge,
+                operation,
+            });
+        }
+        let inner = Arc::clone(&operation.inner);
+        let state = match try_state(&inner) {
+            Ok(state) => state,
+            Err(error) => {
+                return Err(ReserveAdmittedGraphOperationFailure { error, operation });
+            }
+        };
+        if state.disconnected {
+            drop(state);
+            return Err(ReserveAdmittedGraphOperationFailure {
+                error: InjectedControlError::Disconnected,
+                operation,
+            });
+        }
+        if inner.accepted_finalizer_failed.load(Ordering::Acquire)
+            || inner.applied.render_protocol_failed()
+        {
+            drop(state);
+            return Err(ReserveAdmittedGraphOperationFailure {
+                error: InjectedControlError::ProtocolViolation,
+                operation,
+            });
+        }
+        match state.phase {
+            // SealStarted is legal only because this exact admission was acquired before the gate
+            // sealed. Close cannot drain while `operation` remains alive.
+            TransportPhase::Open | TransportPhase::SealStarted => {}
+            TransportPhase::Transitioning => {
+                drop(state);
+                return Err(ReserveAdmittedGraphOperationFailure {
+                    error: InjectedControlError::Contended,
+                    operation,
+                });
+            }
+            TransportPhase::Sealed => {
+                drop(state);
+                return Err(ReserveAdmittedGraphOperationFailure {
+                    error: InjectedControlError::Sealed,
+                    operation,
+                });
+            }
+            TransportPhase::Failed => {
+                drop(state);
+                return Err(ReserveAdmittedGraphOperationFailure {
+                    error: InjectedControlError::ProtocolViolation,
+                    operation,
+                });
+            }
+        }
+        let Some(command_credit) = inner.logical_commands.try_acquire(command_count) else {
+            drop(state);
+            return Err(ReserveAdmittedGraphOperationFailure {
+                error: InjectedControlError::LogicalCommandCredits,
+                operation,
+            });
+        };
+        let Some(storage) = inner.batch_storage.try_acquire() else {
+            drop(state);
+            drop(command_credit);
+            return Err(ReserveAdmittedGraphOperationFailure {
+                error: InjectedControlError::BatchStorageCredits,
+                operation,
+            });
+        };
+        let outstanding = inner.batch_sequence_reservations.load(Ordering::Acquire);
         let Some(reserved_sequence) = state.next_batch_sequence.checked_add(outstanding as u64)
         else {
-            return Err(InjectedControlError::SequenceExhausted);
+            drop(state);
+            drop(storage);
+            drop(command_credit);
+            return Err(ReserveAdmittedGraphOperationFailure {
+                error: InjectedControlError::SequenceExhausted,
+                operation,
+            });
         };
         if reserved_sequence == u64::MAX {
-            return Err(InjectedControlError::SequenceExhausted);
+            drop(state);
+            drop(storage);
+            drop(command_credit);
+            return Err(ReserveAdmittedGraphOperationFailure {
+                error: InjectedControlError::SequenceExhausted,
+                operation,
+            });
         }
-        self.inner
+        inner
             .batch_sequence_reservations
             .fetch_add(1, Ordering::AcqRel);
         let sequence_reservation =
-            BatchSequenceReservation(Arc::clone(&self.inner.batch_sequence_reservations));
+            BatchSequenceReservation(Arc::clone(&inner.batch_sequence_reservations));
         let placement = if state.placement == TransportPlacement::Staged {
-            ReservedPlacement::Staged(
-                self.inner
-                    .staging_slots
-                    .try_acquire()
-                    .ok_or(InjectedControlError::StagingFull)?,
-            )
+            let Some(slot) = inner.staging_slots.try_acquire() else {
+                drop(state);
+                drop(sequence_reservation);
+                drop(storage);
+                drop(command_credit);
+                return Err(ReserveAdmittedGraphOperationFailure {
+                    error: InjectedControlError::StagingFull,
+                    operation,
+                });
+            };
+            ReservedPlacement::Staged(slot)
         } else {
-            let physical = self
-                .inner
-                .ordinary_physical
-                .try_acquire()
-                .ok_or(InjectedControlError::OrdinaryPhysicalCredits)?;
+            let Some(physical) = inner.ordinary_physical.try_acquire() else {
+                drop(state);
+                drop(sequence_reservation);
+                drop(storage);
+                drop(command_credit);
+                return Err(ReserveAdmittedGraphOperationFailure {
+                    error: InjectedControlError::OrdinaryPhysicalCredits,
+                    operation,
+                });
+            };
             ReservedPlacement::Running(physical)
         };
         drop(state);
+        let AdmittedGraphOperation { inner, admission } = operation;
         Ok(ControlBatchReservation {
-            inner: Arc::clone(&self.inner),
+            inner,
             command_count,
             storage,
             command_credit,
@@ -2328,6 +2466,115 @@ mod tests {
                 gc.join().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn admitted_graph_operation_survives_seal_start_and_drain_waits_for_it() {
+        let mut harness = Harness::new(1, false);
+        let admitted = harness.producer.try_admit_graph_operation().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let retirement = harness
+            .owner
+            .take()
+            .unwrap()
+            .try_begin_close()
+            .ok()
+            .unwrap();
+        let (done_send, done_recv) = crossbeam_channel::bounded(1);
+        let waiter = thread::spawn(move || {
+            let drained = retirement.retire_and_wait().1;
+            done_send.send(drained).unwrap();
+        });
+        assert!(matches!(
+            done_recv.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        ));
+
+        let reservation = match admitted.reserve_commands(1) {
+            Ok(reservation) => reservation,
+            Err(_) => panic!("a pre-seal admission must reserve during SealStarted"),
+        };
+        let prepared = reservation
+            .prepare_with(|| {
+                vec![ControlMessage::TestMarker {
+                    value: 7,
+                    log: Arc::clone(&log),
+                }]
+            })
+            .ok()
+            .unwrap();
+        assert_eq!(
+            harness.producer.try_commit(prepared).unwrap(),
+            CommitControlOutcome::Enqueued { sequence: 1 }
+        );
+        let drained = done_recv
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        waiter.join().unwrap();
+        let transport = drained.finish().ok().unwrap();
+        assert_eq!(transport.close.barrier().required_batch_sequence(), 1);
+        assert_eq!(harness.producer.applied_batch_sequence(), 0);
+        harness.callback();
+        assert_eq!(*log.lock().unwrap(), vec![7]);
+        assert_eq!(harness.producer.applied_batch_sequence(), 1);
+        assert!(matches!(
+            transport.close.snapshot(),
+            GraphLifecycleSnapshot::Applied {
+                observed_batch_sequence: 1,
+                outcome: GraphLifecycleOutcome::Applied,
+                ..
+            }
+        ));
+        drop(transport);
+    }
+
+    #[test]
+    fn admitted_capacity_failure_returns_same_lease_without_credit_leak() {
+        let harness = Harness::new(1, false);
+        let occupied = harness.producer.try_begin_operation(1).unwrap();
+        let admitted = harness.producer.try_admit_graph_operation().unwrap();
+        let failure = match admitted.reserve_commands(1) {
+            Ok(_) => panic!("the sole physical slot is occupied"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.error, InjectedControlError::OrdinaryPhysicalCredits);
+        assert!(harness
+            .producer
+            .matches_admitted_operation(&failure.operation));
+        assert_eq!(harness.producer.accounting(), (1, 1, 1, 0));
+        drop(occupied);
+        let reservation = match failure.operation.reserve_commands(1) {
+            Ok(reservation) => reservation,
+            Err(_) => panic!("the returned admission remains operational"),
+        };
+        assert_eq!(harness.producer.accounting(), (1, 1, 1, 0));
+        drop(reservation);
+        assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn generic_invalid_count_precedes_closed_gate_state() {
+        let mut harness = Harness::new(1, false);
+        let retirement = harness
+            .owner
+            .take()
+            .unwrap()
+            .try_begin_close()
+            .ok()
+            .unwrap();
+        assert_eq!(
+            harness.producer.try_begin_operation(0).err(),
+            Some(InjectedControlError::Empty)
+        );
+        assert_eq!(
+            harness
+                .producer
+                .try_begin_operation(CONTROL_BATCH_CAPACITY + 1)
+                .err(),
+            Some(InjectedControlError::TooLarge)
+        );
+        let drained = retirement.retire_and_wait().1;
+        drop(drained.finish().ok().unwrap());
     }
 
     fn prepare_with(

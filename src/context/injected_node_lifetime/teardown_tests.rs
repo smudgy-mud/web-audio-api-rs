@@ -46,16 +46,19 @@ enum CleanupBehavior {
     Reject,
     Panic,
     DropPanic,
+    RetryTwice,
 }
 
 struct CleanupProbe {
     behavior: CleanupBehavior,
+    attempts: usize,
     reconciled: Arc<Mutex<Vec<(AudioNodeId, ThreadId)>>>,
     dropped: Arc<Mutex<Vec<ThreadId>>>,
 }
 
 impl InjectedNodeReclaimCleanup for CleanupProbe {
     fn reconcile(&mut self, id: AudioNodeId) -> Result<(), NodeReclaimCleanupError> {
+        self.attempts += 1;
         self.reconciled
             .lock()
             .unwrap()
@@ -64,6 +67,26 @@ impl InjectedNodeReclaimCleanup for CleanupProbe {
             CleanupBehavior::Ok | CleanupBehavior::DropPanic => Ok(()),
             CleanupBehavior::Reject => Err(NodeReclaimCleanupError::Rejected),
             CleanupBehavior::Panic => panic!("reconcile panic"),
+            CleanupBehavior::RetryTwice if self.attempts <= 2 => {
+                Err(NodeReclaimCleanupError::RetryContended)
+            }
+            CleanupBehavior::RetryTwice => Ok(()),
+        }
+    }
+
+    fn reconcile_after_whole_graph(
+        &mut self,
+        id: AudioNodeId,
+    ) -> Result<(), NodeReclaimCleanupError> {
+        if matches!(self.behavior, CleanupBehavior::RetryTwice) {
+            self.attempts += 1;
+            self.reconciled
+                .lock()
+                .unwrap()
+                .push((id, thread::current().id()));
+            Ok(())
+        } else {
+            self.reconcile(id)
         }
     }
 }
@@ -88,6 +111,7 @@ fn probe(behavior: CleanupBehavior) -> (Box<dyn InjectedNodeReclaimCleanup>, Pro
     (
         Box::new(CleanupProbe {
             behavior,
+            attempts: 0,
             reconciled: Arc::clone(&reconciled),
             dropped: Arc::clone(&dropped),
         }),
@@ -274,6 +298,89 @@ fn typed_teardown_stays_out_of_general_batching_and_reuses_only_after_cleanup() 
     assert_eq!(staged, 1);
     assert_eq!(foundation.producer.accounting(), (0, 0, 0, 0));
     assert_eq!(retire(registry).cleanup_count, 0);
+}
+
+#[test]
+fn retryable_cleanup_restores_exact_requested_and_awaiting_state_without_id_reuse() {
+    for awaiting in [false, true] {
+        let mut foundation = Foundation::new(1, 300 + u64::from(awaiting), 1, true);
+        let registered = foundation.register(CleanupBehavior::RetryTwice);
+        let id = registered.id;
+        let key = registered.key;
+        drop(registered.live);
+        if awaiting {
+            assert!(matches!(
+                foundation.owner.as_mut().unwrap().try_drive_once(),
+                NodeLifetimeDriveOutcome::Submitted { id: submitted, .. } if submitted == id
+            ));
+        }
+        foundation
+            .graph
+            .as_mut()
+            .unwrap()
+            .push_for_test(registered.reclaim);
+
+        let expected_phase = if awaiting {
+            SlotPhase::AwaitingReclaim
+        } else {
+            SlotPhase::Requested
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                foundation.owner.as_mut().unwrap().try_drive_once(),
+                NodeLifetimeDriveOutcome::Retry {
+                    id,
+                    reason: NodeLifetimeRetryReason::Contended,
+                }
+            );
+            let slot = &foundation.owner.as_ref().unwrap().inner().slots[key.slot];
+            let word = slot.word.load(Ordering::Acquire);
+            assert_eq!(SlotPhase::from_word(word), expected_phase);
+            assert!(has_reclaim(word));
+            let reserved = foundation.allocator.try_reserve(1).unwrap();
+            assert_ne!(reserved.id(0), id);
+            drop(reserved);
+        }
+        assert_eq!(
+            foundation.owner.as_mut().unwrap().try_drive_once(),
+            NodeLifetimeDriveOutcome::Reconciled { id }
+        );
+        // The two rejected probe reservations are also in the allocator FIFO. Reserve the whole
+        // small set at once so the exact reconciled ID cannot be hidden behind their order.
+        let reserved = foundation.allocator.try_reserve(4).unwrap();
+        assert!((0..4).any(|index| reserved.id(index) == id));
+        drop(reserved);
+    }
+}
+
+#[test]
+fn seal_retains_retryable_cleanup_for_unique_whole_graph_reconciliation() {
+    let mut foundation = Foundation::new(1, 400, 1, true);
+    let registered = foundation.register(CleanupBehavior::RetryTwice);
+    let id = registered.id;
+    let reconciled = Arc::clone(&registered.records.0);
+    drop(registered.live);
+    foundation
+        .graph
+        .as_mut()
+        .unwrap()
+        .push_for_test(registered.reclaim);
+    assert_eq!(
+        foundation.owner.as_mut().unwrap().try_drive_once(),
+        NodeLifetimeDriveOutcome::Retry {
+            id,
+            reason: NodeLifetimeRetryReason::Contended,
+        }
+    );
+    let reserved = foundation.allocator.try_reserve(1).unwrap();
+    assert_ne!(reserved.id(0), id);
+    drop(reserved);
+
+    let (registry, _) = foundation.close_and_seal();
+    let report = retire(registry);
+    assert_eq!(report.cleanup_count, 1);
+    assert!(!report.cleanup_rejected);
+    assert_eq!(reconciled.lock().unwrap().len(), 2);
 }
 
 #[test]
