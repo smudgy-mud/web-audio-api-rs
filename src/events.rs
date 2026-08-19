@@ -13,6 +13,8 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::Receiver;
 
+use crate::render::InjectedEventDispatchSender;
+
 type EventActivityHandler = dyn Fn() + Send + Sync + 'static;
 
 /// The Event interface
@@ -204,7 +206,7 @@ enum EventLoopStop {
 
 /// Confirmed reason that a lifecycle-owned event-loop thread exited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // consumed by the pending context lifecycle integration
+#[allow(dead_code)] // consumed by private B3b lifecycle; public AudioContext wiring is pending
 pub(crate) enum EventLoopExit {
     /// Queued records were drained and one final `Closed` state change was dispatched.
     Graceful,
@@ -213,7 +215,7 @@ pub(crate) enum EventLoopExit {
 }
 
 /// Join failure for the lifecycle-owned event-loop thread.
-#[allow(dead_code)] // consumed by the pending context lifecycle integration
+#[allow(dead_code)] // consumed by private B3b lifecycle; public AudioContext wiring is pending
 pub(crate) enum EventLoopJoinError {
     /// Joining the current thread would deadlock.
     CurrentThread,
@@ -242,21 +244,74 @@ impl std::fmt::Debug for EventLoopJoinError {
 /// from this event thread remains or can begin. A successful join does not prove destruction of
 /// handlers or queued payloads retained by other [`EventLoop`] or receiver clones. This owner is
 /// `Send`, so a lifecycle worker may request stop and move it to a different thread for the join.
-#[allow(dead_code)] // consumed by the pending context lifecycle integration
+#[allow(dead_code)] // consumed by private B3b lifecycle; public AudioContext wiring is pending
 pub(crate) struct JoinableEventLoop {
     stop_send: crossbeam_channel::Sender<EventLoopStop>,
     join: Option<JoinHandle<Result<EventLoopExit, EventLoopJoinError>>>,
     stop_requested: bool,
 }
 
-#[allow(dead_code)] // consumed by the pending context lifecycle integration
+/// Opaque consumer/join owner paired with [`InjectedEventDispatchSender`].
+pub(crate) struct InjectedJoinableEventLoop {
+    event_loop: JoinableEventLoop,
+    identity: Arc<()>,
+}
+
+impl InjectedJoinableEventLoop {
+    pub(crate) fn into_event_loop(self) -> JoinableEventLoop {
+        self.event_loop
+    }
+
+    pub(crate) fn matches_identity(&self, identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.identity, identity)
+    }
+}
+
+/// Creates both exact halves without ever exposing a separable raw injected sender.
+#[allow(dead_code)] // selected by the pending private injected AudioContext constructor
+pub(crate) fn injected_event_loop_pair(
+) -> std::io::Result<(InjectedEventDispatchSender, InjectedJoinableEventLoop)> {
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let event_loop = EventLoop::new(receiver).run_joinable()?;
+    Ok(finish_injected_event_loop_pair(sender, event_loop))
+}
+
+#[cfg(test)]
+pub(crate) fn injected_event_loop_pair_with_setup(
+    setup: impl FnOnce(&EventLoop),
+) -> std::io::Result<(InjectedEventDispatchSender, InjectedJoinableEventLoop)> {
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let event_loop = EventLoop::new(receiver);
+    setup(&event_loop);
+    Ok(finish_injected_event_loop_pair(
+        sender,
+        event_loop.run_joinable()?,
+    ))
+}
+
+fn finish_injected_event_loop_pair(
+    sender: crossbeam_channel::Sender<EventDispatch>,
+    event_loop: JoinableEventLoop,
+) -> (InjectedEventDispatchSender, InjectedJoinableEventLoop) {
+    let identity = Arc::new(());
+    (
+        InjectedEventDispatchSender::from_event_loop_pair(sender, Arc::clone(&identity)),
+        InjectedJoinableEventLoop {
+            event_loop,
+            identity,
+        },
+    )
+}
+
+#[allow(dead_code)] // consumed by private B3b lifecycle; public AudioContext wiring is pending
 impl JoinableEventLoop {
     /// Requests an ordered graceful stop.
     ///
     /// Render and control producers must already be quiescent. The event thread drains records
     /// already in the queue, coalescing any real `Closed` records, then dispatches exactly one
-    /// final `Closed` state change. Establishing producer quiescence belongs to the pending context
-    /// lifecycle integration. Call [`Self::join`] for retirement acknowledgement.
+    /// final `Closed` state change. B3b's private injected lifecycle establishes producer
+    /// quiescence internally; legacy lifecycle callers supply their existing proof. Call
+    /// [`Self::join`] for retirement acknowledgement.
     pub(crate) fn request_graceful_stop(&mut self) {
         self.request_stop(EventLoopStop::Graceful);
     }
@@ -405,7 +460,7 @@ impl EventLoop {
     /// Starts a lifecycle-owned event thread that can be stopped and explicitly joined.
     ///
     /// This is separate from [`Self::run_in_thread`], whose detached legacy behavior is preserved.
-    #[allow(dead_code)] // consumed by the pending context lifecycle integration
+    #[allow(dead_code)] // consumed by private B3b lifecycle; public AudioContext wiring is pending
     pub(crate) fn run_joinable(&self) -> std::io::Result<JoinableEventLoop> {
         let (stop_send, stop_recv) = crossbeam_channel::bounded(1);
         let event_loop = self.clone();
@@ -555,7 +610,7 @@ mod tests {
             current_time: 0.,
             sample_rate: 48_000.,
             node_id: Cell::new(AudioNodeId(42)),
-            event_sender: render_init.event_send,
+            event_sender: render_init.event_send.into(),
         };
         completion.mark_complete_and_wake(&scope);
 
@@ -563,7 +618,7 @@ mod tests {
         assert_eq!(roots.lock().unwrap().len(), 1);
         assert!(event_loop.handle_pending_events());
         assert!(roots.lock().unwrap().is_empty());
-        assert_eq!(activity_count.load(Ordering::Relaxed), queued as usize);
+        assert_eq!(activity_count.load(Ordering::Relaxed), queued);
     }
 
     #[test]
@@ -609,7 +664,7 @@ mod tests {
             current_time: 0.,
             sample_rate: 48_000.,
             node_id: Cell::new(reused_id),
-            event_sender: event_send,
+            event_sender: event_send.into(),
         };
         new_completion.mark_complete_and_wake(&scope);
 

@@ -243,7 +243,7 @@ mod tests {
             current_time: 0.,
             sample_rate: 48_000.,
             node_id: Cell::new(AudioNodeId(queued)),
-            event_sender: render_init.event_send,
+            event_sender: render_init.event_send.into(),
         };
         let completion = ScheduledSourceCompletionToken::new();
 

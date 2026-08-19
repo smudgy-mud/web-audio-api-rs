@@ -7,7 +7,9 @@ use super::injected_control::{
     injected_control_channel, BoundInjectedRenderer, InjectedControlLifecycleOwner,
 };
 use super::injected_ids::injected_node_id_pair;
-use super::injected_node_lifetime::{injected_node_lifetime_registry, BoundInjectedOutputRenderer};
+use super::injected_node_lifetime::{
+    injected_node_lifetime_registry, TestBoundInjectedOutputRenderer,
+};
 use super::{AudioContextState, InjectedContextAdmissionGate};
 use crate::events::EventDispatch;
 use crate::output::{
@@ -42,7 +44,7 @@ fn output_events() -> AudioOutputEventSink {
     AudioOutputEventSink::bounded(4).0
 }
 
-fn install_and_reclaim(bound: BoundInjectedOutputRenderer, events: AudioOutputEventSink) {
+fn install_and_reclaim(bound: TestBoundInjectedOutputRenderer, events: AudioOutputEventSink) {
     let format = AudioRenderFormat::new(48_000., 2, 128).unwrap();
     let (owner, mut callback) = bound
         .try_into_audio_render_thread_pair(format, events)

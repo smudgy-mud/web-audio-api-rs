@@ -5,6 +5,13 @@
 
 #![allow(dead_code)] // production wiring begins with the pending injected AudioContext constructor
 
+mod injected;
+#[allow(unused_imports)] // public context wiring follows this private lifecycle slice
+pub(crate) use injected::{
+    start_injected_output, InjectedOutputLifecycleController, InjectedOutputStart,
+    InjectedOutputStartFailure, InjectedOutputStartFailureParts,
+};
+
 use std::any::Any;
 use std::fmt;
 use std::future::Future;
@@ -39,6 +46,12 @@ impl EventProducersQuiesced {
     const fn for_test() -> Self {
         Self(())
     }
+
+    fn after_injected_graph_retired(
+        _retired: &super::injected_node_lifetime::RetiredInjectedGraph,
+    ) -> Self {
+        Self(())
+    }
 }
 
 /// Successful shutdown mode certified by [`OutputShutdownReceipt`].
@@ -61,6 +74,10 @@ pub(crate) enum OutputShutdownIssueKind {
     WorkerPanicked,
     WorkerSpawnFailed,
     BootstrapFailed,
+    InjectedStartPanicked,
+    InjectedControlClose,
+    InjectedNodeLifetime,
+    InjectedWholeGraphQuarantined,
 }
 
 /// Clone-cheap lifecycle diagnostic retained by all receipt observers.
@@ -716,12 +733,14 @@ fn finish_endpoint_shutdown(
     mut event_loop: JoinableEventLoop,
     mut request: LifecycleRequest,
 ) -> OutputShutdownOutcome {
-    if let Err(failure) = poll_endpoint_shutdown(
+    if let EndpointPollOutcome::Quarantined { future, failure } = poll_endpoint_shutdown(
         endpoint_future,
         &output_events,
         &mut request,
         &mut event_loop,
+        true,
     ) {
+        std::mem::forget(future);
         event_loop.request_silent_stop();
         drop(render_owner); // fail-closed leak
         let event_issue = retire_events(event_loop, OutputShutdownMode::Silent).issue;
@@ -826,12 +845,32 @@ impl Wake for ChannelWake {
     }
 }
 
+enum EndpointPollOutcome {
+    Confirmed,
+    Quarantined {
+        future: AudioOutputEndpointShutdown,
+        failure: OutputShutdownIssue,
+    },
+}
+
+struct EndpointShutdownQuarantine(Option<AudioOutputEndpointShutdown>);
+
+impl Drop for EndpointShutdownQuarantine {
+    fn drop(&mut self) {
+        if let Some(future) = self.0.take() {
+            std::mem::forget(future);
+        }
+    }
+}
+
 fn poll_endpoint_shutdown(
-    mut future: AudioOutputEndpointShutdown,
+    future: AudioOutputEndpointShutdown,
     output_events: &AudioOutputEventWatcher,
     request: &mut LifecycleRequest,
     event_loop: &mut JoinableEventLoop,
-) -> Result<(), OutputShutdownIssue> {
+    stop_events_on_death: bool,
+) -> EndpointPollOutcome {
+    let mut future = EndpointShutdownQuarantine(Some(future));
     let (wake_send, wake_recv) = crossbeam_channel::bounded(1);
     let waker = Waker::from(Arc::new(ChannelWake(wake_send)));
     let mut context = Context::from_waker(&waker);
@@ -839,28 +878,43 @@ fn poll_endpoint_shutdown(
     loop {
         // The atomic latch is authoritative. Rechecking before every poll prevents a self-waking
         // future from starving a queued or dropped best-effort diagnostic.
-        promote_death_to_silent(output_events, request, event_loop);
+        promote_death_to_silent_for_poll(output_events, request, event_loop, stop_events_on_death);
         let polled = panic::catch_unwind(AssertUnwindSafe(|| {
-            Pin::new(&mut future).poll(&mut context)
+            Pin::new(future.0.as_mut().unwrap()).poll(&mut context)
         }));
         match polled {
-            Ok(Poll::Ready(Ok(()))) => return Ok(()),
+            Ok(Poll::Ready(Ok(()))) => {
+                drop(future.0.take());
+                return EndpointPollOutcome::Confirmed;
+            }
             Ok(Poll::Ready(Err(error))) => {
                 let issue = issue_from_audio_error(
                     OutputShutdownIssueKind::EndpointRejectedShutdown,
                     error,
                 );
-                std::mem::forget(future);
-                return Err(issue);
+                return EndpointPollOutcome::Quarantined {
+                    future: future.0.take().unwrap(),
+                    failure: issue,
+                };
             }
             Ok(Poll::Pending) => {
-                promote_death_to_silent(output_events, request, event_loop);
+                promote_death_to_silent_for_poll(
+                    output_events,
+                    request,
+                    event_loop,
+                    stop_events_on_death,
+                );
                 if diagnostics_connected {
                     crossbeam_channel::select_biased! {
                         recv(wake_recv) -> _ => {}
                         recv(output_events.receiver()) -> diagnostic => {
                             diagnostics_connected = diagnostic.is_ok();
-                            promote_death_to_silent(output_events, request, event_loop);
+                            promote_death_to_silent_for_poll(
+                                output_events,
+                                request,
+                                event_loop,
+                                stop_events_on_death,
+                            );
                         }
                     }
                 } else {
@@ -872,13 +926,33 @@ fn poll_endpoint_shutdown(
             Err(payload) => {
                 // The future may own callback/host leases and its destructor is ambiguous after a
                 // poll panic. Quarantine it before touching the equally untrusted panic payload.
-                std::mem::forget(future);
                 quarantine_panic_payload(payload);
-                return Err(OutputShutdownIssue::new(
-                    OutputShutdownIssueKind::EndpointFuturePanicked,
-                    "endpoint shutdown future panicked while being polled",
-                ));
+                return EndpointPollOutcome::Quarantined {
+                    future: future.0.take().unwrap(),
+                    failure: OutputShutdownIssue::new(
+                        OutputShutdownIssueKind::EndpointFuturePanicked,
+                        "endpoint shutdown future panicked while being polled",
+                    ),
+                };
             }
+        }
+    }
+}
+
+fn promote_death_to_silent_for_poll(
+    output_events: &AudioOutputEventWatcher,
+    request: &mut LifecycleRequest,
+    event_loop: &mut JoinableEventLoop,
+    stop_events_on_death: bool,
+) {
+    if stop_events_on_death {
+        promote_death_to_silent(output_events, request, event_loop);
+    } else {
+        request.endpoint_death = request
+            .endpoint_death
+            .or_else(|| output_events.death_reason());
+        if request.endpoint_death.is_some() {
+            request.mode = OutputShutdownMode::Silent;
         }
     }
 }
