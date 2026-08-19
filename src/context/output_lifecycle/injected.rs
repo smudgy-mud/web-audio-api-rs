@@ -2116,6 +2116,9 @@ fn finish_reclaimed_graph(
     let degraded = node_report.cleanup_panicked
         || node_report.cleanup_rejected
         || node_report.reclaim_brand_mismatch
+        || node_report.connection_registry.protocol_failed
+        || node_report.connection_registry.serializer_poison_recovered
+        || node_report.connection_registry.ownership_mismatch
         || node_report.pre_retirement_degraded
         || control.transport_poison_recovered
         || control.capacity_worker_panicked
