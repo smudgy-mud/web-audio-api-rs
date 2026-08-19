@@ -16,13 +16,16 @@ use crate::context::injected_control::{
     InjectedControlLifecycleOwner,
 };
 use crate::context::injected_ids::injected_node_id_pair;
-use crate::context::injected_node_construction::{InjectedGainPayload, InjectedNodeConstructor};
+use crate::context::injected_node_construction::{
+    InjectedGainPayload, InjectedNodeConstructor, InjectedOscillatorConstructionError,
+    InjectedOscillatorPayload,
+};
 use crate::context::injected_node_lifetime::injected_node_lifetime_registry;
 use crate::context::injected_node_lifetime::{
     BoundInjectedOutputRenderer, MagicInitializedInjectedOutputRenderer,
 };
 use crate::context::{
-    AdmissionError, AudioContextState, BaseAudioContext, ConcreteBaseAudioContext,
+    AdmissionError, AudioContextState, AudioNodeId, BaseAudioContext, ConcreteBaseAudioContext,
     ControlEventSendOutcome, InjectedContextAdmissionGate,
 };
 use crate::events::{
@@ -32,13 +35,18 @@ use crate::events::{
 };
 use crate::message::ControlMessage;
 use crate::node::{
-    AudioNode, ChannelConfigInner, ChannelCountMode, ChannelInterpretation, GainNode, GainOptions,
+    AudioNode, AudioScheduledSourceNode, AudioScheduledSourceNodeExt, ChannelConfigInner,
+    ChannelCountMode, ChannelInterpretation, GainNode, GainOptions, OscillatorNode,
+    OscillatorOptions, OscillatorType,
 };
 use crate::output::{
     AudioOutputConfig, AudioOutputDeathReason, AudioOutputErrorKind, AudioRenderCallback,
     AudioRenderFormat, AudioRenderStatus, EndpointShutdownConfirmed,
 };
-use crate::param::{AudioParamInitialValue, InjectedAudioParamProcessor};
+use crate::param::{
+    injected_audio_param_raw_parts, AudioParamDescriptor, AudioParamInitialValue, AutomationRate,
+    InjectedAudioParamProcessor,
+};
 use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope,
 };
@@ -236,7 +244,9 @@ struct PumpControl {
     resume_count: AtomicUsize,
     suspend_count: AtomicUsize,
     render_count: AtomicUsize,
+    max_render_count: AtomicUsize,
     output_nonzero: AtomicBool,
+    deny_next_render_allocation: AtomicBool,
     shutdown_called: AtomicBool,
     resume_panics: AtomicBool,
     resume_errors: AtomicBool,
@@ -259,7 +269,9 @@ impl PumpControl {
             resume_count: AtomicUsize::new(0),
             suspend_count: AtomicUsize::new(0),
             render_count: AtomicUsize::new(0),
+            max_render_count: AtomicUsize::new(usize::MAX),
             output_nonzero: AtomicBool::new(false),
+            deny_next_render_allocation: AtomicBool::new(false),
             shutdown_called: AtomicBool::new(false),
             resume_panics: AtomicBool::new(false),
             resume_errors: AtomicBool::new(false),
@@ -489,9 +501,20 @@ impl PreparedAudioOutput for TestPrepared {
                     while !thread_control.stop.load(Ordering::Acquire) {
                         if thread_control.running.load(Ordering::Acquire)
                             && thread_control.release.load(Ordering::Acquire)
+                            && thread_control.render_count.load(Ordering::Acquire)
+                                < thread_control.max_render_count.load(Ordering::Acquire)
                         {
                             thread_control.render_count.fetch_add(1, Ordering::AcqRel);
-                            let status = callback.render_interleaved_f32(&mut output);
+                            let status = if thread_control
+                                .deny_next_render_allocation
+                                .swap(false, Ordering::AcqRel)
+                            {
+                                alloc_counter::deny_alloc(|| {
+                                    callback.render_interleaved_f32(&mut output)
+                                })
+                            } else {
+                                callback.render_interleaved_f32(&mut output)
+                            };
                             thread_control.output_nonzero.store(
                                 output.iter().any(|sample| *sample != 0.),
                                 Ordering::Release,
@@ -558,6 +581,12 @@ struct SilentProcessor;
 
 struct PanicDropProcessor;
 
+struct BlockingPanicDropProcessor {
+    entered: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+    tokens_restored: Arc<AtomicBool>,
+}
+
 struct DropProbeProcessor(Arc<AtomicUsize>);
 
 static REJECTED_EVENT_DROPS: AtomicUsize = AtomicUsize::new(0);
@@ -595,7 +624,28 @@ impl Drop for PanicDropProcessor {
     }
 }
 
+impl Drop for BlockingPanicDropProcessor {
+    fn drop(&mut self) {
+        assert!(self.tokens_restored.load(Ordering::Acquire));
+        self.entered.send(()).unwrap();
+        self.release.recv().unwrap();
+        panic!("forced blocked oscillator processor destructor panic");
+    }
+}
+
 impl AudioProcessor for PanicDropProcessor {
+    fn process(
+        &mut self,
+        _inputs: &[AudioRenderQuantum],
+        _outputs: &mut [AudioRenderQuantum],
+        _params: AudioParamValues<'_>,
+        _scope: &AudioWorkletGlobalScope,
+    ) -> bool {
+        false
+    }
+}
+
+impl AudioProcessor for BlockingPanicDropProcessor {
     fn process(
         &mut self,
         _inputs: &[AudioRenderQuantum],
@@ -650,6 +700,43 @@ fn gain_payload_with_drop_probe(drops: &Arc<AtomicUsize>) -> InjectedGainPayload
         param_channel_config: config(),
         gain_channel_config: config(),
         initial_value: AudioParamInitialValue::new(1.),
+    }
+}
+
+fn oscillator_payload_for_test(
+    oscillator_processor: Box<dyn AudioProcessor>,
+) -> InjectedOscillatorPayload {
+    let (frequency_raw, frequency_processor) =
+        injected_audio_param_raw_parts(AudioParamDescriptor {
+            name: String::new(),
+            min_value: -24_000.,
+            max_value: 24_000.,
+            default_value: 440.,
+            automation_rate: AutomationRate::A,
+        });
+    let (detune_raw, detune_processor) = injected_audio_param_raw_parts(AudioParamDescriptor {
+        name: String::new(),
+        min_value: -153_600.,
+        max_value: 153_600.,
+        default_value: 0.,
+        automation_rate: AutomationRate::A,
+    });
+    InjectedOscillatorPayload {
+        frequency_processor,
+        detune_processor,
+        oscillator_processor,
+        param_channel_config: ChannelConfigInner {
+            count: 1,
+            count_mode: ChannelCountMode::Explicit,
+            interpretation: ChannelInterpretation::Discrete,
+        },
+        oscillator_channel_config: ChannelConfigInner {
+            count: 2,
+            count_mode: ChannelCountMode::Max,
+            interpretation: ChannelInterpretation::Speakers,
+        },
+        frequency_initial_value: frequency_raw.set_initial_value_for_injected(440.),
+        detune_initial_value: detune_raw.set_initial_value_for_injected(0.),
     }
 }
 
@@ -1567,6 +1654,972 @@ fn suspended_exact_connect_then_disconnect_stage_and_flush_fifo_before_resume_ac
     let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
     assert_eq!(report.mode(), OutputShutdownMode::Graceful);
     assert!(report.reclaim_issue().is_none());
+}
+
+#[test]
+fn exact_fixed_oscillators_use_ids_eleven_through_thirteen_render_without_allocation_and_end_once()
+{
+    let fixture = lifecycle_fixture_inner(
+        false,
+        false,
+        64,
+        16,
+        injected_event_dispatch_setup().unwrap(),
+    );
+    let base = fixture.take_exact_base();
+    let destination = base.destination();
+    let ended = Arc::new(AtomicUsize::new(0));
+    let mut oscillators = Vec::new();
+    let mut completions = Vec::new();
+    for (index, type_) in [
+        OscillatorType::Sine,
+        OscillatorType::Square,
+        OscillatorType::Sawtooth,
+        OscillatorType::Triangle,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut oscillator = OscillatorNode::new(
+            &base,
+            OscillatorOptions {
+                type_,
+                frequency: 220. + index as f32 * 55.,
+                detune: index as f32 * 10.,
+                ..OscillatorOptions::default()
+            },
+        );
+        assert_eq!(
+            oscillator.registration().id(),
+            AudioNodeId(11 + index as u64 * 3)
+        );
+        assert_eq!(
+            oscillator.frequency().registration().id(),
+            AudioNodeId(12 + index as u64 * 3)
+        );
+        assert_eq!(
+            oscillator.detune().registration().id(),
+            AudioNodeId(13 + index as u64 * 3)
+        );
+        assert_eq!(oscillator.type_(), type_);
+        oscillator.frequency().set_value(330. + index as f32 * 20.);
+        oscillator.detune().set_value(index as f32 * 25.);
+        let ended_count = Arc::clone(&ended);
+        oscillator.set_onended(move |_| {
+            ended_count.fetch_add(1, Ordering::AcqRel);
+        });
+        oscillator.connect(&destination);
+        completions.push(oscillator.completion_token());
+        oscillator.start();
+        oscillators.push(oscillator);
+    }
+
+    let control = PumpControl::new(false, true);
+    control
+        .deny_next_render_allocation
+        .store(true, Ordering::Release);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || control.output_nonzero.load(Ordering::Acquire),
+        "fixed exact oscillators did not render nonzero output",
+    );
+
+    oscillators[0].set_type(OscillatorType::Square);
+    assert_eq!(oscillators[0].type_(), OscillatorType::Square);
+    for oscillator in &mut oscillators {
+        oscillator.stop();
+    }
+    wait_until(
+        || completions.iter().all(|token| token.is_complete()),
+        "fixed exact oscillator completion did not become authoritative",
+    );
+    wait_until(
+        || ended.load(Ordering::Acquire) == oscillators.len(),
+        "each fixed exact oscillator did not dispatch exactly one ended event",
+    );
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(ended.load(Ordering::Acquire), oscillators.len());
+
+    drop(oscillators);
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.reclaim_issue().is_none());
+}
+
+#[test]
+fn suspended_exact_oscillator_commands_flush_fifo_through_real_b4c_resume() {
+    let fixture =
+        lifecycle_fixture_inner(true, false, 32, 8, injected_event_dispatch_setup().unwrap());
+    let base = fixture.take_exact_base();
+    let destination = base.destination();
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let completion = oscillator.completion_token();
+    let ended = Arc::new(AtomicUsize::new(0));
+    let ended_for_handler = Arc::clone(&ended);
+    oscillator.set_onended(move |_| {
+        ended_for_handler.fetch_add(1, Ordering::AcqRel);
+    });
+    oscillator.connect(&destination);
+    oscillator.frequency().set_value(330.);
+    oscillator.detune().set_value(120.);
+    oscillator.set_type(OscillatorType::Triangle);
+    oscillator.start_at(0.);
+    oscillator.stop_at(1.);
+    oscillator.stop_at(0.01);
+    let applied_before = base.applied_control_batch_sequence();
+
+    let control = PumpControl::new(false, false);
+    control.max_render_count.store(32, Ordering::Release);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || control.suspend_count.load(Ordering::Acquire) == 1,
+        "initially suspended endpoint was not natively reconciled",
+    );
+    assert_eq!(base.state(), AudioContextState::Suspended);
+    assert_eq!(base.applied_control_batch_sequence(), applied_before);
+
+    // The endpoint remains idle until Resume flips its native running state. Once it does, the
+    // pump can execute at most 32 quanta, providing a deterministic audio-time window.
+    control.release.store(true, Ordering::Release);
+    assert_eq!(
+        wait_state(controller.state_control().resume().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    wait_until(
+        || control.render_count.load(Ordering::Acquire) == 32,
+        "fixed resumed render window did not complete",
+    );
+    assert!(
+        completion.is_complete(),
+        "staged Stop FIFO was reversed: 32 quanta exceed 0.01s but are below 1s"
+    );
+    wait_until(
+        || ended.load(Ordering::Acquire) == 1,
+        "resumed exact oscillator did not dispatch ended",
+    );
+    assert_eq!(oscillator.type_(), OscillatorType::Triangle);
+    assert_eq!(oscillator.frequency().value(), 330.);
+    assert_eq!(oscillator.detune().value(), 120.);
+    assert!(base.applied_control_batch_sequence() >= applied_before + 8);
+
+    control
+        .max_render_count
+        .store(usize::MAX, Ordering::Release);
+    drop(oscillator);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn connected_started_stopped_oscillator_survives_immediate_handle_drop_until_ended_and_reclaim() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 32);
+    let base = fixture.take_exact_base();
+    let destination = base.destination();
+    let ended = Arc::new(AtomicUsize::new(0));
+    let ended_for_handler = Arc::clone(&ended);
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let completion = oscillator.completion_token();
+    oscillator.set_onended(move |_| {
+        ended_for_handler.fetch_add(1, Ordering::AcqRel);
+    });
+    oscillator.connect(&destination);
+    oscillator.start_at(0.);
+    oscillator.stop_at(0.01);
+    drop(oscillator);
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || completion.is_complete(),
+        "dropped connected source did not remain live through its stop",
+    );
+    wait_until(
+        || ended.load(Ordering::Acquire) == 1,
+        "dropped connected source did not dispatch ended",
+    );
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.reclaim_issue().is_none());
+}
+
+#[test]
+fn never_started_and_future_started_sources_do_not_synthesize_ended_during_close() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 32);
+    let base = fixture.take_exact_base();
+    let destination = base.destination();
+    let ended = Arc::new(AtomicUsize::new(0));
+
+    let never = OscillatorNode::new(&base, OscillatorOptions::default());
+    let never_completion = never.completion_token();
+    let never_ended = Arc::clone(&ended);
+    never.set_onended(move |_| {
+        never_ended.fetch_add(1, Ordering::AcqRel);
+    });
+    drop(never);
+
+    let mut future = OscillatorNode::new(&base, OscillatorOptions::default());
+    let future_completion = future.completion_token();
+    let future_ended = Arc::clone(&ended);
+    future.set_onended(move |_| {
+        future_ended.fetch_add(1, Ordering::AcqRel);
+    });
+    future.connect(&destination);
+    future.start_at(10.);
+    drop(future);
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert_eq!(ended.load(Ordering::Acquire), 0);
+    assert!(!never_completion.is_complete());
+    assert!(!future_completion.is_complete());
+}
+
+#[test]
+fn exact_oscillator_validation_precedes_reservation_and_deferred_custom_paths_are_inert() {
+    let fixture =
+        lifecycle_fixture_inner(false, false, 2, 8, injected_event_dispatch_setup().unwrap());
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let initial_sequence = constructor.last_submitted_batch_sequence();
+    let probe = fixture.allocator.try_reserve(3).unwrap();
+    assert_eq!(probe.id(0), AudioNodeId(11));
+    assert_eq!(probe.id(1), AudioNodeId(12));
+    assert_eq!(probe.id(2), AudioNodeId(13));
+    drop(probe);
+
+    for options in [
+        OscillatorOptions {
+            type_: OscillatorType::Custom,
+            ..OscillatorOptions::default()
+        },
+        OscillatorOptions {
+            periodic_wave: Some(crate::PeriodicWave::default()),
+            ..OscillatorOptions::default()
+        },
+    ] {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            OscillatorNode::new(&base, options)
+        }))
+        .is_err());
+        assert_eq!(
+            constructor.last_submitted_batch_sequence(),
+            initial_sequence
+        );
+        assert_eq!(
+            constructor.connection_transport_accounting_for_test(),
+            (0, 0, 0, 0)
+        );
+        let probe = fixture.allocator.try_reserve(3).unwrap();
+        assert_eq!(probe.id(0), AudioNodeId(11));
+        assert_eq!(probe.id(1), AudioNodeId(12));
+        assert_eq!(probe.id(2), AudioNodeId(13));
+        drop(probe);
+    }
+
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| oscillator.stop())).is_err());
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        construction_sequence
+    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.start_at(f64::NAN)
+    }))
+    .is_err());
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        construction_sequence
+    );
+    oscillator.start();
+    let start_sequence = constructor.last_submitted_batch_sequence();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| oscillator.start())).is_err());
+    assert_eq!(constructor.last_submitted_batch_sequence(), start_sequence);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_type(OscillatorType::Custom)
+    }))
+    .is_err());
+    assert_eq!(constructor.last_submitted_batch_sequence(), start_sequence);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_periodic_wave(crate::PeriodicWave::default())
+    }))
+    .is_err());
+    assert_eq!(constructor.last_submitted_batch_sequence(), start_sequence);
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn exact_oscillator_event_nonce_exhaustion_is_typed_terminal_and_never_reused() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let nonce_source = Arc::new(AtomicU64::new(u64::MAX));
+    base.injected_events()
+        .unwrap()
+        .set_nonce_source_for_test(Arc::clone(&nonce_source));
+
+    assert_eq!(
+        base.try_begin_injected_oscillator(OscillatorType::Sine)
+            .err(),
+        Some(InjectedOscillatorConstructionError::EventIdentityExhausted)
+    );
+    assert_eq!(nonce_source.load(Ordering::Acquire), u64::MAX);
+    let ids = fixture.allocator.try_reserve(3).unwrap();
+    assert_eq!(ids.id(0), AudioNodeId(14));
+    assert_eq!(ids.id(1), AudioNodeId(15));
+    assert_eq!(ids.id(2), AudioNodeId(16));
+    drop(ids);
+    assert!(matches!(
+        base.try_begin_injected_oscillator(OscillatorType::Sine),
+        Err(InjectedOscillatorConstructionError::Control(
+            crate::context::injected_control::InjectedControlError::ProtocolViolation
+        ))
+    ));
+    assert_eq!(nonce_source.load(Ordering::Acquire), u64::MAX);
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
+fn exact_oscillator_not_accepted_parser_restores_all_three_ids_from_the_seven_record_batch() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let transaction = base
+        .try_begin_injected_oscillator(OscillatorType::Sine)
+        .unwrap();
+    base.fail_closed_injected_protocol();
+    assert_eq!(
+        transaction
+            .commit(oscillator_payload_for_test(Box::new(SilentProcessor)))
+            .err(),
+        Some(InjectedOscillatorConstructionError::Control(
+            crate::context::injected_control::InjectedControlError::ProtocolViolation
+        ))
+    );
+
+    // A normal NotAccepted rollback accepts only the exact seven-record construction shape and
+    // restores each reclaim token before returning. Magic permanently owns 0..=10.
+    let restored = fixture.allocator.try_reserve(3).unwrap();
+    assert_eq!(restored.id(0), AudioNodeId(11));
+    assert_eq!(restored.id(1), AudioNodeId(12));
+    assert_eq!(restored.id(2), AudioNodeId(13));
+    drop(restored);
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
+fn exact_oscillator_not_accepted_restores_ids_before_hostile_payload_drop_and_close_drain() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let allocator = fixture.allocator.clone();
+    let mut transaction = base
+        .try_begin_injected_oscillator(OscillatorType::Sine)
+        .unwrap();
+    let tokens_restored = Arc::new(AtomicBool::new(false));
+    transaction.observe_rollback_tokens_restored_for_test(Arc::clone(&tokens_restored));
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+
+    base.fail_closed_injected_protocol();
+    let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+    let (release_send, release_recv) = crossbeam_channel::bounded(1);
+    let tokens_restored_in_drop = Arc::clone(&tokens_restored);
+    let commit = thread::spawn(move || {
+        transaction.commit(oscillator_payload_for_test(Box::new(
+            BlockingPanicDropProcessor {
+                entered: entered_send,
+                release: release_recv,
+                tokens_restored: tokens_restored_in_drop,
+            },
+        )))
+    });
+    entered_recv.recv_timeout(TIMEOUT).unwrap();
+    assert!(tokens_restored.load(Ordering::Acquire));
+
+    let receipt = controller.shutdown_silently();
+    let (done_send, done_recv) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = done_send.send(executor::block_on(receipt));
+    });
+    thread::sleep(Duration::from_millis(20));
+    assert!(done_recv.try_recv().is_err());
+    assert!(!control.shutdown_called.load(Ordering::Acquire));
+
+    release_send.send(()).unwrap();
+    assert_eq!(
+        commit.join().unwrap().err(),
+        Some(InjectedOscillatorConstructionError::RejectedPayloadPanicked)
+    );
+    let restored = allocator.try_reserve(3).unwrap();
+    assert_eq!(restored.id(0), AudioNodeId(14));
+    assert_eq!(restored.id(1), AudioNodeId(15));
+    assert_eq!(restored.id(2), AudioNodeId(16));
+    drop(restored);
+    let report = confirmed(done_recv.recv_timeout(TIMEOUT).unwrap());
+    assert_eq!(report.mode(), OutputShutdownMode::Silent);
+}
+
+#[test]
+fn exact_oscillator_group_finalizer_failure_or_panic_quarantines_all_three_ids() {
+    for (ordinal, panics) in [(1, false), (2, false), (3, false), (2, true)] {
+        let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+        let base = fixture.take_exact_base();
+        if panics {
+            fixture.registrar.panic_construction_arm_for_test(ordinal);
+        } else {
+            fixture.registrar.fail_construction_arm_for_test(ordinal);
+        }
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            OscillatorNode::new(&base, OscillatorOptions::default())
+        }))
+        .is_err());
+
+        // Acceptance committed the whole ID group before arming any public registration. No
+        // subset is republished after a finalizer fault.
+        let next = fixture.allocator.try_reserve(3).unwrap();
+        assert_eq!(next.id(0), AudioNodeId(14));
+        assert_eq!(next.id(1), AudioNodeId(15));
+        assert_eq!(next.id(2), AudioNodeId(16));
+        drop(next);
+
+        let control = PumpControl::new(false, true);
+        let lifecycle = start(
+            TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+            fixture,
+        )
+        .ok()
+        .unwrap();
+        let InjectedOutputStart::Running(controller) = lifecycle else {
+            panic!("pumping endpoint must start running")
+        };
+        assert_eq!(
+            confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+            OutputShutdownMode::Silent
+        );
+    }
+}
+
+#[test]
+fn exact_confirmed_close_releases_handler_and_postseal_set_drops_callback_before_panicking() {
+    struct CallbackDrop(Arc<AtomicUsize>);
+
+    impl Drop for CallbackDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let drops = Arc::new(AtomicUsize::new(0));
+    let retained = CallbackDrop(Arc::clone(&drops));
+    oscillator.set_onended(move |_| {
+        let _ = &retained;
+    });
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+
+    let rejected = CallbackDrop(Arc::clone(&drops));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_onended(move |_| {
+            let _ = &rejected;
+        });
+    }))
+    .is_err());
+    assert_eq!(drops.load(Ordering::Acquire), 2);
+    oscillator.clear_onended();
+    oscillator.clear_onended();
+}
+
+#[test]
+fn reconciled_oscillator_id_reuse_rejects_stale_target_and_old_event_cannot_hit_replacement() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let allocator = fixture.allocator.clone();
+    let registrar = fixture.registrar.clone();
+    let destination = base.destination();
+    let mut old = OscillatorNode::new(&base, OscillatorOptions::default());
+    let old_id = old.registration().id();
+    let stale_target = old.injected_control_for_test().ended_target();
+    let old_key = stale_target.render_key();
+    let old_completion = old.completion_token();
+    old.connect(&destination);
+    old.start_at(0.);
+    old.stop_at(0.);
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || old_completion.is_complete(),
+        "first oscillator did not complete before generation reuse",
+    );
+    drop(old);
+    wait_until(
+        || registrar.slot_phase_counts_for_test() == Some([8, 0, 0, 0, 0, 0]),
+        "first oscillator generation did not reconcile",
+    );
+
+    // Reorder the three returned reclaim tokens so the next oscillator's node (slot zero in its
+    // atomic reservation) deliberately reuses the old oscillator's numeric id.
+    let mut returned = allocator.try_reserve(3).unwrap();
+    let old_position = (0..3)
+        .find(|index| returned.id(*index) == old_id)
+        .expect("reconciled oscillator id must be among its returned three-token group");
+    if old_position != 0 {
+        let old_token = returned.take_reclaim_node(old_position).unwrap();
+        let first_token = returned.take_reclaim_node(0).unwrap();
+        returned
+            .restore_reclaim_node(old_position, first_token)
+            .ok()
+            .unwrap();
+        returned.restore_reclaim_node(0, old_token).ok().unwrap();
+    }
+    drop(returned);
+
+    let mut replacement = OscillatorNode::new(&base, OscillatorOptions::default());
+    assert_eq!(replacement.registration().id(), old_id);
+    let replacement_key = replacement
+        .injected_control_for_test()
+        .ended_target()
+        .render_key();
+    assert_ne!(replacement_key, old_key);
+    assert_eq!(
+        stale_target.try_set_handler(EventHandler::Once(Box::new(|_| {}))),
+        Err(crate::events::InjectedExactEndedHandlerError::Inactive)
+    );
+
+    let ended = Arc::new(AtomicUsize::new(0));
+    let ended_for_handler = Arc::clone(&ended);
+    replacement.set_onended(move |_| {
+        ended_for_handler.fetch_add(1, Ordering::AcqRel);
+    });
+    let (barrier_send, barrier_recv) = crossbeam_channel::bounded(1);
+    base.set_event_handler(
+        EventType::SinkChange,
+        EventHandler::Once(Box::new(move |_| barrier_send.send(()).unwrap())),
+    );
+    assert_eq!(
+        base.send_event_with(move || EventDispatch::exact_ended(old_key)),
+        Ok(())
+    );
+    assert_eq!(base.send_event_with(EventDispatch::sink_change), Ok(()));
+    barrier_recv.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(ended.load(Ordering::Acquire), 0);
+
+    let replacement_completion = replacement.completion_token();
+    replacement.connect(&destination);
+    replacement.start_at(0.);
+    replacement.stop_at(0.);
+    wait_until(
+        || replacement_completion.is_complete(),
+        "replacement oscillator did not complete",
+    );
+    wait_until(
+        || ended.load(Ordering::Acquire) == 1,
+        "replacement exact ended key did not invoke its own handler",
+    );
+    drop(replacement);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn exact_oscillator_runtime_saturation_precedes_no_host_mutation_and_recovers() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || base.applied_control_batch_sequence() >= construction_sequence,
+        "oscillator construction did not apply before runtime saturation",
+    );
+    wait_until(
+        || constructor.connection_transport_accounting_for_test() == (0, 0, 0, 0),
+        "construction credits did not retire before runtime saturation",
+    );
+
+    let held = constructor
+        .control()
+        .try_begin_operation(crate::message::CONTROL_COMMANDS_PER_CALLBACK)
+        .unwrap();
+    let submitted_before = constructor.last_submitted_batch_sequence();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_type(OscillatorType::Square);
+    }))
+    .is_err());
+    assert_eq!(oscillator.type_(), OscillatorType::Sine);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        submitted_before
+    );
+    drop(held);
+
+    oscillator.set_type(OscillatorType::Square);
+    assert_eq!(oscillator.type_(), OscillatorType::Square);
+    drop(oscillator);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn exact_oscillator_runtime_not_accepted_rolls_back_without_host_mirror_mutation() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || base.applied_control_batch_sequence() >= construction_sequence,
+        "oscillator construction did not apply before runtime rejection",
+    );
+    wait_until(
+        || constructor.connection_transport_accounting_for_test() == (0, 0, 0, 0),
+        "construction credits did not retire before runtime rejection",
+    );
+    let submitted_before = constructor.last_submitted_batch_sequence();
+    oscillator
+        .injected_control_for_test()
+        .fail_next_runtime_commit_for_test();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_type(OscillatorType::Square);
+    }))
+    .is_err());
+    assert_eq!(oscillator.type_(), OscillatorType::Sine);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        submitted_before
+    );
+    assert_eq!(
+        constructor.connection_transport_accounting_for_test(),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
+fn accepted_oscillator_runtime_finalizer_panic_keeps_command_queue_owned_and_applied() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    oscillator
+        .injected_control_for_test()
+        .panic_next_runtime_finalizer_for_test();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_type(OscillatorType::Square);
+    }))
+    .is_err());
+    assert_eq!(oscillator.type_(), OscillatorType::Square);
+    let accepted_sequence = constructor.last_submitted_batch_sequence();
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || base.applied_control_batch_sequence() >= accepted_sequence,
+        "accepted oscillator command was suppressed after its finalizer panic",
+    );
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
+fn exact_oscillator_runtime_wrong_processor_latches_before_failed_watermark() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 8);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let transaction = base
+        .try_begin_injected_oscillator(OscillatorType::Sine)
+        .unwrap();
+    let constructed = transaction
+        .commit(oscillator_payload_for_test(Box::new(SilentProcessor)))
+        .unwrap();
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+    constructed.oscillator_control.try_start(0.).unwrap();
+    let failed_sequence = constructor.last_submitted_batch_sequence();
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Silent);
+    assert_eq!(base.applied_control_batch_sequence(), construction_sequence);
+    assert!(construction_sequence < failed_sequence);
+    assert!(constructor.control().render_protocol_failed_for_test());
+    drop(constructed);
+}
+
+#[test]
+fn saturated_exact_event_queue_cannot_hide_authoritative_oscillator_completion() {
+    let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+    let (release_send, release_recv) = crossbeam_channel::bounded(1);
+    let setup = injected_event_dispatch_setup_bounded_for_test(1, move |events| {
+        events.set_handler(
+            EventType::SinkChange,
+            EventHandler::Once(Box::new(move |_| {
+                entered_send.send(()).unwrap();
+                release_recv.recv().unwrap();
+            })),
+        );
+    })
+    .unwrap();
+    let fixture = lifecycle_fixture_with_event_setup(false, false, 32, setup);
+    let base = fixture.take_exact_base();
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let completion = oscillator.completion_token();
+    let ended = Arc::new(AtomicUsize::new(0));
+    let ended_for_handler = Arc::clone(&ended);
+    oscillator.set_onended(move |_| {
+        ended_for_handler.fetch_add(1, Ordering::AcqRel);
+    });
+    oscillator.connect(&base.destination());
+    oscillator.start_at(0.);
+    oscillator.stop_at(0.);
+
+    assert_eq!(base.send_event_with(EventDispatch::sink_change), Ok(()));
+    entered_recv.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(
+        base.send_event_with(EventDispatch::control_batch_activity),
+        Ok(())
+    );
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || completion.is_complete(),
+        "event saturation suppressed exact oscillator completion",
+    );
+    assert_eq!(ended.load(Ordering::Acquire), 0);
+    release_send.send(()).unwrap();
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert_eq!(ended.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn disconnected_exact_event_queue_cannot_hide_authoritative_oscillator_completion() {
+    let setup = injected_event_dispatch_setup_with_handlers(|events| {
+        events.set_handler(
+            EventType::SinkChange,
+            EventHandler::Once(Box::new(|_| panic!("forced exact event-thread exit"))),
+        );
+    })
+    .unwrap();
+    let fixture = lifecycle_fixture_with_event_setup(false, false, 32, setup);
+    let base = fixture.take_exact_base();
+    assert_eq!(base.send_event_with(EventDispatch::sink_change), Ok(()));
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        match base.send_event_with(EventDispatch::control_batch_activity) {
+            Err(ControlEventSendOutcome::Disconnected) => break,
+            Ok(()) | Err(ControlEventSendOutcome::Full) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "panicked exact event thread did not disconnect its receiver"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            other => panic!("unexpected event-send outcome before Close: {other:?}"),
+        }
+    }
+
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let completion = oscillator.completion_token();
+    let ended = Arc::new(AtomicUsize::new(0));
+    let ended_for_handler = Arc::clone(&ended);
+    oscillator.set_onended(move |_| {
+        ended_for_handler.fetch_add(1, Ordering::AcqRel);
+    });
+    oscillator.connect(&base.destination());
+    oscillator.start_at(0.);
+    oscillator.stop_at(0.);
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || completion.is_complete(),
+        "event disconnect suppressed exact oscillator completion",
+    );
+    assert_eq!(ended.load(Ordering::Acquire), 0);
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.event_issue().is_some());
 }
 
 #[test]

@@ -285,6 +285,26 @@ pub(crate) struct InjectedNodeRegistrationIdentity {
     key: RegistrationKey,
 }
 
+impl InjectedNodeRegistrationIdentity {
+    pub(crate) const fn event_key_parts(&self) -> (usize, NonZeroU64) {
+        (self.key.slot, self.key.generation)
+    }
+
+    pub(crate) fn is_live_for(&self, id: AudioNodeId) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        inner.connection_registration_is_live(
+            id,
+            InjectedNodeRegistrationStamp {
+                id,
+                slot: self.key.slot,
+                generation: self.key.generation,
+            },
+        )
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct InjectedNodeLifetimeRegistrar {
     inner: Weak<NodeLifetimeInner>,
@@ -1644,6 +1664,110 @@ impl NodeRegistrationArm<'_> {
         self.arm_accepted()
     }
 
+    /// Publishes one fixed constructor's accepted registrations as a closed group. Every
+    /// fallible check and test panic hook runs before the first slot transition; after that point
+    /// only non-panicking atomic updates remain. A structural atomic race quarantines the entire
+    /// group and never exposes a registration handle.
+    pub(crate) fn arm_accepted_batch<const N: usize>(
+        arms: [Self; N],
+    ) -> Result<(), AcceptedBatchFinalizeError> {
+        if N == 0 || arms.iter().any(|arm| !arm.accepted.load(Ordering::Acquire)) {
+            return Err(AcceptedBatchFinalizeError::Rejected);
+        }
+        let Some(inner) = arms[0].inner.upgrade() else {
+            return Err(AcceptedBatchFinalizeError::Rejected);
+        };
+        if arms
+            .iter()
+            .any(|arm| !Weak::ptr_eq(arm.inner, &Arc::downgrade(&inner)))
+            || arms
+                .iter()
+                .enumerate()
+                .any(|(index, arm)| arms[..index].iter().any(|prior| prior.key == arm.key))
+        {
+            return Err(AcceptedBatchFinalizeError::Rejected);
+        }
+
+        #[cfg(test)]
+        {
+            let behavior = inner.construction_arm_behavior.swap(0, Ordering::AcqRel);
+            if behavior != 0 {
+                let ordinal = usize::from(behavior & 0x7f);
+                if ordinal <= N {
+                    if behavior & 0x80 != 0 {
+                        panic!("injected construction batch arm panic");
+                    }
+                    return Err(AcceptedBatchFinalizeError::Rejected);
+                }
+                inner
+                    .construction_arm_behavior
+                    .store(behavior, Ordering::Release);
+            }
+        }
+
+        let _allocation = match inner.allocation.try_lock() {
+            Ok(allocation) => allocation,
+            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
+                return Err(AcceptedBatchFinalizeError::Rejected)
+            }
+        };
+        if RegistryPhase::from_u8(inner.phase.load(Ordering::Acquire)) != RegistryPhase::Open {
+            return Err(AcceptedBatchFinalizeError::Rejected);
+        }
+        #[cfg(test)]
+        if let Some((entered, release)) = inner
+            .arm_publish_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+
+        let valid = arms.iter().all(|arm| {
+            let word = inner.slots[arm.key.slot].word.load(Ordering::Acquire);
+            generation(word) == arm.key.generation.get()
+                && SlotPhase::from_word(word) == SlotPhase::Provisional
+        });
+        if !valid {
+            drop(_allocation);
+            for arm in arms {
+                teardown::quarantine_slot(&inner, arm.key);
+            }
+            return Err(AcceptedBatchFinalizeError::Rejected);
+        }
+
+        for arm in arms {
+            let slot = &inner.slots[arm.key.slot];
+            let mut observed = slot.word.load(Ordering::Acquire);
+            loop {
+                if generation(observed) != arm.key.generation.get()
+                    || SlotPhase::from_word(observed) != SlotPhase::Provisional
+                {
+                    drop(_allocation);
+                    for failed in arms {
+                        teardown::quarantine_slot(&inner, failed.key);
+                    }
+                    return Err(AcceptedBatchFinalizeError::Rejected);
+                }
+                match slot.word.compare_exchange_weak(
+                    observed,
+                    with_phase(observed, SlotPhase::Live),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => observed = next,
+                }
+            }
+        }
+        for arm in arms {
+            arm.armed.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
     /// Internal constructor protocol failure. Prefer an explicit quarantined slot; if structural
     /// corruption is proven, this off-RT path serializes with allocation and quarantines both the
     /// exact slot and the registry so later construction cannot proceed.
@@ -2638,6 +2762,64 @@ mod tests {
 
         let reserved = foundation.allocator.try_reserve(1).unwrap();
         assert_eq!(reserved.id(0), AudioNodeId(102));
+    }
+
+    #[test]
+    fn three_way_accepted_group_arm_preserves_every_early_reclaim_bit() {
+        let mut foundation = Foundation::new(3, 100);
+        let mut ids = foundation.allocator.try_reserve(3).unwrap();
+        let first = foundation
+            .registrar
+            .try_register(ids.id(0), noop())
+            .ok()
+            .unwrap();
+        let second = foundation
+            .registrar
+            .try_register(ids.id(1), noop())
+            .ok()
+            .unwrap();
+        let third = foundation
+            .registrar
+            .try_register(ids.id(2), noop())
+            .ok()
+            .unwrap();
+        for index in 0..3 {
+            foundation
+                .graph
+                .as_mut()
+                .unwrap()
+                .push_for_test(ids.take_reclaim_node(index).unwrap());
+        }
+        ids.commit().unwrap();
+        assert_eq!(foundation.owner.as_mut().unwrap().ingest_reclaims(), Ok(3));
+
+        let arms = [first.arm_token(), second.arm_token(), third.arm_token()];
+        for arm in arms {
+            arm.mark_accepted();
+        }
+        NodeRegistrationArm::arm_accepted_batch(arms).unwrap();
+        for arm in arms {
+            let word = foundation.owner.as_ref().unwrap().inner().slots[arm.key.slot]
+                .word
+                .load(Ordering::Acquire);
+            assert_eq!(SlotPhase::from_word(word), SlotPhase::Live);
+            assert!(has_reclaim(word));
+        }
+        let slots = arms.map(|arm| arm.key.slot);
+
+        let registrations = [
+            first.into_registration().unwrap(),
+            second.into_registration().unwrap(),
+            third.into_registration().unwrap(),
+        ];
+        drop(registrations);
+        for slot in slots {
+            let word = foundation.owner.as_ref().unwrap().inner().slots[slot]
+                .word
+                .load(Ordering::Acquire);
+            assert_eq!(SlotPhase::from_word(word), SlotPhase::Requested);
+            assert!(has_reclaim(word));
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Audio processing code that runs on the audio rendering thread
 use crate::context::{AudioNodeId, AudioParamId};
-use crate::events::{AudioProcessingEvent, ErrorEvent, EventDispatch};
+use crate::events::{AudioProcessingEvent, ErrorEvent, EventDispatch, ExactEndedEventKey};
 use crate::render::thread::EventDispatchSender;
 use crate::{AudioBuffer, Event, RENDER_QUANTUM_SIZE};
 
@@ -55,6 +55,11 @@ impl AudioWorkletGlobalScope {
         let _ = self
             .event_sender
             .try_send(EventDispatch::ended(self.node_id.get()));
+    }
+
+    pub(crate) fn send_exact_ended_event(&self, key: ExactEndedEventKey) {
+        // Completion state is published before this bounded best-effort notification.
+        let _ = self.event_sender.try_send(EventDispatch::exact_ended(key));
     }
 
     pub(crate) fn send_audio_processing_event(

@@ -16,7 +16,7 @@ pub(crate) use injected_admission::{
 };
 
 mod injected_control;
-pub(crate) use injected_control::InjectedControlRenderInit;
+pub(crate) use injected_control::{CommitControlOutcome, InjectedControlRenderInit};
 
 mod injected_connections;
 pub(crate) use injected_connections::{
@@ -36,10 +36,16 @@ pub(crate) use injected_magic_construction::MAGIC_COMMAND_COUNT;
 mod injected_magic_construction_tests;
 
 mod injected_node_lifetime;
-pub(crate) use injected_node_lifetime::RetiredInjectedGraph;
+pub(crate) use injected_node_lifetime::{
+    InjectedNodeRegistration, InjectedNodeRegistrationIdentity, RetiredInjectedGraph,
+};
 
 mod injected_node_construction;
-pub(crate) use injected_node_construction::{InjectedAudioParamMutation, InjectedGainPayload};
+pub(crate) use injected_node_construction::{
+    InjectedAudioParamMutation, InjectedGainPayload, InjectedOscillatorCommandKind,
+    InjectedOscillatorControl, InjectedOscillatorEventMint, InjectedOscillatorMutationError,
+    InjectedOscillatorPayload, InjectedOscillatorRenderMessage, InjectedOscillatorWireCommand,
+};
 #[cfg(test)]
 mod injected_node_construction_tests;
 
@@ -148,6 +154,8 @@ pub struct AudioContextRegistration {
     /// Exact public-edge endpoint brand. Permanent magic registrations carry this without an
     /// ordinary lifetime slot; ordinary Gain registrations carry both capabilities.
     injected_connection: Option<injected_connections::InjectedConnectionEndpoint>,
+    /// Exact scheduled-source event key, present only after accepted oscillator publication.
+    injected_ended: Option<crate::events::InjectedExactEndedEventTarget>,
     /// the audio context in which nodes and connections lives
     context: ConcreteBaseAudioContext,
     /// identify a specific `AudioNode`
@@ -176,6 +184,7 @@ impl AudioContextRegistration {
         Self {
             injected_lifetime: Some(lifetime),
             injected_connection: None,
+            injected_ended: None,
             context,
             id,
         }
@@ -205,6 +214,7 @@ impl AudioContextRegistration {
         Self {
             injected_lifetime: Some(lifetime),
             injected_connection: Some(connection),
+            injected_ended: None,
             context,
             id,
         }
@@ -232,6 +242,7 @@ impl AudioContextRegistration {
         Self {
             injected_lifetime: None,
             injected_connection: Some(connection),
+            injected_ended: None,
             context,
             id,
         }
@@ -262,6 +273,70 @@ impl AudioContextRegistration {
         &self,
     ) -> Option<&injected_connections::InjectedConnectionEndpoint> {
         self.injected_connection.as_ref()
+    }
+
+    pub(crate) fn from_injected_oscillator(
+        id: AudioNodeId,
+        context: ConcreteBaseAudioContext,
+        lifetime: injected_node_lifetime::InjectedNodeRegistration,
+        connection: injected_connections::InjectedConnectionEndpoint,
+        ended: crate::events::InjectedExactEndedEventTarget,
+    ) -> Self {
+        let matches_context = context
+            .injected_node_constructor()
+            .is_some_and(|constructor| connection.matches_constructor(constructor));
+        let matches_events = context
+            .injected_events()
+            .is_some_and(|events| ended.matches_attachment(events, &lifetime, id));
+        if !matches_context
+            || !matches_events
+            || !connection.matches_registration(
+                &lifetime,
+                id,
+                injected_connections::InjectedConnectionEndpointKind::AudioNode,
+                0,
+                1,
+            )
+        {
+            connection.fail_closed_protocol();
+            if let Some(constructor) = context.injected_node_constructor() {
+                constructor.fail_closed_protocol();
+            }
+            panic!("exact oscillator capabilities do not match their context/live registration");
+        }
+        Self {
+            injected_lifetime: Some(lifetime),
+            injected_connection: Some(connection),
+            injected_ended: Some(ended),
+            context,
+            id,
+        }
+    }
+
+    pub(crate) fn set_ended_handler(&self, callback: crate::events::EventHandler) {
+        if let Some(ended) = &self.injected_ended {
+            if let Err(error) = ended.try_set_handler(callback) {
+                panic!("InvalidStateError - exact ended handler installation failed: {error:?}");
+            }
+            return;
+        }
+        if self.context.injected_node_constructor().is_some() {
+            drop(callback);
+            panic!("NotSupportedError - this exact scheduled source has no ended capability");
+        }
+        self.context
+            .set_event_handler(crate::events::EventType::Ended(self.id), callback);
+    }
+
+    pub(crate) fn clear_ended_handler(&self) {
+        if let Some(ended) = &self.injected_ended {
+            ended.clear_handler();
+            return;
+        }
+        if self.context.injected_node_constructor().is_none() {
+            self.context
+                .clear_event_handler(crate::events::EventType::Ended(self.id));
+        }
     }
 
     /// Send a message to the corresponding audio processor of this node

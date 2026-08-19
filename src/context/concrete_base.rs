@@ -10,6 +10,9 @@ use crate::context::injected_magic_construction::{
     InjectedMagicConstructionError, InjectedMagicGraph,
 };
 use crate::context::injected_node_construction::InjectedNodeConstructor;
+use crate::context::injected_node_construction::{
+    InjectedOscillatorConstruction, InjectedOscillatorConstructionError,
+};
 use crate::context::injected_node_lifetime::{
     BoundInjectedOutputRenderer, MagicInitializedInjectedOutputRenderer,
 };
@@ -904,6 +907,32 @@ impl ConcreteBaseAudioContext {
         }
     }
 
+    pub(crate) fn injected_events(&self) -> Option<&InjectedControlEventDispatch> {
+        match &self.inner.event_handlers {
+            ConcreteEventHandlers::Legacy(_) => None,
+            ConcreteEventHandlers::Injected(events) => Some(events),
+        }
+    }
+
+    pub(crate) fn try_begin_injected_oscillator(
+        &self,
+        initial_type: crate::node::OscillatorType,
+    ) -> Result<InjectedOscillatorConstruction, InjectedOscillatorConstructionError> {
+        let constructor = self
+            .injected_node_constructor()
+            .ok_or(InjectedOscillatorConstructionError::ProtocolViolation)?;
+        let events = self
+            .injected_events()
+            .ok_or(InjectedOscillatorConstructionError::ProtocolViolation)?;
+        constructor.try_begin_oscillator(events, initial_type)
+    }
+
+    pub(crate) fn fail_closed_injected_protocol(&self) {
+        if let Some(constructor) = self.injected_node_constructor() {
+            constructor.fail_closed_protocol();
+        }
+    }
+
     pub(crate) fn address(&self) -> usize {
         Arc::as_ptr(&self.inner) as usize
     }
@@ -929,6 +958,7 @@ impl ConcreteBaseAudioContext {
         let registration = AudioContextRegistration {
             injected_lifetime: None,
             injected_connection: None,
+            injected_ended: None,
             id,
             context: self.clone(),
         };
@@ -1118,6 +1148,7 @@ impl ConcreteBaseAudioContext {
             None => AudioContextRegistration {
                 injected_lifetime: None,
                 injected_connection: None,
+                injected_ended: None,
                 id: DESTINATION_NODE_ID,
                 context: self.clone(),
             },
@@ -1144,6 +1175,7 @@ impl ConcreteBaseAudioContext {
                 None => AudioContextRegistration {
                     injected_lifetime: None,
                     injected_connection: None,
+                    injected_ended: None,
                     id: AudioNodeId(id),
                     context: self.clone(),
                 },

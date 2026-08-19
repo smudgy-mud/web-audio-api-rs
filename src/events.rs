@@ -13,6 +13,7 @@ use crate::{AudioBuffer, AudioRenderCapacityEvent};
 use std::any::Any;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::num::NonZeroU64;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,6 +27,22 @@ type EventActivityHandler = dyn Fn() + Send + Sync + 'static;
 #[cfg(test)]
 type AfterAdmissionObserver = dyn Fn() + Send + Sync + 'static;
 
+const INJECTED_EVENT_QUEUE_CAPACITY: usize = 256;
+static NEXT_INJECTED_EVENT_CONTEXT_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// Copy event key for one exact scheduled-source lifetime generation.
+///
+/// Construction is restricted to an admitted exact node transaction. The context nonce is
+/// process-unique and never reused, while the slot/generation pair prevents a queued `ended`
+/// record from targeting a later node which recycled the same numeric id.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ExactEndedEventKey {
+    context: NonZeroU64,
+    id: AudioNodeId,
+    slot: usize,
+    generation: NonZeroU64,
+}
+
 /// The Event interface
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -37,6 +54,7 @@ pub struct Event {
 pub(crate) enum EventType {
     ControlBatchActivity,
     Ended(AudioNodeId),
+    ExactEnded(ExactEndedEventKey),
     SinkChange,
     StateChange,
     RenderCapacity,
@@ -137,6 +155,13 @@ impl EventDispatch {
         }
     }
 
+    pub(crate) fn exact_ended(key: ExactEndedEventKey) -> Self {
+        EventDispatch {
+            type_: EventType::ExactEnded(key),
+            payload: EventPayload::None,
+        }
+    }
+
     pub fn sink_change() -> Self {
         EventDispatch {
             type_: EventType::SinkChange,
@@ -205,6 +230,7 @@ pub(crate) struct EventLoop {
     event_recv: Receiver<EventDispatch>,
     event_handlers: Arc<Mutex<HashMap<EventType, EventHandler>>>,
     event_activity_handler: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
+    clear_handlers_on_confirmed_stop: bool,
 }
 
 /// Single-use setup authority for one injected context's exact event channel.
@@ -218,6 +244,7 @@ pub(crate) struct InjectedEventDispatchSetup {
     handlers: Arc<Mutex<HashMap<EventType, EventHandler>>>,
     activity: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
     identity: Arc<()>,
+    context_nonce: Arc<AtomicU64>,
 }
 
 /// Non-clone handler-only setup view. It has no event receiver, producer, stop, or join authority.
@@ -328,12 +355,15 @@ impl InjectedContextState {
 pub(crate) struct InjectedControlEventDispatch {
     sender: Sender<EventDispatch>,
     identity: Arc<()>,
+    context_nonce: Arc<AtomicU64>,
     gate: InjectedContextAdmissionGate,
     state: InjectedContextState,
     handlers: Arc<Mutex<HashMap<EventType, EventHandler>>>,
     activity: Arc<Mutex<Option<Arc<EventActivityHandler>>>>,
     #[cfg(test)]
     after_admission: Arc<Mutex<Option<Arc<AfterAdmissionObserver>>>>,
+    #[cfg(test)]
+    nonce_source_for_test: Arc<Mutex<Option<Arc<AtomicU64>>>>,
 }
 
 impl InjectedControlEventDispatch {
@@ -343,6 +373,12 @@ impl InjectedControlEventDispatch {
 
     pub(crate) fn matches_identity(&self, identity: &Arc<()>) -> bool {
         Arc::ptr_eq(&self.identity, identity)
+    }
+
+    pub(crate) fn matches_same_dispatch(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+            && Arc::ptr_eq(&self.context_nonce, &other.context_nonce)
+            && self.gate.ptr_eq(&other.gate)
     }
 
     pub(crate) fn admission_gate(&self) -> InjectedContextAdmissionGate {
@@ -387,6 +423,92 @@ impl InjectedControlEventDispatch {
         outcome
     }
 
+    /// Mints the context portion of an exact ended key while the caller owns graph admission.
+    /// The shared slot is initialized at most once; a losing compare-exchange consumes but never
+    /// reuses its nonce. Exhaustion is terminal to the caller's construction protocol.
+    fn exact_ended_key_after_graph_admission(
+        &self,
+        id: AudioNodeId,
+        lifetime: &crate::context::InjectedNodeRegistrationIdentity,
+    ) -> Option<ExactEndedEventKey> {
+        let mut nonce = self.context_nonce.load(Ordering::Acquire);
+        if nonce == 0 {
+            #[cfg(test)]
+            let nonce_source_for_test = self.nonce_source_for_test.lock().unwrap().clone();
+            #[cfg(test)]
+            let nonce_source = nonce_source_for_test
+                .as_deref()
+                .unwrap_or(&NEXT_INJECTED_EVENT_CONTEXT_NONCE);
+            #[cfg(not(test))]
+            let nonce_source = &NEXT_INJECTED_EVENT_CONTEXT_NONCE;
+            let allocated = nonce_source
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(1)
+                })
+                .ok()?;
+            let allocated = NonZeroU64::new(allocated)?;
+            match self.context_nonce.compare_exchange(
+                0,
+                allocated.get(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => nonce = allocated.get(),
+                Err(existing) => nonce = existing,
+            }
+        }
+        let (slot, generation) = lifetime.event_key_parts();
+        Some(ExactEndedEventKey {
+            context: NonZeroU64::new(nonce)?,
+            id,
+            slot,
+            generation,
+        })
+    }
+
+    pub(crate) fn matches_exact_ended_key(
+        &self,
+        key: ExactEndedEventKey,
+        id: AudioNodeId,
+        lifetime: &crate::context::InjectedNodeRegistrationIdentity,
+    ) -> bool {
+        let (slot, generation) = lifetime.event_key_parts();
+        NonZeroU64::new(self.context_nonce.load(Ordering::Acquire)) == Some(key.context)
+            && key.id == id
+            && key.slot == slot
+            && key.generation == generation
+    }
+
+    /// Installs one exact handler under short external-event admission. Replacement is removed
+    /// under the mutex and destroyed after unlocking. Post-seal rejection never retains the new
+    /// callback in the shared map.
+    pub(crate) fn try_set_exact_ended_handler(
+        &self,
+        key: ExactEndedEventKey,
+        callback: EventHandler,
+    ) -> Result<(), AdmissionError> {
+        let admission = self.gate.try_external_event()?;
+        let previous = self
+            .handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(EventType::ExactEnded(key), callback);
+        drop(admission);
+        drop(previous);
+        Ok(())
+    }
+
+    /// Exact handler removal is shrink-only and idempotent, so it remains safe after seal. The
+    /// removed callback is destroyed outside the handler mutex.
+    pub(crate) fn clear_exact_ended_handler(&self, key: ExactEndedEventKey) {
+        let previous = self
+            .handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&EventType::ExactEnded(key));
+        drop(previous);
+    }
+
     pub(crate) fn set_handler(&self, event: EventType, callback: EventHandler) {
         self.handlers.lock().unwrap().insert(event, callback);
     }
@@ -410,6 +532,11 @@ impl InjectedControlEventDispatch {
     pub(crate) fn set_after_admission_for_test(&self, observer: Arc<dyn Fn() + Send + Sync>) {
         *self.after_admission.lock().unwrap() = Some(observer);
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_nonce_source_for_test(&self, source: Arc<AtomicU64>) {
+        *self.nonce_source_for_test.lock().unwrap() = Some(source);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -417,6 +544,76 @@ pub(crate) enum InjectedControlEventSendError {
     Full,
     Disconnected,
     Admission(AdmissionError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedExactEndedHandlerError {
+    Inactive,
+    Admission(AdmissionError),
+}
+
+/// Weak exact handler capability attached only to an accepted scheduled-source registration.
+/// It carries no lifetime or admission credit; each installation revalidates the live generation
+/// and obtains a short event admission. Removal remains shrink-only after seal. The generation key
+/// prevents stale invocation after numeric-id reuse, but an event lost to bounded saturation (or a
+/// source which never fires) may leave its callback retained until confirmed whole-context event
+/// retirement. Per-source callback reconciliation belongs to the later scheduled-source root/event
+/// hub; clearing during ordinary reclaim would race an already queued exact event.
+#[derive(Clone)]
+pub(crate) struct InjectedExactEndedEventTarget {
+    events: InjectedControlEventDispatch,
+    lifetime: crate::context::InjectedNodeRegistrationIdentity,
+    id: AudioNodeId,
+    key: ExactEndedEventKey,
+}
+
+impl InjectedExactEndedEventTarget {
+    pub(crate) fn from_oscillator_mint(
+        events: &InjectedControlEventDispatch,
+        mint: crate::context::InjectedOscillatorEventMint,
+    ) -> Option<Self> {
+        let (id, lifetime) = mint.into_parts();
+        let key = events.exact_ended_key_after_graph_admission(id, &lifetime)?;
+        Some(Self {
+            events: events.clone(),
+            lifetime,
+            id,
+            key,
+        })
+    }
+
+    pub(crate) fn matches_attachment(
+        &self,
+        events: &InjectedControlEventDispatch,
+        registration: &crate::context::InjectedNodeRegistration,
+        id: AudioNodeId,
+    ) -> bool {
+        self.id == id
+            && registration.matches_identity(&self.lifetime)
+            && self.events.matches_same_dispatch(events)
+            && events.matches_exact_ended_key(self.key, id, &self.lifetime)
+    }
+
+    pub(crate) const fn render_key(&self) -> ExactEndedEventKey {
+        self.key
+    }
+
+    pub(crate) fn try_set_handler(
+        &self,
+        callback: EventHandler,
+    ) -> Result<(), InjectedExactEndedHandlerError> {
+        if !self.lifetime.is_live_for(self.id) {
+            drop(callback);
+            return Err(InjectedExactEndedHandlerError::Inactive);
+        }
+        self.events
+            .try_set_exact_ended_handler(self.key, callback)
+            .map_err(InjectedExactEndedHandlerError::Admission)
+    }
+
+    pub(crate) fn clear_handler(&self) {
+        self.events.clear_exact_ended_handler(self.key);
+    }
 }
 
 /// Sole event-consumer retirement authority paired with the exact injected state.
@@ -551,12 +748,15 @@ impl InjectedEventDispatchSetup {
             control: InjectedControlEventDispatch {
                 sender: self.sender,
                 identity: Arc::clone(&self.identity),
+                context_nonce: Arc::clone(&self.context_nonce),
                 gate,
                 state: state.clone(),
                 handlers: self.handlers,
                 activity: self.activity,
                 #[cfg(test)]
                 after_admission: Arc::new(Mutex::new(None)),
+                #[cfg(test)]
+                nonce_source_for_test: Arc::new(Mutex::new(None)),
             },
             lifecycle: InjectedLifecycleEventLoop {
                 event_loop: Some(self.event_loop),
@@ -627,7 +827,7 @@ pub(crate) struct JoinableEventLoop {
 /// Creates the inseparable injected event setup without exposing a raw producer or consumer.
 #[allow(dead_code)] // selected by the pending private injected AudioContext constructor
 pub(crate) fn injected_event_dispatch_setup() -> std::io::Result<InjectedEventDispatchSetup> {
-    let (sender, receiver) = crossbeam_channel::unbounded();
+    let (sender, receiver) = crossbeam_channel::bounded(INJECTED_EVENT_QUEUE_CAPACITY);
     let event_loop = EventLoop::new(receiver);
     finish_injected_event_dispatch_setup(sender, event_loop)
 }
@@ -664,13 +864,14 @@ fn finish_injected_event_dispatch_setup(
     let identity = Arc::new(());
     let handlers = Arc::clone(&event_loop.event_handlers);
     let activity = Arc::clone(&event_loop.event_activity_handler);
-    let event_loop = event_loop.run_joinable()?;
+    let event_loop = event_loop.run_joinable_exact()?;
     Ok(InjectedEventDispatchSetup {
         sender,
         event_loop,
         handlers,
         activity,
         identity,
+        context_nonce: Arc::new(AtomicU64::new(0)),
     })
 }
 
@@ -751,6 +952,7 @@ impl EventLoop {
             event_recv,
             event_handlers: Default::default(),
             event_activity_handler: Default::default(),
+            clear_handlers_on_confirmed_stop: false,
         }
     }
 
@@ -839,8 +1041,20 @@ impl EventLoop {
     /// This is separate from [`Self::run_in_thread`], whose detached legacy behavior is preserved.
     #[allow(dead_code)] // consumed by the private lifecycle; public AudioContext wiring is pending
     pub(crate) fn run_joinable(&self) -> std::io::Result<JoinableEventLoop> {
+        self.run_joinable_inner(false)
+    }
+
+    fn run_joinable_exact(&self) -> std::io::Result<JoinableEventLoop> {
+        self.run_joinable_inner(true)
+    }
+
+    fn run_joinable_inner(
+        &self,
+        clear_handlers_on_confirmed_stop: bool,
+    ) -> std::io::Result<JoinableEventLoop> {
         let (stop_send, stop_recv) = crossbeam_channel::bounded(1);
-        let event_loop = self.clone();
+        let mut event_loop = self.clone();
+        event_loop.clear_handlers_on_confirmed_stop = clear_handlers_on_confirmed_stop;
         let join = std::thread::Builder::new()
             .name("web-audio-event-loop".to_owned())
             .spawn(move || event_loop.run_with_stop(stop_recv))?;
@@ -902,7 +1116,9 @@ impl EventLoop {
     }
 
     fn finish_stop(&self, stop: EventLoopStop) -> EventLoopExit {
-        match stop {
+        let clear_handlers =
+            self.clear_handlers_on_confirmed_stop && !matches!(stop, EventLoopStop::Silent);
+        let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match stop {
             EventLoopStop::Silent => EventLoopExit::Silent,
             EventLoopStop::TerminalClosed => {
                 // Silent/controller-drop shutdown does not deliver stale unrelated records. The
@@ -937,7 +1153,71 @@ impl EventLoop {
                 debug_assert!(result.is_break());
                 EventLoopExit::Graceful
             }
+        }));
+        let (exit, mut first_panic) = match dispatch {
+            Ok(exit) => (Some(exit), None),
+            Err(payload) => (None, Some(payload)),
+        };
+
+        // Confirmed producer quiescence makes the event thread the final owner allowed to touch
+        // queued payload and handler storage. Base/node clones retain the Arc after join, so clear
+        // every dead exact callback before publishing thread retirement. Destructors run outside
+        // the mutex; a hostile destructor panic is reported by JoinableEventLoop::join.
+        if clear_handlers {
+            // A queued handler or the final Closed handler may have panicked before the dispatch
+            // closure drained the channel. Producer quiescence makes the remaining records dead;
+            // contain each payload destructor independently so one panic cannot strand the rest.
+            while let Ok(event) = self.event_recv.try_recv() {
+                if let Err(payload) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(event)))
+                {
+                    if first_panic.is_none() {
+                        first_panic = Some(payload);
+                    } else {
+                        std::mem::forget(payload);
+                    }
+                }
+            }
+            let mut handlers = {
+                let mut handlers = self
+                    .event_handlers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::take(&mut *handlers)
+            };
+            for (_, handler) in handlers.drain() {
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(handler);
+                })) {
+                    if first_panic.is_none() {
+                        first_panic = Some(payload);
+                    } else {
+                        std::mem::forget(payload);
+                    }
+                }
+            }
+            drop(handlers);
+            let activity = self
+                .event_activity_handler
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(activity) = activity {
+                if let Err(payload) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(activity)))
+                {
+                    if first_panic.is_none() {
+                        first_panic = Some(payload);
+                    } else {
+                        std::mem::forget(payload);
+                    }
+                }
+            }
         }
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
+        }
+        exit.expect("event stop dispatch returns an exit unless its panic is resumed")
     }
 
     pub fn set_handler(&self, event: EventType, callback: EventHandler) {
@@ -963,6 +1243,7 @@ impl EventLoop {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -971,6 +1252,45 @@ mod tests {
     use crate::context::AudioNodeId;
     use crate::node::ScheduledSourceCompletionToken;
     use crate::render::AudioWorkletGlobalScope;
+
+    fn exact_key_for_test(id: u64) -> ExactEndedEventKey {
+        exact_key_with_generation_for_test(id, 1)
+    }
+
+    fn exact_key_with_generation_for_test(id: u64, generation: u64) -> ExactEndedEventKey {
+        ExactEndedEventKey {
+            context: NonZeroU64::new(1).unwrap(),
+            id: AudioNodeId(id),
+            slot: id as usize,
+            generation: NonZeroU64::new(generation).unwrap(),
+        }
+    }
+
+    #[test]
+    fn queued_exact_ended_from_recycled_generation_cannot_invoke_new_handler() {
+        let (event_send, event_recv) = crossbeam_channel::unbounded();
+        let event_loop = EventLoop::new(event_recv);
+        let old = exact_key_with_generation_for_test(42, 1);
+        let recycled = exact_key_with_generation_for_test(42, 2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = Arc::clone(&calls);
+        event_loop.set_handler(
+            EventType::ExactEnded(recycled),
+            EventHandler::Once(Box::new(move |_| {
+                calls_for_handler.fetch_add(1, Ordering::AcqRel);
+            })),
+        );
+
+        event_send.send(EventDispatch::exact_ended(old)).unwrap();
+        assert!(event_loop.handle_pending_events());
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        event_send
+            .send(EventDispatch::exact_ended(recycled))
+            .unwrap();
+        assert!(event_loop.handle_pending_events());
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
 
     #[test]
     fn unrelated_backlog_wakes_reconciliation_after_terminal_send_is_dropped() {
@@ -1225,6 +1545,203 @@ mod tests {
 
         assert_eq!(queued_count.load(Ordering::Relaxed), 1);
         assert_eq!(close_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn exact_handler_replacement_releases_admission_before_hostile_old_callback_drop() {
+        struct BlockingDrop {
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+        }
+
+        impl Drop for BlockingDrop {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+        }
+
+        let gate = InjectedContextAdmissionGate::new();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let control = InjectedControlEventDispatch {
+            sender,
+            identity: Arc::new(()),
+            context_nonce: Arc::new(AtomicU64::new(1)),
+            gate: gate.clone(),
+            state: InjectedContextState::new_for_test(false),
+            handlers: Arc::new(Mutex::new(HashMap::new())),
+            activity: Arc::new(Mutex::new(None)),
+            after_admission: Arc::new(Mutex::new(None)),
+            nonce_source_for_test: Arc::new(Mutex::new(None)),
+        };
+        let key = exact_key_for_test(7);
+        let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+        let (release_send, release_recv) = crossbeam_channel::bounded(1);
+        let probe = BlockingDrop {
+            entered: entered_send,
+            release: release_recv,
+        };
+        control
+            .try_set_exact_ended_handler(
+                key,
+                EventHandler::Once(Box::new(move |_| {
+                    let _ = &probe;
+                })),
+            )
+            .unwrap();
+
+        let replacement = control.clone();
+        let replace = std::thread::spawn(move || {
+            replacement.try_set_exact_ended_handler(key, EventHandler::Once(Box::new(|_| {})))
+        });
+        entered_recv.recv_timeout(Duration::from_secs(1)).unwrap();
+        let sealed = gate.try_seal().unwrap();
+        let (_worker, drain) = sealed.into_parts();
+        let drained_before_old_drop = drain.snapshot().is_drained();
+        release_send.send(()).unwrap();
+        replace.join().unwrap().unwrap();
+        assert!(drained_before_old_drop);
+    }
+
+    #[test]
+    fn only_exact_confirmed_stops_release_retained_target_and_activity_handlers() {
+        struct DropProbe(Arc<AtomicUsize>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        for exact in [false, true] {
+            for terminal in [false, true] {
+                if !exact && terminal {
+                    continue;
+                }
+                let (_sender, receiver) = crossbeam_channel::unbounded();
+                let event_loop = EventLoop::new(receiver);
+                let drops = Arc::new(AtomicUsize::new(0));
+                let target_probe = DropProbe(Arc::clone(&drops));
+                event_loop.set_handler(
+                    EventType::ExactEnded(exact_key_for_test(11)),
+                    EventHandler::Once(Box::new(move |_| {
+                        let _ = &target_probe;
+                    })),
+                );
+                let activity_probe = DropProbe(Arc::clone(&drops));
+                event_loop.set_activity_handler(move || {
+                    let _ = &activity_probe;
+                });
+
+                let mut running = if exact {
+                    event_loop.run_joinable_exact().unwrap()
+                } else {
+                    event_loop.run_joinable().unwrap()
+                };
+                if terminal {
+                    running.request_terminal_closed_stop();
+                } else {
+                    running.request_graceful_stop();
+                }
+                running.join().unwrap();
+                if exact {
+                    assert_eq!(drops.load(Ordering::Acquire), 2);
+                } else {
+                    assert_eq!(drops.load(Ordering::Acquire), 0);
+                    event_loop.clear_handler(EventType::ExactEnded(exact_key_for_test(11)));
+                    event_loop.clear_activity_handler();
+                    assert_eq!(drops.load(Ordering::Acquire), 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_confirmed_retirement_contains_each_panicking_handler_destructor() {
+        struct PanicDrop(Arc<AtomicUsize>);
+
+        impl Drop for PanicDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                panic!("hostile exact handler destructor");
+            }
+        }
+
+        let (_sender, receiver) = crossbeam_channel::unbounded();
+        let event_loop = EventLoop::new(receiver);
+        let drops = Arc::new(AtomicUsize::new(0));
+        for id in [21, 22] {
+            let probe = PanicDrop(Arc::clone(&drops));
+            event_loop.set_handler(
+                EventType::ExactEnded(exact_key_for_test(id)),
+                EventHandler::Once(Box::new(move |_| {
+                    let _ = &probe;
+                })),
+            );
+        }
+        let mut running = event_loop.run_joinable_exact().unwrap();
+        running.request_terminal_closed_stop();
+        assert!(matches!(
+            running.join(),
+            Err(EventLoopJoinError::Panicked(_))
+        ));
+        assert_eq!(drops.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn exact_confirmed_retirement_clears_unrelated_handlers_after_queued_or_final_callback_panic() {
+        struct DropProbe(Arc<AtomicUsize>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        for panic_on_final_closed in [false, true] {
+            let (event_send, event_recv) = crossbeam_channel::unbounded();
+            let event_loop = EventLoop::new(event_recv);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let retained = DropProbe(Arc::clone(&drops));
+            event_loop.set_handler(
+                EventType::ExactEnded(exact_key_for_test(31)),
+                EventHandler::Once(Box::new(move |_| {
+                    let _ = &retained;
+                })),
+            );
+            let activity = DropProbe(Arc::clone(&drops));
+            event_loop.set_activity_handler(move || {
+                let _ = &activity;
+            });
+
+            if panic_on_final_closed {
+                event_loop.set_handler(
+                    EventType::StateChange,
+                    EventHandler::Once(Box::new(|_| panic!("forced final Closed handler panic"))),
+                );
+            } else {
+                event_loop.set_handler(
+                    EventType::SinkChange,
+                    EventHandler::Once(Box::new(|_| panic!("forced queued handler panic"))),
+                );
+                event_send.send(EventDispatch::sink_change()).unwrap();
+                let trailing = DropProbe(Arc::clone(&drops));
+                event_send
+                    .send(EventDispatch::message(AudioNodeId(99), Box::new(trailing)))
+                    .unwrap();
+            }
+
+            let mut running = event_loop.run_joinable_exact().unwrap();
+            running.request_graceful_stop();
+            assert!(matches!(
+                running.join(),
+                Err(EventLoopJoinError::Panicked(_))
+            ));
+            assert_eq!(
+                drops.load(Ordering::Acquire),
+                if panic_on_final_closed { 2 } else { 3 }
+            );
+        }
     }
 
     #[test]

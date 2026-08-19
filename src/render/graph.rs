@@ -584,6 +584,14 @@ impl Graph {
         self.nodes.get_unchecked_mut(index).processor.onmessage(msg);
     }
 
+    pub(crate) fn try_route_message(&mut self, index: AudioNodeId, msg: &mut dyn Any) -> bool {
+        let Some(node) = self.nodes.get_mut(index) else {
+            return false;
+        };
+        node.get_mut().processor.onmessage(msg);
+        true
+    }
+
     /// Helper function for `order_nodes` - traverse node and outgoing edges
     ///
     /// The return value indicates `cycle_breaker_applied`:
