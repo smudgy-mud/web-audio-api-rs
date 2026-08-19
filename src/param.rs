@@ -442,12 +442,7 @@ impl AudioParam {
 
     #[allow(dead_code)] // called by the pending injected Gain transaction
     pub(crate) fn set_initial_value_for_injected(&self, value: f32) -> AudioParamInitialValue {
-        let initial = AudioParamInitialValue::new(value);
-        let clamped = value.clamp(self.raw_parts.min_value, self.raw_parts.max_value);
-        self.raw_parts
-            .current_value
-            .store(clamped, Ordering::Release);
-        initial
+        self.raw_parts.set_initial_value_for_injected(value)
     }
 
     /// Schedules a parameter value change at the given time.
@@ -683,6 +678,15 @@ impl AudioParam {
     fn send_event(&self, event: AudioParamEvent) -> &Self {
         self.registration().post_message(event);
         self
+    }
+}
+
+impl AudioParamInner {
+    pub(crate) fn set_initial_value_for_injected(&self, value: f32) -> AudioParamInitialValue {
+        let initial = AudioParamInitialValue::new(value);
+        let clamped = value.clamp(self.min_value, self.max_value);
+        self.current_value.store(clamped, Ordering::Release);
+        initial
     }
 }
 
@@ -1642,6 +1646,19 @@ pub(crate) fn audio_param_pair(
     descriptor: AudioParamDescriptor,
     registration: AudioContextRegistration,
 ) -> (AudioParam, AudioParamProcessor) {
+    let (raw_parts, processor) = audio_param_raw_parts(descriptor);
+    (
+        AudioParam::from_raw_parts(registration, raw_parts),
+        processor,
+    )
+}
+
+/// Builds the shareable control state and renderer without creating an AudioContextRegistration.
+/// Injected construction uses this before acceptance so no public handle can request teardown for
+/// a graph node that was never committed.
+pub(crate) fn audio_param_raw_parts(
+    descriptor: AudioParamDescriptor,
+) -> (AudioParamInner, AudioParamProcessor) {
     let AudioParamDescriptor {
         automation_rate,
         default_value,
@@ -1664,16 +1681,13 @@ pub(crate) fn audio_param_pair(
 
     let current_value = Arc::new(AtomicF32::new(default_value));
 
-    let param = AudioParam {
-        registration: registration.into(),
-        raw_parts: AudioParamInner {
-            default_value,
-            max_value,
-            min_value,
-            automation_rate_constrained: false,
-            automation_rate: Arc::new(Mutex::new(automation_rate)),
-            current_value: Arc::clone(&current_value),
-        },
+    let raw_parts = AudioParamInner {
+        default_value,
+        max_value,
+        min_value,
+        automation_rate_constrained: false,
+        automation_rate: Arc::new(Mutex::new(automation_rate)),
+        current_value: Arc::clone(&current_value),
     };
 
     let processor = AudioParamProcessor {
@@ -1688,7 +1702,7 @@ pub(crate) fn audio_param_pair(
         buffer: ArrayVec::new(),
     };
 
-    (param, processor)
+    (raw_parts, processor)
 }
 
 #[cfg(test)]
