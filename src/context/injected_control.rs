@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, TryLockError, Weak};
 
 use crossbeam_channel::{Sender, TrySendError};
 
@@ -20,7 +20,12 @@ use super::injected_admission::{
     CapacityWorkerRetirement, GraphControlAdmission,
 };
 #[cfg(test)]
-use super::{injected_node_id_pair, InjectedNodeIdOwner};
+use super::injected_node_id_pair;
+use super::injected_node_lifetime::InjectedNodeLifetimeOwner;
+#[cfg(test)]
+use super::injected_node_lifetime::{
+    injected_node_lifetime_registry, DEFAULT_NODE_LIFETIME_CAPACITY,
+};
 use super::{InjectedContextAdmissionGate, InjectedGraphReclaimInit};
 use crate::events::EventDispatch;
 use crate::message::{
@@ -171,6 +176,20 @@ struct InjectedControlInner {
     accepted_finalizer_failed: AtomicBool,
 }
 
+/// Opaque weak identity used to bind later private lifecycle foundations to this exact transport.
+#[derive(Clone)]
+pub(crate) struct InjectedControlIdentity(Weak<InjectedControlInner>);
+
+impl InjectedControlIdentity {
+    pub(crate) fn matches_drained(&self, drained: &DrainedControlClose) -> bool {
+        Weak::ptr_eq(&self.0, &Arc::downgrade(&drained.inner))
+    }
+
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// Cloneable ordinary graph producer. Private fields prevent raw sender or lifecycle extraction.
 #[derive(Clone)]
 pub(crate) struct InjectedControlProducer {
@@ -190,6 +209,40 @@ pub(crate) struct InjectedControlRenderInit {
     physical_owners: InjectedPhysicalCreditOwners,
     lifecycle_publisher: GraphLifecyclePublisher,
     applied: ControlBatchApplied,
+    identity: InjectedControlIdentity,
+}
+
+/// Inseparable pre-render bundle. Its private fields ensure the exact graph-id publisher and
+/// lifetime owner validated together cannot be swapped, and successful render construction keeps
+/// returning that owner alongside the render owner/callback.
+pub(crate) struct InjectedNodeLifetimeBootstrap {
+    owner: InjectedNodeLifetimeOwner,
+    graph: InjectedGraphReclaimInit,
+}
+
+impl InjectedNodeLifetimeBootstrap {
+    #[allow(clippy::result_large_err)] // failure must return both exact unboxed owners intact
+    pub(crate) fn new(
+        owner: InjectedNodeLifetimeOwner,
+        graph: InjectedGraphReclaimInit,
+    ) -> Result<Self, (InjectedNodeLifetimeOwner, InjectedGraphReclaimInit)> {
+        if !owner.matches_graph_init(&graph) {
+            return Err((owner, graph));
+        }
+        Ok(Self { owner, graph })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_parts_for_test(
+        self,
+    ) -> (InjectedNodeLifetimeOwner, InjectedGraphReclaimInit) {
+        (self.owner, self.graph)
+    }
+}
+
+pub(crate) struct BuildInjectedRenderFailure {
+    pub(crate) init: InjectedControlRenderInit,
+    pub(crate) node_lifetimes: InjectedNodeLifetimeBootstrap,
 }
 
 /// Opaque renderer with receiver and owners already bound. The future injected constructor passes
@@ -197,6 +250,7 @@ pub(crate) struct InjectedControlRenderInit {
 #[must_use]
 pub(crate) struct BoundInjectedRenderer {
     renderer: RenderThread,
+    node_lifetimes: InjectedNodeLifetimeOwner,
 }
 
 impl BoundInjectedRenderer {
@@ -206,28 +260,47 @@ impl BoundInjectedRenderer {
         self,
         format: AudioRenderFormat,
         events: AudioOutputEventSink,
-    ) -> (AudioRenderOwner, AudioRenderCallback) {
-        audio_render_thread_pair(format, self.renderer, events)
+    ) -> (
+        AudioRenderOwner,
+        AudioRenderCallback,
+        InjectedNodeLifetimeOwner,
+    ) {
+        let (owner, callback) = audio_render_thread_pair(format, self.renderer, events);
+        (owner, callback, self.node_lifetimes)
     }
 
     #[cfg(test)]
-    fn into_render_thread_for_test(self) -> RenderThread {
-        self.renderer
+    fn into_render_thread_for_test(self) -> (RenderThread, InjectedNodeLifetimeOwner) {
+        (self.renderer, self.node_lifetimes)
     }
 }
 
 impl InjectedControlRenderInit {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::result_large_err)] // retry must return the exact init and bootstrap intact
     pub(crate) fn build_render_thread(
         self,
-        graph: InjectedGraphReclaimInit,
+        node_lifetimes: InjectedNodeLifetimeBootstrap,
         sample_rate: f32,
         number_of_channels: usize,
         state: Arc<std::sync::atomic::AtomicU8>,
         frames_played: Arc<AtomicU64>,
         stats: AudioStats,
         event_sender: Sender<EventDispatch>,
-    ) -> BoundInjectedRenderer {
+    ) -> Result<BoundInjectedRenderer, BuildInjectedRenderFailure> {
+        if !self
+            .identity
+            .ptr_eq(node_lifetimes.owner.control_identity())
+        {
+            return Err(BuildInjectedRenderFailure {
+                init: self,
+                node_lifetimes,
+            });
+        }
+        let InjectedNodeLifetimeBootstrap {
+            owner: node_lifetimes,
+            graph,
+        } = node_lifetimes;
         let mut renderer = RenderThread::new(
             sample_rate,
             number_of_channels,
@@ -253,7 +326,10 @@ impl InjectedControlRenderInit {
         {
             unreachable!("new renderer has no lifecycle publisher");
         }
-        BoundInjectedRenderer { renderer }
+        Ok(BoundInjectedRenderer {
+            renderer,
+            node_lifetimes,
+        })
     }
 }
 
@@ -325,6 +401,7 @@ pub(crate) fn injected_control_channel(
             physical_owners,
             lifecycle_publisher,
             applied,
+            identity: InjectedControlIdentity(Arc::downgrade(&inner)),
         },
     ))
 }
@@ -531,6 +608,10 @@ pub(crate) struct FlushControlOutcome {
 }
 
 impl InjectedControlProducer {
+    pub(crate) fn identity(&self) -> InjectedControlIdentity {
+        InjectedControlIdentity(Arc::downgrade(&self.inner))
+    }
+
     /// Reserves logical, storage, and state-specific placement capacity before caller mutation.
     /// Physical FIFO and sequence order are commit order. A future mirror transaction must
     /// serialize its mirror mutation plus commit if concurrent callers require mutation order.
@@ -1277,7 +1358,7 @@ mod tests {
         owner: Option<InjectedControlLifecycleOwner>,
         renderer: Option<RenderThread>,
         gc: Option<std::thread::JoinHandle<()>>,
-        _node_ids: InjectedNodeIdOwner,
+        _node_lifetimes: InjectedNodeLifetimeOwner,
         _event_receiver: crossbeam_channel::Receiver<EventDispatch>,
     }
 
@@ -1288,9 +1369,17 @@ mod tests {
                 injected_control_channel(gate.clone(), ordinary_capacity, suspended).unwrap();
             let (event_sender, event_receiver) = crossbeam_channel::bounded(32);
             let (_allocator, node_ids, graph) = injected_node_id_pair(0);
-            let mut renderer = init
+            let (_registrar, node_lifetimes) = injected_node_lifetime_registry(
+                DEFAULT_NODE_LIFETIME_CAPACITY,
+                &producer,
+                node_ids,
+                graph,
+            )
+            .ok()
+            .unwrap();
+            let bound = init
                 .build_render_thread(
-                    graph,
+                    node_lifetimes,
                     48_000.,
                     2,
                     Arc::new(AtomicU8::new(AudioContextState::Suspended as u8)),
@@ -1298,7 +1387,9 @@ mod tests {
                     AudioStats::new(),
                     event_sender,
                 )
-                .into_render_thread_for_test();
+                .ok()
+                .unwrap();
+            let (mut renderer, node_lifetimes) = bound.into_render_thread_for_test();
             let gc = renderer.spawn_joinable_garbage_collector_thread().unwrap();
             Self {
                 gate,
@@ -1306,7 +1397,7 @@ mod tests {
                 owner: Some(owner),
                 renderer: Some(renderer),
                 gc: Some(gc),
-                _node_ids: node_ids,
+                _node_lifetimes: node_lifetimes,
                 _event_receiver: event_receiver,
             }
         }
@@ -2066,19 +2157,31 @@ mod tests {
         let (producer, owner, init) = injected_control_channel(gate, 1, false).unwrap();
         let (event_sender, _event_receiver) = crossbeam_channel::bounded(1);
         let (_allocator, node_ids, graph) = injected_node_id_pair(0);
-        let bound = init.build_render_thread(
+        let (_registrar, node_lifetimes) = injected_node_lifetime_registry(
+            DEFAULT_NODE_LIFETIME_CAPACITY,
+            &producer,
+            node_ids,
             graph,
-            48_000.,
-            2,
-            Arc::new(AtomicU8::new(AudioContextState::Suspended as u8)),
-            Arc::new(AtomicU64::new(0)),
-            AudioStats::new(),
-            event_sender,
-        );
+        )
+        .ok()
+        .unwrap();
+        let bound = init
+            .build_render_thread(
+                node_lifetimes,
+                48_000.,
+                2,
+                Arc::new(AtomicU8::new(AudioContextState::Suspended as u8)),
+                Arc::new(AtomicU64::new(0)),
+                AudioStats::new(),
+                event_sender,
+            )
+            .ok()
+            .unwrap();
         assert!(bound.renderer.has_injected_reclaim_publisher());
         let (events, _watcher) = AudioOutputEventSink::bounded(1);
         let format = AudioRenderFormat::new(48_000., 2, 128).unwrap();
-        let (render_owner, callback) = bound.into_audio_render_thread_pair(format, events);
+        let (render_owner, callback, node_lifetimes) =
+            bound.into_audio_render_thread_pair(format, events);
         render_owner.begin_shutdown();
         drop(callback);
         assert!(render_owner
@@ -2086,6 +2189,6 @@ mod tests {
             .ok()
             .unwrap()
             .is_ok());
-        drop((producer, owner, node_ids));
+        drop((producer, owner, node_lifetimes));
     }
 }
