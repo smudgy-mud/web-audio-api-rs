@@ -60,6 +60,10 @@ pub use offline::*;
 mod online;
 pub use online::*;
 
+mod resource;
+pub use resource::AudioNodeLifetimeReservation;
+pub(crate) use resource::SharedAudioNodeLifetimeReservation;
+
 mod hosted;
 pub use hosted::{
     AudioContextBuildError, AudioContextBuildErrorKind, AudioContextBuilder,

@@ -29,7 +29,10 @@ use super::injected_node_lifetime::{
     InjectedNodeRegistrationIdentity, NodeReclaimCleanupError, NodeRegistrationError,
     ProvisionalNodeRegistration,
 };
-use super::{AudioContextRegistration, AudioNodeId};
+use super::{
+    AudioContextRegistration, AudioNodeId, AudioNodeLifetimeReservation,
+    SharedAudioNodeLifetimeReservation,
+};
 use crate::events::{ExactEndedEventKey, InjectedExactEndedEventTarget};
 use crate::message::ControlMessage;
 use crate::node::{ChannelConfigInner, OscillatorType};
@@ -420,10 +423,11 @@ pub(crate) struct InjectedOscillatorConstruction {
 }
 
 impl InjectedNodeConstructor {
-    pub(super) fn try_begin_oscillator(
+    pub(super) fn try_begin_oscillator_with_lifetime(
         &self,
         events: &crate::events::InjectedControlEventDispatch,
         initial_type: OscillatorType,
+        lifetime: Option<AudioNodeLifetimeReservation>,
     ) -> Result<InjectedOscillatorConstruction, InjectedOscillatorConstructionError> {
         if initial_type == OscillatorType::Custom || !events.matches_gate(&self.admission_gate()) {
             return Err(InjectedOscillatorConstructionError::ProtocolViolation);
@@ -432,6 +436,7 @@ impl InjectedNodeConstructor {
             .control
             .try_begin_operation(OSCILLATOR_COMMAND_COUNT)
             .map_err(InjectedOscillatorConstructionError::Control)?;
+        let lifetime = lifetime.map(SharedAudioNodeLifetimeReservation::new);
         let oscillator_serializer = Arc::new(Mutex::new(()));
         let frequency_serializer = Arc::new(Mutex::new(()));
         let detune_serializer = Arc::new(Mutex::new(()));
@@ -450,18 +455,21 @@ impl InjectedNodeConstructor {
             InjectedConnectionEndpointKind::AudioNode,
             0,
             1,
+            lifetime.clone(),
         )?;
         let (frequency, frequency_connection) = self.register_oscillator_endpoint(
             frequency_id,
             InjectedConnectionEndpointKind::AudioParam,
             1,
             1,
+            lifetime.clone(),
         )?;
         let (detune, detune_connection) = self.register_oscillator_endpoint(
             detune_id,
             InjectedConnectionEndpointKind::AudioParam,
             1,
             1,
+            lifetime,
         )?;
         let mint = InjectedOscillatorEventMint {
             id: oscillator_id,
@@ -503,12 +511,16 @@ impl InjectedNodeConstructor {
         kind: InjectedConnectionEndpointKind,
         inputs: usize,
         outputs: usize,
+        lifetime: Option<SharedAudioNodeLifetimeReservation>,
     ) -> Result<
         (ProvisionalNodeRegistration, InjectedConnectionEndpoint),
         InjectedOscillatorConstructionError,
     > {
         let cleanup: Box<dyn InjectedNodeReclaimCleanup> =
-            Box::new(DeferredIncidentConnectionCleanup { id });
+            Box::new(DeferredIncidentConnectionCleanup {
+                id,
+                _lifetime: lifetime.clone(),
+            });
         let provisional = self
             .lifetimes
             .try_register(id, cleanup)
@@ -532,6 +544,10 @@ impl InjectedNodeConstructor {
                 NodeRegistrationError::OwnerGone,
             ));
         };
+        let cleanup: Box<dyn InjectedNodeReclaimCleanup> = Box::new(RetainedNodeLifetimeCleanup {
+            cleanup,
+            _lifetime: lifetime,
+        });
         let previous = provisional
             .replace_cleanup_before_acceptance(cleanup)
             .map_err(|cleanup| {
@@ -1237,14 +1253,23 @@ impl InjectedNodeConstructor {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn try_begin_gain(
         &self,
+    ) -> Result<InjectedGainConstruction, InjectedGainConstructionError> {
+        self.try_begin_gain_with_lifetime(None)
+    }
+
+    pub(crate) fn try_begin_gain_with_lifetime(
+        &self,
+        lifetime: Option<AudioNodeLifetimeReservation>,
     ) -> Result<InjectedGainConstruction, InjectedGainConstructionError> {
         // This admission must precede every ID, lifetime-slot, mirror, or payload mutation.
         let reservation = self
             .control
             .try_begin_operation(GAIN_COMMAND_COUNT)
             .map_err(InjectedGainConstructionError::Control)?;
+        let lifetime = lifetime.map(SharedAudioNodeLifetimeReservation::new);
         // Allocate the post-construction serializer while every later Gain resource is still
         // rollback-owned by this admitted transaction.
         let param_serializer = Arc::new(Mutex::new(()));
@@ -1261,13 +1286,19 @@ impl InjectedNodeConstructor {
         let gain_id = ids.id(GAIN_ID_INDEX);
         let param_id = ids.id(PARAM_ID_INDEX);
 
-        let (gain, gain_connection) =
-            self.register_endpoint(gain_id, InjectedConnectionEndpointKind::AudioNode, 1, 1)?;
+        let (gain, gain_connection) = self.register_endpoint(
+            gain_id,
+            InjectedConnectionEndpointKind::AudioNode,
+            1,
+            1,
+            lifetime.clone(),
+        )?;
         let (param, param_connection) = match self.register_endpoint(
             param_id,
             InjectedConnectionEndpointKind::AudioParam,
             1,
             1,
+            lifetime,
         ) {
             Ok(param) => param,
             Err(error) => {
@@ -1308,12 +1339,16 @@ impl InjectedNodeConstructor {
         kind: InjectedConnectionEndpointKind,
         inputs: usize,
         outputs: usize,
+        lifetime: Option<SharedAudioNodeLifetimeReservation>,
     ) -> Result<
         (ProvisionalNodeRegistration, InjectedConnectionEndpoint),
         InjectedGainConstructionError,
     > {
         let cleanup: Box<dyn InjectedNodeReclaimCleanup> =
-            Box::new(DeferredIncidentConnectionCleanup { id });
+            Box::new(DeferredIncidentConnectionCleanup {
+                id,
+                _lifetime: lifetime.clone(),
+            });
         let provisional = self
             .lifetimes
             .try_register(id, cleanup)
@@ -1337,6 +1372,10 @@ impl InjectedNodeConstructor {
                 NodeRegistrationError::OwnerGone,
             ));
         };
+        let cleanup: Box<dyn InjectedNodeReclaimCleanup> = Box::new(RetainedNodeLifetimeCleanup {
+            cleanup,
+            _lifetime: lifetime,
+        });
         let previous = provisional
             .replace_cleanup_before_acceptance(cleanup)
             .map_err(|cleanup| {
@@ -1451,6 +1490,7 @@ impl InjectedNodeConstructor {
 /// slot. The hidden parameter edge remains deliberately outside the public connection mirror.
 struct DeferredIncidentConnectionCleanup {
     id: AudioNodeId,
+    _lifetime: Option<SharedAudioNodeLifetimeReservation>,
 }
 
 impl InjectedNodeReclaimCleanup for DeferredIncidentConnectionCleanup {
@@ -1459,6 +1499,28 @@ impl InjectedNodeReclaimCleanup for DeferredIncidentConnectionCleanup {
             return Err(NodeReclaimCleanupError::Rejected);
         }
         Ok(())
+    }
+}
+
+/// Exact incident cleanup plus an optional host reservation shared by every node created in one
+/// compound transaction. The reservation is released only after all successful cleanup records
+/// have been destroyed. Rejected cleanup is forgotten by the lifetime registry and therefore
+/// retains the reservation fail closed.
+struct RetainedNodeLifetimeCleanup {
+    cleanup: Box<dyn InjectedNodeReclaimCleanup>,
+    _lifetime: Option<SharedAudioNodeLifetimeReservation>,
+}
+
+impl InjectedNodeReclaimCleanup for RetainedNodeLifetimeCleanup {
+    fn reconcile(&mut self, id: AudioNodeId) -> Result<(), NodeReclaimCleanupError> {
+        self.cleanup.reconcile(id)
+    }
+
+    fn reconcile_after_whole_graph(
+        &mut self,
+        id: AudioNodeId,
+    ) -> Result<(), NodeReclaimCleanupError> {
+        self.cleanup.reconcile_after_whole_graph(id)
     }
 }
 
