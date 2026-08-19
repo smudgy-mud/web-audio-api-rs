@@ -18,6 +18,13 @@ use crate::render::graph::Graph;
 use crate::MediaElement;
 use crate::{is_valid_sample_rate, AudioPlaybackStats, AudioRenderCapacity, Event};
 
+use super::hosted::{
+    hosted_shutdown_outcome_is_success, hosted_state_outcome_is_success, AudioContextBuilder,
+    AudioContextLifecycleError, AudioContextShutdownReceipt, AudioContextStateChangeReceipt,
+    HostedAudioContextMode,
+};
+use crate::output::AudioOutputFactory;
+
 use futures_channel::oneshot;
 
 /// Check if the provided sink_id is available for playback
@@ -206,12 +213,21 @@ pub struct AudioContextOptions {
 pub struct AudioContext {
     /// represents the underlying `BaseAudioContext`
     base: ConcreteBaseAudioContext,
-    /// audio backend (play/pause functionality)
-    backend_manager: Mutex<Box<dyn AudioBackendManager>>,
     /// Provider for rendering performance metrics
     render_capacity: AudioRenderCapacity,
     /// Provider for playback statistics
     playback_stats: AudioPlaybackStats,
+    mode: AudioContextMode,
+}
+
+enum AudioContextMode {
+    Legacy(LegacyAudioContextMode),
+    Hosted(HostedAudioContextMode),
+}
+
+struct LegacyAudioContextMode {
+    /// audio backend (play/pause functionality)
+    backend_manager: Mutex<Box<dyn AudioBackendManager>>,
     /// true while the render thread has not yet processed its initial Startup message
     startup_pending: std::sync::Arc<AtomicBool>,
     /// Initializer for the render thread (when restart is required)
@@ -231,11 +247,21 @@ impl std::fmt::Debug for AudioContext {
 
 impl Drop for AudioContext {
     fn drop(&mut self) {
-        // Continue playing the stream if the AudioContext goes out of scope
-        if self.state() == AudioContextState::Running {
-            let tombstone = Box::new(NoneBackend::void());
-            let original = std::mem::replace(self.backend_manager.get_mut().unwrap(), tombstone);
-            Box::leak(original);
+        let state = self.base.state();
+        match &mut self.mode {
+            AudioContextMode::Legacy(legacy) => {
+                // Continue playing the stream if the legacy AudioContext goes out of scope.
+                if state == AudioContextState::Running {
+                    let tombstone = Box::new(NoneBackend::void());
+                    let original =
+                        std::mem::replace(legacy.backend_manager.get_mut().unwrap(), tombstone);
+                    Box::leak(original);
+                }
+            }
+            AudioContextMode::Hosted(hosted) => {
+                self.render_capacity.close();
+                hosted.request_silent_on_drop();
+            }
         }
     }
 }
@@ -253,6 +279,50 @@ impl Default for AudioContext {
 }
 
 impl AudioContext {
+    /// Starts construction of an exact hosted context using the supplied output factory.
+    #[must_use]
+    pub fn builder(output: Arc<dyn AudioOutputFactory>) -> AudioContextBuilder {
+        AudioContextBuilder::new(output)
+    }
+
+    pub(super) fn from_hosted_parts(
+        base: ConcreteBaseAudioContext,
+        render_capacity: AudioRenderCapacity,
+        playback_stats: AudioPlaybackStats,
+        hosted: HostedAudioContextMode,
+    ) -> Self {
+        Self {
+            base,
+            render_capacity,
+            playback_stats,
+            mode: AudioContextMode::Hosted(hosted),
+        }
+    }
+
+    fn legacy(&self) -> &LegacyAudioContextMode {
+        match &self.mode {
+            AudioContextMode::Legacy(legacy) => legacy,
+            AudioContextMode::Hosted(_) => {
+                unreachable!("legacy-only AudioContext path selected for hosted context")
+            }
+        }
+    }
+
+    fn is_hosted(&self) -> bool {
+        matches!(self.mode, AudioContextMode::Hosted(_))
+    }
+
+    #[cfg(test)]
+    fn set_hosted_state_request_hook_for_test(
+        &self,
+        observer: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) {
+        let AudioContextMode::Hosted(hosted) = &self.mode else {
+            panic!("test hook requires hosted context")
+        };
+        hosted.set_state_request_hook_for_test(observer);
+    }
+
     /// Creates and returns a new `AudioContext` object.
     ///
     /// This will play live audio on the default output device.
@@ -365,11 +435,13 @@ impl AudioContext {
 
         Ok(Self {
             base,
-            backend_manager: Mutex::new(backend),
             render_capacity,
             playback_stats,
-            startup_pending,
-            render_thread_init: Mutex::new(Some(render_thread_init)),
+            mode: AudioContextMode::Legacy(LegacyAudioContextMode {
+                backend_manager: Mutex::new(backend),
+                startup_pending,
+                render_thread_init: Mutex::new(Some(render_thread_init)),
+            }),
         })
     }
 
@@ -401,7 +473,12 @@ impl AudioContext {
     ///
     /// Returns an error when the selected audio backend cannot query the output latency.
     fn try_output_latency(&self) -> Result<f64, Box<dyn Error>> {
-        Ok(self.backend_manager.lock().unwrap().output_latency()?)
+        match &self.mode {
+            AudioContextMode::Legacy(legacy) => {
+                Ok(legacy.backend_manager.lock().unwrap().output_latency()?)
+            }
+            AudioContextMode::Hosted(hosted) => Ok(hosted.config().output_latency()),
+        }
     }
 
     /// Identifier or the information of the current audio output device.
@@ -409,7 +486,12 @@ impl AudioContext {
     /// The initial value is `""`, which means the default audio output device.
     #[allow(clippy::missing_panics_doc)]
     pub fn sink_id(&self) -> String {
-        self.backend_manager.lock().unwrap().sink_id().to_owned()
+        match &self.mode {
+            AudioContextMode::Legacy(legacy) => {
+                legacy.backend_manager.lock().unwrap().sink_id().to_owned()
+            }
+            AudioContextMode::Hosted(hosted) => hosted.config().accepted_sink_id().to_owned(),
+        }
     }
 
     /// Returns an [`AudioRenderCapacity`] instance associated with an AudioContext.
@@ -435,6 +517,12 @@ impl AudioContext {
     /// is currently not implemented.
     #[allow(clippy::needless_collect, clippy::missing_panics_doc)]
     pub fn set_sink_id_sync(&self, sink_id: String) -> Result<(), Box<dyn Error>> {
+        if self.is_hosted() {
+            if self.sink_id() == sink_id {
+                return Ok(());
+            }
+            return Err("NotSupportedError: hosted output replacement is not available".into());
+        }
         log::debug!("SinkChange requested");
         if self.sink_id() == sink_id {
             log::debug!("SinkChange: no-op");
@@ -446,7 +534,8 @@ impl AudioContext {
         };
 
         log::debug!("SinkChange: locking backend manager");
-        let mut backend_manager_guard = self.backend_manager.lock().unwrap();
+        let legacy = self.legacy();
+        let mut backend_manager_guard = legacy.backend_manager.lock().unwrap();
         let original_state = self.state();
         if original_state == AudioContextState::Closed {
             log::debug!("SinkChange: context is closed");
@@ -458,7 +547,7 @@ impl AudioContext {
         let ctrl_msg_send = self.base.lock_control_msg_sender();
 
         // Flush out the ctrl msg receiver, cache
-        let render_thread_init = self
+        let render_thread_init = legacy
             .render_thread_init
             .lock()
             .unwrap()
@@ -575,8 +664,12 @@ impl AudioContext {
     #[cfg(feature = "diagnostics")]
     #[allow(clippy::missing_panics_doc)]
     pub fn run_diagnostics<F: Fn(AudioContextDiagnostics) + Send + 'static>(&self, callback: F) {
+        if self.is_hosted() {
+            drop(callback);
+            panic!("NotSupportedError: hosted diagnostics are not available");
+        }
         let backend = {
-            let backend = self.backend_manager.lock().unwrap();
+            let backend = self.legacy().backend_manager.lock().unwrap();
             AudioBackendDiagnostics {
                 name: backend.name().to_string(),
                 sink_id: backend.sink_id().to_string(),
@@ -611,7 +704,20 @@ impl AudioContext {
     ///
     /// * The audio device is not available
     /// * For a `BackendSpecificError`
+    /// * The hosted context's fixed lifecycle request capacity is temporarily contended or full.
+    ///   Call [`Self::request_suspend`] to handle that bounded condition without panicking. A
+    ///   downstream isolate must provide its own wake/retry policy rather than blocking here.
     pub async fn suspend(&self) {
+        if let AudioContextMode::Hosted(hosted) = &self.mode {
+            let receipt = hosted
+                .request_suspend()
+                .unwrap_or_else(|error| panic!("InvalidStateError - {error:?}"));
+            let outcome = receipt.await;
+            if !hosted_state_outcome_is_success(outcome) {
+                panic!("InvalidStateError - hosted suspend failed: {outcome:?}");
+            }
+            return;
+        }
         // Don't lock the backend manager because we can't hold is across the await point
         log::debug!("Suspend called");
 
@@ -621,7 +727,9 @@ impl AudioContext {
             return;
         }
 
-        if state != AudioContextState::Running && !self.startup_pending.load(Ordering::Acquire) {
+        if state != AudioContextState::Running
+            && !self.legacy().startup_pending.load(Ordering::Acquire)
+        {
             log::debug!("Suspend no-op - context is not running");
             return;
         }
@@ -639,7 +747,8 @@ impl AudioContext {
 
         // Then ask the audio host to suspend the stream
         log::debug!("Suspended audio graph. Suspending audio stream..");
-        self.backend_manager
+        self.legacy()
+            .backend_manager
             .lock()
             .unwrap()
             .suspend()
@@ -657,13 +766,26 @@ impl AudioContext {
     ///
     /// * The audio device is not available
     /// * For a `BackendSpecificError`
+    /// * The hosted context's fixed lifecycle request capacity is temporarily contended or full.
+    ///   Call [`Self::request_resume`] to handle that bounded condition without panicking. A
+    ///   downstream isolate must provide its own wake/retry policy rather than blocking here.
     pub async fn resume(&self) {
+        if let AudioContextMode::Hosted(hosted) = &self.mode {
+            let receipt = hosted
+                .request_resume()
+                .unwrap_or_else(|error| panic!("InvalidStateError - {error:?}"));
+            let outcome = receipt.await;
+            if !hosted_state_outcome_is_success(outcome) {
+                panic!("InvalidStateError - hosted resume failed: {outcome:?}");
+            }
+            return;
+        }
         let (sender, receiver) = oneshot::channel();
 
         {
             // Lock the backend manager mutex to avoid concurrent calls
             log::debug!("Resume called, locking backend manager");
-            let backend_manager_guard = self.backend_manager.lock().unwrap();
+            let backend_manager_guard = self.legacy().backend_manager.lock().unwrap();
 
             if self.state() != AudioContextState::Suspended {
                 log::debug!("Resume no-op - context is not suspended");
@@ -697,8 +819,25 @@ impl AudioContext {
     ///
     /// # Panics
     ///
-    /// Will panic when this function is called multiple times
+    /// Hosted close is idempotent, but panics when awaited from this context's event thread or
+    /// when lifecycle retirement is unconfirmed/controller-terminated. A confirmed degraded
+    /// report still completes this convenience method; [`Self::request_close`] exposes its typed
+    /// details. Legacy close preserves its backend error behavior.
     pub async fn close(&self) {
+        if let AudioContextMode::Hosted(hosted) = &self.mode {
+            if hosted.is_event_thread() {
+                panic!("InvalidStateError - EventThread");
+            }
+            self.render_capacity.close();
+            let outcome = hosted
+                .request_close()
+                .unwrap_or_else(|error| panic!("InvalidStateError - {error:?}"))
+                .await;
+            if !hosted_shutdown_outcome_is_success(&outcome) {
+                panic!("InvalidStateError - hosted close failed: {outcome:?}");
+            }
+            return;
+        }
         // Don't lock the backend manager because we can't hold is across the await point
         log::debug!("Close called");
 
@@ -728,7 +867,8 @@ impl AudioContext {
 
         // Then ask the audio host to close the stream
         log::debug!("Suspended audio graph. Closing audio stream..");
-        self.backend_manager
+        self.legacy()
+            .backend_manager
             .lock()
             .unwrap()
             .close()
@@ -752,10 +892,22 @@ impl AudioContext {
     ///
     /// * The audio device is not available
     /// * For a `BackendSpecificError`
+    /// * The hosted context's fixed lifecycle request capacity is temporarily contended or full;
+    ///   [`Self::request_suspend`] exposes that condition as a typed error.
     pub fn suspend_sync(&self) {
+        if let AudioContextMode::Hosted(hosted) = &self.mode {
+            let receipt = hosted
+                .request_suspend()
+                .unwrap_or_else(|error| panic!("InvalidStateError - {error:?}"));
+            let outcome = receipt.wait();
+            if !hosted_state_outcome_is_success(outcome) {
+                panic!("InvalidStateError - hosted suspend failed: {outcome:?}");
+            }
+            return;
+        }
         // Lock the backend manager mutex to avoid concurrent calls
         log::debug!("Suspend_sync called, locking backend manager");
-        let backend_manager_guard = self.backend_manager.lock().unwrap();
+        let backend_manager_guard = self.legacy().backend_manager.lock().unwrap();
 
         let state = self.state();
         if state == AudioContextState::Closed {
@@ -763,7 +915,9 @@ impl AudioContext {
             return;
         }
 
-        if state != AudioContextState::Running && !self.startup_pending.load(Ordering::Acquire) {
+        if state != AudioContextState::Running
+            && !self.legacy().startup_pending.load(Ordering::Acquire)
+        {
             log::debug!("Suspend_sync no-op - context is not running");
             return;
         }
@@ -800,10 +954,22 @@ impl AudioContext {
     ///
     /// * The audio device is not available
     /// * For a `BackendSpecificError`
+    /// * The hosted context's fixed lifecycle request capacity is temporarily contended or full;
+    ///   [`Self::request_resume`] exposes that condition as a typed error.
     pub fn resume_sync(&self) {
+        if let AudioContextMode::Hosted(hosted) = &self.mode {
+            let receipt = hosted
+                .request_resume()
+                .unwrap_or_else(|error| panic!("InvalidStateError - {error:?}"));
+            let outcome = receipt.wait();
+            if !hosted_state_outcome_is_success(outcome) {
+                panic!("InvalidStateError - hosted resume failed: {outcome:?}");
+            }
+            return;
+        }
         // Lock the backend manager mutex to avoid concurrent calls
         log::debug!("Resume_sync called, locking backend manager");
-        let backend_manager_guard = self.backend_manager.lock().unwrap();
+        let backend_manager_guard = self.legacy().backend_manager.lock().unwrap();
 
         if self.state() != AudioContextState::Suspended {
             log::debug!("Resume no-op - context is not suspended");
@@ -838,11 +1004,30 @@ impl AudioContext {
     ///
     /// # Panics
     ///
-    /// Will panic when this function is called multiple times
+    /// Hosted close is idempotent, but panics when called from this context's event thread or when
+    /// lifecycle retirement is unconfirmed/controller-terminated. A confirmed degraded report
+    /// still completes this convenience method; [`Self::request_close`] exposes its typed details.
+    /// Legacy close preserves its backend error behavior.
     pub fn close_sync(&self) {
+        if let AudioContextMode::Hosted(hosted) = &self.mode {
+            if hosted.is_event_thread() {
+                panic!(
+                    "InvalidStateError: cannot synchronously close a context from its event thread"
+                );
+            }
+            self.render_capacity.close();
+            let outcome = hosted
+                .request_close()
+                .unwrap_or_else(|error| panic!("InvalidStateError - {error:?}"))
+                .wait();
+            if !hosted_shutdown_outcome_is_success(&outcome) {
+                panic!("InvalidStateError - hosted close failed: {outcome:?}");
+            }
+            return;
+        }
         // Lock the backend manager mutex to avoid concurrent calls
         log::debug!("Close_sync called, locking backend manager");
-        let backend_manager_guard = self.backend_manager.lock().unwrap();
+        let backend_manager_guard = self.legacy().backend_manager.lock().unwrap();
 
         if self.state() == AudioContextState::Closed {
             log::debug!("Close no-op - context is already closed");
@@ -882,7 +1067,7 @@ impl AudioContext {
     /// renderer did not dequeue. This runs on the control side after permanent backend close; sink
     /// replacement deliberately keeps and reuses the initializer instead.
     fn retire_render_thread_init(&self) {
-        if let Some(init) = self.render_thread_init.lock().unwrap().take() {
+        if let Some(init) = self.legacy().render_thread_init.lock().unwrap().take() {
             for message in init.ctrl_msg_recv.try_iter() {
                 drop(message);
             }
@@ -896,6 +1081,7 @@ impl AudioContext {
         &self,
         media: &MediaStream,
     ) -> node::MediaStreamAudioSourceNode {
+        self.reject_hosted_media_node();
         let opts = node::MediaStreamAudioSourceOptions {
             media_stream: media,
         };
@@ -905,6 +1091,7 @@ impl AudioContext {
     /// Creates a [`MediaStreamAudioDestinationNode`](node::MediaStreamAudioDestinationNode)
     #[must_use]
     pub fn create_media_stream_destination(&self) -> node::MediaStreamAudioDestinationNode {
+        self.reject_hosted_media_node();
         let opts = AudioNodeOptions::default();
         node::MediaStreamAudioDestinationNode::new(self, opts)
     }
@@ -916,6 +1103,7 @@ impl AudioContext {
         &self,
         media: &MediaStreamTrack,
     ) -> node::MediaStreamTrackAudioSourceNode {
+        self.reject_hosted_media_node();
         let opts = node::MediaStreamTrackAudioSourceOptions {
             media_stream_track: media,
         };
@@ -929,8 +1117,70 @@ impl AudioContext {
         &self,
         media_element: &mut MediaElement,
     ) -> node::MediaElementAudioSourceNode {
+        self.reject_hosted_media_node();
         let opts = node::MediaElementAudioSourceOptions { media_element };
         node::MediaElementAudioSourceNode::new(self, opts)
+    }
+
+    fn reject_hosted_media_node(&self) {
+        if self.is_hosted() {
+            panic!("NotSupportedError: hosted media-source nodes are not available");
+        }
+    }
+
+    /// Requests a cancellation-independent hosted suspend without converting failures to panics.
+    ///
+    /// Admission is immediate and bounded; contention or capacity is returned to the caller. Once
+    /// accepted, dropping the receipt does not cancel native work and there is no deadline.
+    pub fn request_suspend(
+        &self,
+    ) -> Result<AudioContextStateChangeReceipt, AudioContextLifecycleError> {
+        match &self.mode {
+            AudioContextMode::Hosted(hosted) => hosted.request_suspend(),
+            AudioContextMode::Legacy(_) => Err(AudioContextLifecycleError::LegacyContext),
+        }
+    }
+
+    /// Requests a cancellation-independent hosted resume without converting failures to panics.
+    ///
+    /// Admission is immediate and bounded; contention or capacity is returned to the caller. Once
+    /// accepted, dropping the receipt does not cancel native work and there is no deadline.
+    pub fn request_resume(
+        &self,
+    ) -> Result<AudioContextStateChangeReceipt, AudioContextLifecycleError> {
+        match &self.mode {
+            AudioContextMode::Hosted(hosted) => hosted.request_resume(),
+            AudioContextMode::Legacy(_) => Err(AudioContextLifecycleError::LegacyContext),
+        }
+    }
+
+    /// Latches idempotent hosted shutdown and returns its shared observation receipt.
+    ///
+    /// Initiation may briefly block while closing/joining the internal render-capacity producer
+    /// and serializing the lifecycle latch. It never waits for endpoint, graph, or event-thread
+    /// retirement, so it is safe to initiate from an event callback; move the returned receipt to
+    /// another thread before polling or waiting for confirmation.
+    pub fn request_close(&self) -> Result<AudioContextShutdownReceipt, AudioContextLifecycleError> {
+        match &self.mode {
+            AudioContextMode::Hosted(hosted) => {
+                self.render_capacity.close();
+                hosted.request_close()
+            }
+            AudioContextMode::Legacy(_) => Err(AudioContextLifecycleError::LegacyContext),
+        }
+    }
+
+    /// Observes eventual hosted shutdown without initiating it.
+    ///
+    /// Dropping this receipt never cancels lifecycle work. Legacy contexts do not have an exact
+    /// shutdown controller and return [`AudioContextLifecycleError::LegacyContext`].
+    pub fn shutdown_receipt(
+        &self,
+    ) -> Result<AudioContextShutdownReceipt, AudioContextLifecycleError> {
+        match &self.mode {
+            AudioContextMode::Hosted(hosted) => Ok(hosted.shutdown_receipt()),
+            AudioContextMode::Legacy(_) => Err(AudioContextLifecycleError::LegacyContext),
+        }
     }
 }
 
@@ -939,8 +1189,13 @@ mod tests {
     use super::*;
     #[cfg(feature = "diagnostics")]
     use crate::context::DESTINATION_NODE_ID;
+    use crate::context::{
+        AudioContextBuildErrorKind, AudioContextShutdownIssueKind, AudioContextShutdownMode,
+        AudioContextShutdownOutcome, AudioContextStateChangeOutcome, AudioNodeId,
+    };
     use crate::message::ControlBatchSender;
     use crate::node::{AudioNode, AudioScheduledSourceNode};
+    use crate::node::{ChannelCountMode, ChannelInterpretation};
     use crate::output::{
         audio_render_thread_pair, AudioOutputConfig, AudioOutputContextId,
         AudioOutputEndpointShutdown, AudioOutputError, AudioOutputErrorKind, AudioOutputEventSink,
@@ -950,6 +1205,7 @@ mod tests {
     };
     use crate::render::RenderThread;
     use futures::executor;
+    use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
     use std::thread::{self, JoinHandle, ThreadId};
     use std::time::{Duration, Instant};
@@ -974,6 +1230,13 @@ mod tests {
         callback_destroyed: AtomicBool,
         shutdown_joined: AtomicBool,
         abort_completed: AtomicBool,
+        suspend_calls: AtomicU64,
+        resume_calls: AtomicU64,
+        config_calls: AtomicU64,
+        abort_calls: AtomicU64,
+        abort_thread: Mutex<Option<ThreadId>>,
+        abort_future_dropped: AtomicBool,
+        context_id: Mutex<Option<AudioOutputContextId>>,
         format: Mutex<Option<AudioRenderFormat>>,
         callback_thread: Mutex<Option<ThreadId>>,
     }
@@ -1060,6 +1323,14 @@ mod tests {
         fail_start: bool,
         fail_start_cleanup: bool,
         configured_sample_rate: Option<f32>,
+        fail_prepare: bool,
+        panic_prepare: bool,
+        panic_config: bool,
+        panic_start: bool,
+        output_latency: f64,
+        abort_behavior: u8,
+        abort_release: Option<Arc<Mutex<Option<futures_channel::oneshot::Receiver<()>>>>>,
+        suspend_release: Option<crossbeam_channel::Receiver<()>>,
     }
 
     impl InjectedTestFactory {
@@ -1069,6 +1340,14 @@ mod tests {
                 fail_start,
                 fail_start_cleanup: false,
                 configured_sample_rate: None,
+                fail_prepare: false,
+                panic_prepare: false,
+                panic_config: false,
+                panic_start: false,
+                output_latency: 0.,
+                abort_behavior: 0,
+                abort_release: None,
+                suspend_release: None,
             }
         }
 
@@ -1092,6 +1371,16 @@ mod tests {
             &self,
             request: &AudioOutputRequest,
         ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+            *self.probe.context_id.lock().unwrap() = Some(request.context_id());
+            if self.panic_prepare {
+                panic!("injected test factory prepare panic");
+            }
+            if self.fail_prepare {
+                return Err(AudioOutputError::new(
+                    AudioOutputErrorKind::DeviceUnavailable,
+                    "injected test factory rejected prepare",
+                ));
+            }
             let format = AudioRenderFormat::new(
                 self.configured_sample_rate.unwrap_or_else(|| {
                     request
@@ -1101,12 +1390,17 @@ mod tests {
                 request.number_of_channels(),
                 INJECTED_TEST_FRAMES,
             )?;
-            let config = AudioOutputConfig::new(format, request.sink_id(), 0.)?;
+            let config = AudioOutputConfig::new(format, request.sink_id(), self.output_latency)?;
             Ok(Box::new(InjectedPreparedOutput {
                 config,
                 probe: Arc::clone(&self.probe),
                 fail_start: self.fail_start,
                 fail_start_cleanup: self.fail_start_cleanup,
+                panic_config: self.panic_config,
+                panic_start: self.panic_start,
+                abort_behavior: self.abort_behavior,
+                abort_release: self.abort_release.clone(),
+                suspend_release: self.suspend_release.clone(),
             }))
         }
     }
@@ -1116,10 +1410,50 @@ mod tests {
         probe: Arc<InjectedEndpointProbe>,
         fail_start: bool,
         fail_start_cleanup: bool,
+        panic_config: bool,
+        panic_start: bool,
+        abort_behavior: u8,
+        abort_release: Option<Arc<Mutex<Option<futures_channel::oneshot::Receiver<()>>>>>,
+        suspend_release: Option<crossbeam_channel::Receiver<()>>,
+    }
+
+    struct HostilePreparedAbortFuture {
+        behavior: u8,
+        probe: Arc<InjectedEndpointProbe>,
+    }
+
+    impl std::future::Future for HostilePreparedAbortFuture {
+        type Output = Result<(), AudioOutputError>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            match self.behavior {
+                1 => std::task::Poll::Ready(Err(AudioOutputError::new(
+                    AudioOutputErrorKind::Shutdown,
+                    "forced prepared abort error",
+                ))),
+                3 => panic!("forced prepared abort future panic"),
+                _ => unreachable!("hostile prepared abort future behavior"),
+            }
+        }
+    }
+
+    impl Drop for HostilePreparedAbortFuture {
+        fn drop(&mut self) {
+            self.probe
+                .abort_future_dropped
+                .store(true, AtomicOrdering::Release);
+        }
     }
 
     impl PreparedAudioOutput for InjectedPreparedOutput {
         fn config(&self) -> &AudioOutputConfig {
+            self.probe.config_calls.fetch_add(1, AtomicOrdering::AcqRel);
+            if self.panic_config {
+                panic!("injected test prepared config panic");
+            }
             &self.config
         }
 
@@ -1134,6 +1468,9 @@ mod tests {
                 callback: Some(callback),
                 probe: Arc::clone(&self.probe),
             };
+            if self.panic_start {
+                panic!("injected test prepared start panic");
+            }
             if self.fail_start {
                 drop(tracked);
                 let shutdown = if self.fail_start_cleanup {
@@ -1172,15 +1509,49 @@ mod tests {
                 sender,
                 join: Some(join),
                 probe: Arc::clone(&self.probe),
+                suspend_release: self.suspend_release.clone(),
             }))
         }
 
         fn abort(self: Box<Self>) -> AudioOutputEndpointShutdown {
             let probe = Arc::clone(&self.probe);
-            AudioOutputEndpointShutdown::from_future(async move {
-                probe.abort_completed.store(true, AtomicOrdering::Release);
-                Ok(())
-            })
+            probe.abort_calls.fetch_add(1, AtomicOrdering::AcqRel);
+            *probe.abort_thread.lock().unwrap() = Some(thread::current().id());
+            match self.abort_behavior {
+                0 => AudioOutputEndpointShutdown::from_future(async move {
+                    probe.abort_completed.store(true, AtomicOrdering::Release);
+                    Ok(())
+                }),
+                1 => AudioOutputEndpointShutdown::from_future(HostilePreparedAbortFuture {
+                    behavior: 1,
+                    probe,
+                }),
+                2 => panic!("forced prepared abort method panic"),
+                3 => AudioOutputEndpointShutdown::from_future(HostilePreparedAbortFuture {
+                    behavior: 3,
+                    probe,
+                }),
+                4 => {
+                    let release = self
+                        .abort_release
+                        .expect("pending abort behavior requires a release channel")
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("pending abort release is single-use");
+                    AudioOutputEndpointShutdown::from_future(async move {
+                        release.await.map_err(|_| {
+                            AudioOutputError::new(
+                                AudioOutputErrorKind::Shutdown,
+                                "pending abort release sender disconnected",
+                            )
+                        })?;
+                        probe.abort_completed.store(true, AtomicOrdering::Release);
+                        Ok(())
+                    })
+                }
+                _ => unreachable!("unknown injected prepared abort behavior"),
+            }
         }
     }
 
@@ -1188,6 +1559,7 @@ mod tests {
         sender: crossbeam_channel::Sender<InjectedEndpointCommand>,
         join: Option<JoinHandle<()>>,
         probe: Arc<InjectedEndpointProbe>,
+        suspend_release: Option<crossbeam_channel::Receiver<()>>,
     }
 
     impl InjectedRunningOutput {
@@ -1213,10 +1585,22 @@ mod tests {
 
     impl RunningAudioOutput for InjectedRunningOutput {
         fn resume(&mut self) -> Result<(), AudioOutputError> {
+            self.probe.resume_calls.fetch_add(1, AtomicOrdering::AcqRel);
             self.acknowledged_command(InjectedEndpointCommand::Resume)
         }
 
         fn suspend(&mut self) -> Result<(), AudioOutputError> {
+            self.probe
+                .suspend_calls
+                .fetch_add(1, AtomicOrdering::AcqRel);
+            if let Some(release) = self.suspend_release.take() {
+                release.recv().map_err(|_| {
+                    AudioOutputError::new(
+                        AudioOutputErrorKind::Shutdown,
+                        "injected test native suspend gate disconnected",
+                    )
+                })?;
+            }
             self.acknowledged_command(InjectedEndpointCommand::Suspend)
         }
 
@@ -1245,6 +1629,774 @@ mod tests {
             });
             AudioOutputEndpointShutdown::ready(result)
         }
+    }
+
+    #[test]
+    fn public_hosted_builder_renders_exact_surface_and_closes_idempotently() {
+        let factory = Arc::new(InjectedTestFactory::new(false));
+        let probe = Arc::clone(&factory.probe);
+        let context = AudioContext::builder(factory)
+            .options(AudioContextOptions {
+                sample_rate: Some(INJECTED_TEST_RATE),
+                ..AudioContextOptions::default()
+            })
+            .diagnostic_label("public hosted smoke")
+            .build()
+            .unwrap();
+
+        assert_eq!(context.state(), AudioContextState::Running);
+        assert_eq!(context.sample_rate(), INJECTED_TEST_RATE);
+        assert_eq!(context.sink_id(), "");
+        assert_eq!(context.output_latency(), 0.);
+        assert_eq!(context.set_sink_id_sync(String::new()).unwrap(), ());
+
+        let gain = context.create_gain();
+        gain.gain().set_value(0.25);
+        let mut oscillator = context.create_oscillator();
+        oscillator.connect(&gain);
+        gain.connect(&context.destination());
+        let ended = Arc::new(AtomicBool::new(false));
+        let ended_callback = Arc::clone(&ended);
+        oscillator.set_onended(move |_| ended_callback.store(true, AtomicOrdering::Release));
+        oscillator.start();
+        oscillator.stop_at(context.current_time() + 0.02);
+
+        let deadline = Instant::now() + INJECTED_TEST_TIMEOUT;
+        while !ended.load(AtomicOrdering::Acquire) {
+            assert!(Instant::now() < deadline, "hosted oscillator never ended");
+            thread::yield_now();
+        }
+        assert!(probe.saw_nonzero.load(AtomicOrdering::Acquire));
+
+        assert_eq!(
+            context.request_suspend().unwrap().wait(),
+            AudioContextStateChangeOutcome::Applied
+        );
+        assert_eq!(context.state(), AudioContextState::Suspended);
+        assert_eq!(
+            context.request_resume().unwrap().wait(),
+            AudioContextStateChangeOutcome::Applied
+        );
+        assert_eq!(context.state(), AudioContextState::Running);
+
+        let first = context.request_close().unwrap();
+        let second = context.request_close().unwrap();
+        let first = first.wait();
+        assert_eq!(second.wait(), first);
+        assert!(matches!(first, AudioContextShutdownOutcome::Confirmed(_)));
+        assert_eq!(context.state(), AudioContextState::Closed);
+        assert!(probe.callback_destroyed.load(AtomicOrdering::Acquire));
+        assert!(probe.shutdown_joined.load(AtomicOrdering::Acquire));
+    }
+
+    #[test]
+    fn public_hosted_builder_preserves_initial_suspension_and_staged_fifo() {
+        let (suspend_release, suspend_wait) = crossbeam_channel::bounded(1);
+        let mut factory = InjectedTestFactory::new(false);
+        factory.suspend_release = Some(suspend_wait);
+        let factory = Arc::new(factory);
+        let probe = Arc::clone(&factory.probe);
+        let context = AudioContext::builder(factory)
+            .initially_suspended(true)
+            .build()
+            .unwrap();
+        assert_eq!(context.state(), AudioContextState::Suspended);
+        let deadline = Instant::now() + INJECTED_TEST_TIMEOUT;
+        while probe.suspend_calls.load(AtomicOrdering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "initial native suspension was never reconciled"
+            );
+            thread::yield_now();
+        }
+        while probe.render_count() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "test endpoint stopped invoking callbacks during native suspend"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(context.current_time(), 0.);
+        assert!(!probe.saw_nonzero.load(AtomicOrdering::Acquire));
+
+        let source = context.create_gain();
+        let destination = context.create_gain();
+        source.connect(&destination);
+        source.disconnect();
+        source.connect(&destination);
+        let resume = context.request_resume().unwrap();
+        let close = context.request_close().unwrap();
+        suspend_release.send(()).unwrap();
+        assert!(matches!(
+            resume.wait(),
+            AudioContextStateChangeOutcome::SupersededByShutdown
+                | AudioContextStateChangeOutcome::Closed
+        ));
+        assert!(matches!(
+            close.wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert_eq!(context.state(), AudioContextState::Closed);
+    }
+
+    #[test]
+    fn public_hosted_staged_connections_and_source_commands_flush_on_resume() {
+        let factory = Arc::new(InjectedTestFactory::new(false));
+        let probe = Arc::clone(&factory.probe);
+        let context = AudioContext::builder(factory)
+            .initially_suspended(true)
+            .build()
+            .unwrap();
+        let gain = context.create_gain();
+        let mut oscillator = context.create_oscillator();
+        oscillator.connect(&gain);
+        oscillator.disconnect();
+        oscillator.connect(&gain);
+        gain.connect(&context.destination());
+        let ended = Arc::new(AtomicBool::new(false));
+        let ended_callback = Arc::clone(&ended);
+        oscillator.set_onended(move |_| ended_callback.store(true, AtomicOrdering::Release));
+        oscillator.start();
+        oscillator.stop_at(0.02);
+
+        assert_eq!(
+            context.request_resume().unwrap().wait(),
+            AudioContextStateChangeOutcome::Applied
+        );
+        let deadline = Instant::now() + INJECTED_TEST_TIMEOUT;
+        while !ended.load(AtomicOrdering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "staged source never completed after Resume"
+            );
+            thread::yield_now();
+        }
+        assert!(probe.saw_nonzero.load(AtomicOrdering::Acquire));
+        assert!(matches!(
+            context.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+    }
+
+    #[test]
+    fn hosted_event_thread_rejects_blocking_close_but_can_handoff_receipt() {
+        let factory = Arc::new(InjectedTestFactory::new(false));
+        let context = Arc::new(AudioContext::builder(factory).build().unwrap());
+        let (result_send, result_recv) = crossbeam_channel::bounded(1);
+        let callback_context = Arc::clone(&context);
+        context.set_onstatechange(move |_| {
+            let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                executor::block_on(callback_context.close());
+            }))
+            .is_err();
+            result_send.send(panicked).unwrap();
+        });
+        assert_eq!(
+            context.request_suspend().unwrap().wait(),
+            AudioContextStateChangeOutcome::Applied
+        );
+        assert!(result_recv.recv_timeout(INJECTED_TEST_TIMEOUT).unwrap());
+        context.clear_onstatechange();
+        // The rejected close did not close render capacity or latch lifecycle shutdown.
+        assert_eq!(
+            context.request_resume().unwrap().wait(),
+            AudioContextStateChangeOutcome::Applied
+        );
+
+        let (receipt_send, receipt_recv) = crossbeam_channel::bounded(1);
+        let callback_context = Arc::clone(&context);
+        context.set_onstatechange(move |_| {
+            let receipt = callback_context.request_close().unwrap();
+            let panicked =
+                std::panic::catch_unwind(AssertUnwindSafe(|| receipt.clone().wait())).is_err();
+            receipt_send.send((receipt, panicked)).unwrap();
+        });
+        let state_receipt = context.request_suspend().unwrap();
+        let (receipt, panicked) = receipt_recv.recv_timeout(INJECTED_TEST_TIMEOUT).unwrap();
+        assert!(panicked);
+        let _ = state_receipt.wait();
+        assert!(matches!(
+            receipt.wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+    }
+
+    #[test]
+    fn hosted_live_handler_panic_is_deferred_to_confirmed_retirement() {
+        let factory = Arc::new(InjectedTestFactory::new(false));
+        let context = AudioContext::builder(factory).build().unwrap();
+        context.set_onstatechange(|_| panic!("hostile hosted state handler"));
+        assert_eq!(
+            context.request_suspend().unwrap().wait(),
+            AudioContextStateChangeOutcome::Applied
+        );
+        assert_eq!(
+            context.request_resume().unwrap().wait(),
+            AudioContextStateChangeOutcome::Applied
+        );
+        let AudioContextShutdownOutcome::Confirmed(report) =
+            context.request_close().unwrap().wait()
+        else {
+            panic!("handler panic does not prevent physical shutdown proof");
+        };
+        assert_eq!(
+            report.event_issue().unwrap().kind(),
+            AudioContextShutdownIssueKind::EventDelivery
+        );
+    }
+
+    #[test]
+    fn hosted_builder_classifies_factory_config_and_start_failures_with_cleanup() {
+        let mut prepare_error = InjectedTestFactory::new(false);
+        prepare_error.fail_prepare = true;
+        let error = AudioContext::builder(Arc::new(prepare_error))
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind(), AudioContextBuildErrorKind::OutputRejected);
+        assert!(error.cleanup_receipt().is_none());
+
+        let mut prepare_panic = InjectedTestFactory::new(false);
+        prepare_panic.panic_prepare = true;
+        let error = AudioContext::builder(Arc::new(prepare_panic))
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind(), AudioContextBuildErrorKind::OutputPanicked);
+        assert!(error.cleanup_receipt().is_none());
+
+        let mut config_panic = InjectedTestFactory::new(false);
+        config_panic.panic_config = true;
+        let probe = Arc::clone(&config_panic.probe);
+        let error = AudioContext::builder(Arc::new(config_panic))
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind(), AudioContextBuildErrorKind::OutputPanicked);
+        assert!(matches!(
+            error.cleanup_receipt().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert_eq!(probe.config_calls.load(AtomicOrdering::Acquire), 1);
+        assert!(probe.abort_completed.load(AtomicOrdering::Acquire));
+
+        let mismatch = InjectedTestFactory::with_configured_sample_rate(44_100.);
+        let probe = Arc::clone(&mismatch.probe);
+        let error = AudioContext::builder(Arc::new(mismatch))
+            .options(AudioContextOptions {
+                sample_rate: Some(INJECTED_TEST_RATE),
+                ..AudioContextOptions::default()
+            })
+            .build()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AudioContextBuildErrorKind::InvalidConfiguration
+        );
+        assert!(matches!(
+            error.cleanup_receipt().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert_eq!(probe.config_calls.load(AtomicOrdering::Acquire), 1);
+
+        let start_error = InjectedTestFactory::new(true);
+        let probe = Arc::clone(&start_error.probe);
+        let error = AudioContext::builder(Arc::new(start_error))
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind(), AudioContextBuildErrorKind::StartFailed);
+        assert!(matches!(
+            error.cleanup_receipt().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert!(probe.callback_destroyed.load(AtomicOrdering::Acquire));
+
+        let mut start_panic = InjectedTestFactory::new(false);
+        start_panic.panic_start = true;
+        let probe = Arc::clone(&start_panic.probe);
+        let error = AudioContext::builder(Arc::new(start_panic))
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind(), AudioContextBuildErrorKind::StartFailed);
+        assert!(matches!(
+            error.cleanup_receipt().unwrap().wait(),
+            AudioContextShutdownOutcome::Unconfirmed { .. }
+        ));
+        assert!(probe.callback_destroyed.load(AtomicOrdering::Acquire));
+    }
+
+    #[test]
+    fn hosted_prepared_abort_failures_and_stall_are_owned_off_the_builder_thread() {
+        let builder_thread = thread::current().id();
+        for (behavior, expected) in [
+            (1, AudioContextShutdownIssueKind::OutputFuture),
+            (2, AudioContextShutdownIssueKind::OutputMethod),
+            (3, AudioContextShutdownIssueKind::OutputFuture),
+        ] {
+            let mut factory = InjectedTestFactory::with_configured_sample_rate(44_100.);
+            factory.abort_behavior = behavior;
+            let probe = Arc::clone(&factory.probe);
+            let error = AudioContext::builder(Arc::new(factory))
+                .options(AudioContextOptions {
+                    sample_rate: Some(INJECTED_TEST_RATE),
+                    ..AudioContextOptions::default()
+                })
+                .build()
+                .unwrap_err();
+            let AudioContextShutdownOutcome::Unconfirmed { failure, .. } =
+                error.cleanup_receipt().unwrap().wait()
+            else {
+                panic!("hostile prepared abort must not manufacture confirmation");
+            };
+            assert_eq!(failure.kind(), expected);
+            assert_ne!(*probe.abort_thread.lock().unwrap(), Some(builder_thread));
+            if matches!(behavior, 1 | 3) {
+                assert!(
+                    !probe.abort_future_dropped.load(AtomicOrdering::Acquire),
+                    "Err/panicking abort future must retain unsafe leases in quarantine"
+                );
+            }
+        }
+
+        let (release_send, release_recv) = futures_channel::oneshot::channel();
+        let mut factory = InjectedTestFactory::with_configured_sample_rate(44_100.);
+        factory.abort_behavior = 4;
+        factory.abort_release = Some(Arc::new(Mutex::new(Some(release_recv))));
+        let probe = Arc::clone(&factory.probe);
+        let error = AudioContext::builder(Arc::new(factory))
+            .options(AudioContextOptions {
+                sample_rate: Some(INJECTED_TEST_RATE),
+                ..AudioContextOptions::default()
+            })
+            .build()
+            .unwrap_err();
+        let receipt = error.cleanup_receipt().unwrap();
+        let deadline = Instant::now() + INJECTED_TEST_TIMEOUT;
+        while probe.abort_calls.load(AtomicOrdering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "abort worker never acquired Prepared"
+            );
+            thread::yield_now();
+        }
+        assert_ne!(*probe.abort_thread.lock().unwrap(), Some(builder_thread));
+        assert!(!probe.abort_completed.load(AtomicOrdering::Acquire));
+
+        let (outcome_send, outcome_recv) = crossbeam_channel::bounded(1);
+        thread::spawn(move || outcome_send.send(receipt.wait()).unwrap());
+        assert!(outcome_recv.try_recv().is_err());
+        release_send.send(()).unwrap();
+        assert!(matches!(
+            outcome_recv.recv_timeout(INJECTED_TEST_TIMEOUT).unwrap(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert!(probe.abort_completed.load(AtomicOrdering::Acquire));
+    }
+
+    #[test]
+    fn hosted_bootstrap_transfer_recovers_running_partial_and_uncertain_owners() {
+        super::super::hosted::force_next_prepared_start_failure_for_test();
+        let prepared = InjectedTestFactory::new(false);
+        let prepared_probe = Arc::clone(&prepared.probe);
+        let error = AudioContext::builder(Arc::new(prepared))
+            .build()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AudioContextBuildErrorKind::LifecycleUnavailable
+        );
+        assert!(matches!(
+            error.cleanup_receipt().unwrap().wait(),
+            AudioContextShutdownOutcome::Unconfirmed { .. }
+        ));
+        let deadline = Instant::now() + INJECTED_TEST_TIMEOUT;
+        while prepared_probe.abort_calls.load(AtomicOrdering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "prepared fallback never started abort"
+            );
+            thread::yield_now();
+        }
+
+        super::super::hosted::fail_next_worker_transfer_for_test();
+        let running = InjectedTestFactory::new(false);
+        let running_probe = Arc::clone(&running.probe);
+        let error = AudioContext::builder(Arc::new(running))
+            .build()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AudioContextBuildErrorKind::LifecycleUnavailable
+        );
+        assert!(matches!(
+            error.cleanup_receipt().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert!(running_probe
+            .callback_destroyed
+            .load(AtomicOrdering::Acquire));
+        assert!(running_probe.shutdown_joined.load(AtomicOrdering::Acquire));
+
+        super::super::hosted::fail_next_worker_transfer_for_test();
+        let partial = InjectedTestFactory::new(true);
+        let partial_probe = Arc::clone(&partial.probe);
+        let error = AudioContext::builder(Arc::new(partial))
+            .build()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AudioContextBuildErrorKind::LifecycleUnavailable
+        );
+        assert_eq!(
+            error.output_error().unwrap().kind(),
+            AudioOutputErrorKind::BackendSpecific
+        );
+        assert!(error
+            .to_string()
+            .contains("injected test endpoint rejected startup"));
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(matches!(
+            error.cleanup_receipt().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert!(partial_probe
+            .callback_destroyed
+            .load(AtomicOrdering::Acquire));
+
+        super::super::hosted::fail_next_worker_transfer_for_test();
+        let mut uncertain = InjectedTestFactory::new(false);
+        uncertain.panic_start = true;
+        let uncertain_probe = Arc::clone(&uncertain.probe);
+        let error = AudioContext::builder(Arc::new(uncertain))
+            .build()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AudioContextBuildErrorKind::LifecycleUnavailable
+        );
+        assert!(matches!(
+            error.cleanup_receipt().unwrap().wait(),
+            AudioContextShutdownOutcome::Unconfirmed { .. }
+        ));
+        assert!(uncertain_probe
+            .callback_destroyed
+            .load(AtomicOrdering::Acquire));
+
+        super::super::hosted::fail_next_worker_transfer_for_test();
+        super::super::hosted::fail_next_fallback_worker_spawn_for_test();
+        let running = InjectedTestFactory::new(false);
+        let error = AudioContext::builder(Arc::new(running))
+            .build()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AudioContextBuildErrorKind::LifecycleUnavailable
+        );
+        assert!(matches!(
+            error.cleanup_receipt().unwrap().wait(),
+            AudioContextShutdownOutcome::Unconfirmed { .. }
+        ));
+    }
+
+    #[test]
+    fn hosted_output_config_is_observed_once_and_seeds_playback_latency() {
+        let mut factory = InjectedTestFactory::new(false);
+        factory.output_latency = 0.0125;
+        let probe = Arc::clone(&factory.probe);
+        let context = AudioContext::builder(Arc::new(factory)).build().unwrap();
+        assert_eq!(probe.config_calls.load(AtomicOrdering::Acquire), 1);
+        assert_eq!(context.output_latency(), 0.0125);
+        assert_eq!(context.playback_stats().average_latency(), 0.0125);
+        assert!(matches!(
+            context.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_options_and_worker_failure_do_not_consume_hosted_context_identity() {
+        let identities = Arc::new(AtomicU64::new(77));
+        super::super::hosted::set_context_id_source_for_test(Some(Arc::clone(&identities)));
+
+        let invalid_rate = InjectedTestFactory::new(false);
+        let invalid_rate_probe = Arc::clone(&invalid_rate.probe);
+        let error = AudioContext::builder(Arc::new(invalid_rate))
+            .options(AudioContextOptions {
+                sample_rate: Some(1.),
+                ..AudioContextOptions::default()
+            })
+            .build()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AudioContextBuildErrorKind::InvalidConfiguration
+        );
+        assert_eq!(identities.load(AtomicOrdering::Acquire), 77);
+        assert!(invalid_rate_probe.context_id.lock().unwrap().is_none());
+
+        let invalid_channels = InjectedTestFactory::new(false);
+        let invalid_channels_probe = Arc::clone(&invalid_channels.probe);
+        let error = AudioContext::builder(Arc::new(invalid_channels))
+            .number_of_channels(0)
+            .build()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AudioContextBuildErrorKind::InvalidConfiguration
+        );
+        assert_eq!(identities.load(AtomicOrdering::Acquire), 77);
+        assert!(invalid_channels_probe.context_id.lock().unwrap().is_none());
+
+        let invalid_latency = InjectedTestFactory::new(false);
+        let invalid_latency_probe = Arc::clone(&invalid_latency.probe);
+        let error = AudioContext::builder(Arc::new(invalid_latency))
+            .options(AudioContextOptions {
+                latency_hint: AudioContextLatencyCategory::Custom(0.),
+                ..AudioContextOptions::default()
+            })
+            .build()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AudioContextBuildErrorKind::InvalidConfiguration
+        );
+        assert_eq!(identities.load(AtomicOrdering::Acquire), 77);
+        assert!(invalid_latency_probe.context_id.lock().unwrap().is_none());
+
+        super::super::hosted::fail_next_worker_spawn_for_test();
+        let error = AudioContext::builder(Arc::new(InjectedTestFactory::new(false)))
+            .build()
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            AudioContextBuildErrorKind::LifecycleUnavailable
+        );
+        assert_eq!(identities.load(AtomicOrdering::Acquire), 77);
+
+        super::super::hosted::set_context_id_source_for_test(None);
+    }
+
+    #[test]
+    fn hosted_unsupported_mutators_reject_before_host_or_callback_retention() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, AtomicOrdering::Release);
+            }
+        }
+
+        let context = AudioContext::builder(Arc::new(InjectedTestFactory::new(false)))
+            .build()
+            .unwrap();
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = context.create_biquad_filter();
+        }))
+        .is_err());
+        let gain = context.create_gain();
+        assert_eq!(gain.registration().id(), AudioNodeId(11));
+        assert_eq!(gain.gain().registration().id(), AudioNodeId(12));
+        let original_count = gain.channel_count();
+        let original_mode = gain.channel_count_mode();
+        let original_interpretation = gain.channel_interpretation();
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            gain.set_channel_count(1);
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            gain.set_channel_count_mode(ChannelCountMode::Explicit);
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            gain.set_channel_interpretation(ChannelInterpretation::Discrete);
+        }))
+        .is_err());
+        assert_eq!(gain.channel_count(), original_count);
+        assert_eq!(gain.channel_count_mode(), original_mode);
+        assert_eq!(gain.channel_interpretation(), original_interpretation);
+
+        let processor_callback_dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(Arc::clone(&processor_callback_dropped));
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            gain.set_onprocessorerror(Box::new(move |_| {
+                let _ = &probe;
+            }));
+        }))
+        .is_err());
+        assert!(processor_callback_dropped.load(AtomicOrdering::Acquire));
+
+        assert!(matches!(
+            context.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        let sink_callback_dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(Arc::clone(&sink_callback_dropped));
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            context.set_onsinkchange(move |_| {
+                let _ = &probe;
+            });
+        }))
+        .is_err());
+        assert!(sink_callback_dropped.load(AtomicOrdering::Acquire));
+        context.clear_onsinkchange();
+    }
+
+    #[test]
+    fn hosted_rejections_do_not_change_legacy_channel_or_event_behavior() {
+        let context = AudioContext::new(AudioContextOptions {
+            sink_id: "none".into(),
+            ..AudioContextOptions::default()
+        });
+        let gain = context.create_gain();
+        gain.set_channel_count(1);
+        gain.set_channel_count_mode(ChannelCountMode::Explicit);
+        gain.set_channel_interpretation(ChannelInterpretation::Discrete);
+        assert_eq!(gain.channel_count(), 1);
+        assert_eq!(gain.channel_count_mode(), ChannelCountMode::Explicit);
+        assert_eq!(
+            gain.channel_interpretation(),
+            ChannelInterpretation::Discrete
+        );
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        struct LegacyDropProbe(Arc<AtomicBool>);
+        impl Drop for LegacyDropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, AtomicOrdering::Release);
+            }
+        }
+        let probe = LegacyDropProbe(Arc::clone(&dropped));
+        context.set_onsinkchange(move |_| {
+            let _ = &probe;
+        });
+        context.clear_onsinkchange();
+        assert!(dropped.load(AtomicOrdering::Acquire));
+        context.close_sync();
+    }
+
+    #[test]
+    fn public_hosted_contexts_isolate_factory_identity_graph_state_and_close() {
+        let factory_a = Arc::new(InjectedTestFactory::new(false));
+        let factory_b = Arc::new(InjectedTestFactory::new(false));
+        let probe_a = Arc::clone(&factory_a.probe);
+        let probe_b = Arc::clone(&factory_b.probe);
+        let context_a = AudioContext::builder(factory_a).build().unwrap();
+        let context_b = AudioContext::builder(factory_b).build().unwrap();
+        assert_ne!(
+            *probe_a.context_id.lock().unwrap(),
+            *probe_b.context_id.lock().unwrap()
+        );
+
+        let gain_a = context_a.create_gain();
+        gain_a.gain().set_value(0.25);
+        assert_eq!(context_b.create_gain().gain().value(), 1.);
+        assert_eq!(
+            context_a.request_suspend().unwrap().wait(),
+            AudioContextStateChangeOutcome::Applied
+        );
+        assert_eq!(context_a.state(), AudioContextState::Suspended);
+        assert_eq!(context_b.state(), AudioContextState::Running);
+
+        assert!(matches!(
+            context_a.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert_eq!(context_a.state(), AudioContextState::Closed);
+        assert_eq!(context_b.state(), AudioContextState::Running);
+        assert!(probe_b.render_count() > 0);
+        assert!(matches!(
+            context_b.request_close().unwrap().wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+    }
+
+    #[test]
+    fn hosted_drop_and_dropped_receipts_do_not_cancel_native_lifecycle() {
+        let factory = Arc::new(InjectedTestFactory::new(false));
+        let probe = Arc::clone(&factory.probe);
+        let context = AudioContext::builder(factory).build().unwrap();
+
+        drop(context.request_suspend().unwrap());
+        let deadline = Instant::now() + INJECTED_TEST_TIMEOUT;
+        while context.state() != AudioContextState::Suspended
+            || probe.suspend_calls.load(AtomicOrdering::Acquire) == 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "dropped suspend receipt cancelled work"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            context.request_resume().unwrap().wait(),
+            AudioContextStateChangeOutcome::Applied
+        );
+
+        let gain = context.create_gain();
+        let observer = context.shutdown_receipt().unwrap();
+        drop(context);
+        let AudioContextShutdownOutcome::Confirmed(report) = observer.wait() else {
+            panic!("hosted Drop must autonomously retire the exact owner set");
+        };
+        assert_eq!(report.mode(), AudioContextShutdownMode::Silent);
+        assert_eq!(gain.context().state(), AudioContextState::Closed);
+        assert!(probe.callback_destroyed.load(AtomicOrdering::Acquire));
+        assert!(probe.shutdown_joined.load(AtomicOrdering::Acquire));
+
+        let factory = Arc::new(InjectedTestFactory::new(false));
+        let context = AudioContext::builder(factory).build().unwrap();
+        let observer = context.shutdown_receipt().unwrap();
+        drop(context.request_close().unwrap());
+        assert!(matches!(
+            observer.wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+    }
+
+    #[test]
+    fn hosted_state_contention_is_typed_and_close_dominates_admitted_request() {
+        let context = Arc::new(
+            AudioContext::builder(Arc::new(InjectedTestFactory::new(false)))
+                .build()
+                .unwrap(),
+        );
+        let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+        let (release_send, release_recv) = crossbeam_channel::bounded(1);
+        context.set_hosted_state_request_hook_for_test(Arc::new(move || {
+            entered_send.send(()).unwrap();
+            release_recv.recv().unwrap();
+        }));
+
+        let request_context = Arc::clone(&context);
+        let (state_send, state_recv) = crossbeam_channel::bounded(1);
+        thread::spawn(move || state_send.send(request_context.request_suspend()).unwrap());
+        entered_recv.recv_timeout(INJECTED_TEST_TIMEOUT).unwrap();
+        assert_eq!(
+            context.request_resume().unwrap_err(),
+            AudioContextLifecycleError::Contended
+        );
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| context.resume_sync())).is_err());
+
+        let close_context = Arc::clone(&context);
+        let (close_send, close_recv) = crossbeam_channel::bounded(1);
+        thread::spawn(move || close_send.send(close_context.request_close()).unwrap());
+        assert!(close_recv.try_recv().is_err());
+        release_send.send(()).unwrap();
+
+        let state_receipt = state_recv
+            .recv_timeout(INJECTED_TEST_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        let close_receipt = close_recv
+            .recv_timeout(INJECTED_TEST_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            state_receipt.wait(),
+            AudioContextStateChangeOutcome::Applied
+                | AudioContextStateChangeOutcome::SupersededByShutdown
+        ));
+        assert!(matches!(
+            close_receipt.wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert_eq!(context.state(), AudioContextState::Closed);
     }
 
     struct InjectedContextHarness {
@@ -1746,7 +2898,12 @@ mod tests {
 
         executor::block_on(context.close());
         assert_eq!(context.state(), AudioContextState::Closed);
-        assert!(context.render_thread_init.lock().unwrap().is_none());
+        assert!(context
+            .legacy()
+            .render_thread_init
+            .lock()
+            .unwrap()
+            .is_none());
 
         let time4 = context.current_time();
 

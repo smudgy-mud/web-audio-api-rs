@@ -46,11 +46,20 @@ use super::graph::Graph;
 pub(crate) struct InjectedEventDispatchSender {
     sender: Sender<EventDispatch>,
     identity: Arc<()>,
+    event_thread_alive: Arc<AtomicBool>,
 }
 
 impl InjectedEventDispatchSender {
-    pub(crate) fn from_event_setup(sender: Sender<EventDispatch>, identity: Arc<()>) -> Self {
-        Self { sender, identity }
+    pub(crate) fn from_event_setup(
+        sender: Sender<EventDispatch>,
+        identity: Arc<()>,
+        event_thread_alive: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            sender,
+            identity,
+            event_thread_alive,
+        }
     }
 }
 
@@ -64,13 +73,22 @@ enum EventDispatchSenderKind {
     Injected {
         sender: Sender<EventDispatch>,
         identity: Arc<()>,
+        event_thread_alive: Arc<AtomicBool>,
     },
 }
 
 impl EventDispatchSender {
     fn from_injected(sender: InjectedEventDispatchSender) -> Self {
-        let InjectedEventDispatchSender { sender, identity } = sender;
-        Self(EventDispatchSenderKind::Injected { sender, identity })
+        let InjectedEventDispatchSender {
+            sender,
+            identity,
+            event_thread_alive,
+        } = sender;
+        Self(EventDispatchSenderKind::Injected {
+            sender,
+            identity,
+            event_thread_alive,
+        })
     }
 
     // Returning the rejected event by value keeps the render-thread failure path allocation-free;
@@ -78,8 +96,18 @@ impl EventDispatchSender {
     #[allow(clippy::result_large_err)]
     pub(crate) fn try_send(&self, event: EventDispatch) -> Result<(), TrySendError<EventDispatch>> {
         match &self.0 {
-            EventDispatchSenderKind::Legacy(sender)
-            | EventDispatchSenderKind::Injected { sender, .. } => sender.try_send(event),
+            EventDispatchSenderKind::Legacy(sender) => sender.try_send(event),
+            EventDispatchSenderKind::Injected {
+                sender,
+                event_thread_alive,
+                ..
+            } => {
+                if event_thread_alive.load(Ordering::Acquire) {
+                    sender.try_send(event)
+                } else {
+                    Err(TrySendError::Disconnected(event))
+                }
+            }
         }
     }
 
@@ -1492,7 +1520,11 @@ mod tests {
             InjectedContextState::new_for_test(false),
             Arc::new(AtomicU64::new(0)),
             AudioStats::new(),
-            InjectedEventDispatchSender::from_event_setup(event_sender.clone(), Arc::new(())),
+            InjectedEventDispatchSender::from_event_setup(
+                event_sender.clone(),
+                Arc::new(()),
+                Arc::new(AtomicBool::new(true)),
+            ),
             applied.clone(),
         );
         renderer.garbage_collector = Some(garbage_producer);

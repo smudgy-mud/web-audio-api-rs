@@ -2566,16 +2566,89 @@ fn saturated_exact_event_queue_cannot_hide_authoritative_oscillator_completion()
 
 #[test]
 fn disconnected_exact_event_queue_cannot_hide_authoritative_oscillator_completion() {
-    let setup = injected_event_dispatch_setup_with_handlers(|events| {
-        events.set_handler(
-            EventType::SinkChange,
-            EventHandler::Once(Box::new(|_| panic!("forced exact event-thread exit"))),
-        );
-    })
-    .unwrap();
+    static QUEUED_PAYLOAD_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct PanicDropProbe(Arc<AtomicUsize>);
+
+    impl Drop for PanicDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            panic!("hostile retained exact handler destructor");
+        }
+    }
+
+    struct QueuedPayloadDropProbe(&'static AtomicUsize);
+
+    impl Drop for QueuedPayloadDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct RejectedHandlerDropProbe(Arc<AtomicBool>);
+
+    impl Drop for RejectedHandlerDropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    let setup = injected_event_dispatch_setup().unwrap();
     let fixture = lifecycle_fixture_with_event_setup(false, false, 32, setup);
     let base = fixture.take_exact_base();
+    let retained_handler_drops = Arc::new(AtomicUsize::new(0));
+    let activity_probe = DropProbe(Arc::clone(&retained_handler_drops));
+    base.set_event_activity_handler(move || {
+        let _ = &activity_probe;
+    });
+    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
+    let completion = oscillator.completion_token();
+    let ended = Arc::new(AtomicUsize::new(0));
+    let ended_for_handler = Arc::clone(&ended);
+    let ended_probe = PanicDropProbe(Arc::clone(&retained_handler_drops));
+    oscillator.set_onended(move |_| {
+        let _ = &ended_probe;
+        ended_for_handler.fetch_add(1, Ordering::AcqRel);
+    });
+    oscillator.connect(&base.destination());
+    oscillator.start_at(0.);
+    oscillator.stop_at(0.);
+
+    QUEUED_PAYLOAD_DROPS.store(0, Ordering::Release);
+    let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+    let (release_send, release_recv) = crossbeam_channel::bounded(1);
+    base.set_event_handler(
+        EventType::SinkChange,
+        EventHandler::Once(Box::new(move |_| {
+            entered_send.send(()).unwrap();
+            release_recv.recv().unwrap();
+        })),
+    );
     assert_eq!(base.send_event_with(EventDispatch::sink_change), Ok(()));
+    entered_recv.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(
+        base.send_event_with(EventDispatch::force_exact_thread_exit_for_test),
+        Ok(())
+    );
+    let queued_payload_drops = &QUEUED_PAYLOAD_DROPS;
+    assert_eq!(
+        base.send_event_with(move || {
+            EventDispatch::message(
+                AudioNodeId(9999),
+                Box::new(QueuedPayloadDropProbe(queued_payload_drops)),
+            )
+        }),
+        Ok(())
+    );
+    release_send.send(()).unwrap();
     let deadline = std::time::Instant::now() + TIMEOUT;
     loop {
         match base.send_event_with(EventDispatch::control_batch_activity) {
@@ -2583,24 +2656,22 @@ fn disconnected_exact_event_queue_cannot_hide_authoritative_oscillator_completio
             Ok(()) | Err(ControlEventSendOutcome::Full) => {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "panicked exact event thread did not disconnect its receiver"
+                    "forced exact event-thread exit did not disconnect its receiver"
                 );
                 thread::sleep(Duration::from_millis(1));
             }
             other => panic!("unexpected event-send outcome before Close: {other:?}"),
         }
     }
-
-    let mut oscillator = OscillatorNode::new(&base, OscillatorOptions::default());
-    let completion = oscillator.completion_token();
-    let ended = Arc::new(AtomicUsize::new(0));
-    let ended_for_handler = Arc::clone(&ended);
-    oscillator.set_onended(move |_| {
-        ended_for_handler.fetch_add(1, Ordering::AcqRel);
-    });
-    oscillator.connect(&base.destination());
-    oscillator.start_at(0.);
-    oscillator.stop_at(0.);
+    let rejected_handler_dropped = Arc::new(AtomicBool::new(false));
+    let rejected_probe = RejectedHandlerDropProbe(Arc::clone(&rejected_handler_dropped));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        oscillator.set_onended(move |_| {
+            let _ = &rejected_probe;
+        });
+    }))
+    .is_err());
+    assert!(rejected_handler_dropped.load(Ordering::Acquire));
 
     let control = PumpControl::new(false, true);
     let lifecycle = start(
@@ -2619,7 +2690,15 @@ fn disconnected_exact_event_queue_cannot_hide_authoritative_oscillator_completio
     assert_eq!(ended.load(Ordering::Acquire), 0);
     let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
     assert_eq!(report.mode(), OutputShutdownMode::Graceful);
-    assert!(report.event_issue().is_some());
+    assert_eq!(
+        report.event_issue().unwrap().kind(),
+        OutputShutdownIssueKind::EventDeliveryDegraded
+    );
+    // The base and oscillator still retain their exact event capabilities. Confirmed graph
+    // retirement plus the observed early thread exit nevertheless clears both callback maps on
+    // the lifecycle worker, containing the hostile target-handler destructor before completion.
+    assert_eq!(retained_handler_drops.load(Ordering::Acquire), 2);
+    assert_eq!(QUEUED_PAYLOAD_DROPS.load(Ordering::Acquire), 1);
 }
 
 #[test]

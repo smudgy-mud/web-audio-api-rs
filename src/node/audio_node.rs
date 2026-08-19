@@ -134,6 +134,9 @@ impl ChannelConfig {
         v: ChannelCountMode,
         registration: &AudioContextRegistration,
     ) {
+        registration
+            .context()
+            .reject_exact_channel_config_mutation();
         let mut guard = self.inner.lock().unwrap();
         guard.count_mode = v;
 
@@ -158,6 +161,9 @@ impl ChannelConfig {
         v: ChannelInterpretation,
         registration: &AudioContextRegistration,
     ) {
+        registration
+            .context()
+            .reject_exact_channel_config_mutation();
         let mut guard = self.inner.lock().unwrap();
         guard.interpretation = v;
 
@@ -179,6 +185,9 @@ impl ChannelConfig {
 
     pub(super) fn set_count(&self, v: usize, registration: &AudioContextRegistration) {
         crate::assert_valid_number_of_channels(v);
+        registration
+            .context()
+            .reject_exact_channel_config_mutation();
 
         let mut guard = self.inner.lock().unwrap();
         guard.count = v;
@@ -447,6 +456,17 @@ pub trait AudioNode {
     /// Only a single event handler is active at any time. Calling this method multiple times will
     /// override the previous event handler.
     fn set_onprocessorerror(&self, callback: Box<dyn FnOnce(ErrorEvent) + Send + 'static>) {
+        if self
+            .registration()
+            .context()
+            .injected_node_constructor()
+            .is_some()
+        {
+            drop(callback);
+            panic!(
+                "NotSupportedError - processor-error handlers are unavailable on exact hosted nodes"
+            );
+        }
         let callback = move |v| match v {
             EventPayload::ProcessorError(v) => callback(v),
             _ => unreachable!(),
