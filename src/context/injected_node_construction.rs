@@ -11,6 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use arrayvec::ArrayVec;
 
+use super::injected_connections::{
+    InjectedConnectionEndpoint, InjectedConnectionEndpointKind, InjectedConnectionOperationError,
+    InjectedConnectionOperationOutcome, InjectedConnectionRegistryInner,
+};
 use super::injected_control::{
     AcceptedBatchFinalizeFailure, CommitControlOutcome, CommitWithFinalizeFailure,
     ControlBatchReservation, InjectedControlError, InjectedControlIdentity,
@@ -78,6 +82,12 @@ impl InjectedNodeConstructor {
 
     pub(super) const fn allocator(&self) -> &InjectedNodeIdAllocator {
         &self.allocator
+    }
+
+    pub(super) fn registry_identity(
+        &self,
+    ) -> std::sync::Weak<super::injected_node_lifetime::NodeLifetimeInner> {
+        self.lifetimes.registry_identity()
     }
 
     pub(crate) fn matches_node_id_identity(
@@ -169,8 +179,14 @@ impl InjectedNodeConstructor {
         let gain_id = ids.id(GAIN_ID_INDEX);
         let param_id = ids.id(PARAM_ID_INDEX);
 
-        let gain = self.register(gain_id)?;
-        let param = match self.register(param_id) {
+        let (gain, gain_connection) =
+            self.register_endpoint(gain_id, InjectedConnectionEndpointKind::AudioNode, 1, 1)?;
+        let (param, param_connection) = match self.register_endpoint(
+            param_id,
+            InjectedConnectionEndpointKind::AudioParam,
+            1,
+            1,
+        ) {
             Ok(param) => param,
             Err(error) => {
                 drop(gain);
@@ -182,6 +198,8 @@ impl InjectedNodeConstructor {
             ids,
             gain,
             param,
+            gain_connection,
+            param_connection,
             gain_id,
             param_id,
             param_serializer,
@@ -202,17 +220,51 @@ impl InjectedNodeConstructor {
         })
     }
 
-    fn register(
+    fn register_endpoint(
         &self,
         id: AudioNodeId,
-    ) -> Result<ProvisionalNodeRegistration, InjectedGainConstructionError> {
+        kind: InjectedConnectionEndpointKind,
+        inputs: usize,
+        outputs: usize,
+    ) -> Result<
+        (ProvisionalNodeRegistration, InjectedConnectionEndpoint),
+        InjectedGainConstructionError,
+    > {
         let cleanup: Box<dyn InjectedNodeReclaimCleanup> =
             Box::new(DeferredIncidentConnectionCleanup { id });
-        self.lifetimes.try_register(id, cleanup).map_err(|failure| {
-            let error = failure.error;
-            drop(failure);
-            InjectedGainConstructionError::Registration(error)
-        })
+        let provisional = self
+            .lifetimes
+            .try_register(id, cleanup)
+            .map_err(|failure| {
+                let error = failure.error;
+                drop(failure);
+                InjectedGainConstructionError::Registration(error)
+            })?;
+        let endpoint = InjectedConnectionEndpoint::new_ordinary(
+            self.lifetimes.registry_identity(),
+            self.control.identity(),
+            self.allocator.identity(),
+            kind,
+            inputs,
+            outputs,
+            provisional.stamp(),
+        );
+        let Some(cleanup) = endpoint.incident_cleanup() else {
+            drop(provisional);
+            return Err(InjectedGainConstructionError::Registration(
+                NodeRegistrationError::OwnerGone,
+            ));
+        };
+        let previous = provisional
+            .replace_cleanup_before_acceptance(cleanup)
+            .map_err(|cleanup| {
+                drop(cleanup);
+                InjectedGainConstructionError::Registration(
+                    NodeRegistrationError::ProtocolViolation,
+                )
+            })?;
+        drop(previous);
+        Ok((provisional, endpoint))
     }
 
     pub(crate) fn applied_batch_sequence(&self) -> u64 {
@@ -238,13 +290,85 @@ impl InjectedNodeConstructor {
     pub(crate) fn matches_control_identity(&self, identity: &InjectedControlIdentity) -> bool {
         self.control.identity().ptr_eq(identity)
     }
+
+    pub(super) fn fail_closed_protocol(&self) {
+        self.control.fail_closed_protocol();
+        if let Some(owner) = self.lifetimes.registry_identity().upgrade() {
+            owner.connection_registry().fail_closed_protocol();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_connection_operation_for_test(
+        &self,
+        point: super::injected_connections::InjectedConnectionOperationTestPoint,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+        panics: bool,
+    ) {
+        self.lifetimes
+            .registry_identity()
+            .upgrade()
+            .expect("test retains exact lifetime owner")
+            .connection_registry()
+            .hold_operation_for_test(point, entered, release, panics);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection_edge_count_for_test(&self) -> usize {
+        self.lifetimes
+            .registry_identity()
+            .upgrade()
+            .expect("test retains exact lifetime owner")
+            .connection_registry()
+            .edge_count_for_test()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // selected only by h2b's public overload dispatch
+    pub(crate) fn connect_exact(
+        &self,
+        source: &InjectedConnectionEndpoint,
+        destination: &InjectedConnectionEndpoint,
+        output: usize,
+        input: usize,
+    ) -> Result<InjectedConnectionOperationOutcome, InjectedConnectionOperationError> {
+        InjectedConnectionRegistryInner::connect(
+            &self.control,
+            &self.allocator.identity(),
+            &self.lifetimes.registry_identity(),
+            source,
+            destination,
+            output,
+            input,
+        )
+    }
+
+    #[allow(dead_code)] // selected only by h2b's public overload dispatch
+    pub(crate) fn disconnect_exact(
+        &self,
+        source: &InjectedConnectionEndpoint,
+        output: Option<usize>,
+        destination: Option<&InjectedConnectionEndpoint>,
+        input: Option<usize>,
+    ) -> Result<InjectedConnectionOperationOutcome, InjectedConnectionOperationError> {
+        InjectedConnectionRegistryInner::disconnect(
+            &self.control,
+            &self.allocator.identity(),
+            &self.lifetimes.registry_identity(),
+            source,
+            output,
+            destination,
+            input,
+        )
+    }
 }
 
-/// Exact-ID cleanup placeholder for the private construction boundary.
+/// Short-lived exact-ID cleanup used only while a Gain registration remains provisional.
 ///
-/// The hidden parameter edge is deliberately not mirrored by legacy construction either. The
-/// public injected context and its real explicit-connection administration are deferred; that
-/// later integration must replace this placeholder with cleanup against the actual base mirror.
+/// `register_endpoint` replaces this value with the exact incident-edge cleanup before accepted
+/// publication. It may therefore run only during rollback; it must never survive in a live Gain
+/// slot. The hidden parameter edge remains deliberately outside the public connection mirror.
 struct DeferredIncidentConnectionCleanup {
     id: AudioNodeId,
 }
@@ -271,6 +395,8 @@ pub(crate) struct InjectedConstructedGain {
     pub(crate) param_id: AudioNodeId,
     pub(crate) gain_registration: InjectedNodeRegistration,
     pub(crate) param_registration: InjectedNodeRegistration,
+    pub(crate) gain_connection: InjectedConnectionEndpoint,
+    pub(crate) param_connection: InjectedConnectionEndpoint,
     pub(crate) param_mutation: InjectedAudioParamMutation,
     pub(crate) outcome: CommitControlOutcome,
 }
@@ -504,6 +630,8 @@ pub(crate) struct InjectedGainConstruction {
     ids: ProvisionalNodeIds,
     gain: ProvisionalNodeRegistration,
     param: ProvisionalNodeRegistration,
+    gain_connection: InjectedConnectionEndpoint,
+    param_connection: InjectedConnectionEndpoint,
     gain_id: AudioNodeId,
     param_id: AudioNodeId,
     param_serializer: Arc<Mutex<()>>,
@@ -698,6 +826,8 @@ impl InjectedGainConstruction {
             ids,
             gain,
             param,
+            gain_connection,
+            param_connection,
             gain_id,
             param_id,
             param_serializer: _,
@@ -730,6 +860,8 @@ impl InjectedGainConstruction {
             param_id,
             gain_registration,
             param_registration,
+            gain_connection,
+            param_connection,
             param_mutation,
             outcome,
         })
@@ -745,6 +877,8 @@ impl InjectedGainConstruction {
             mut ids,
             gain,
             param,
+            gain_connection: _,
+            param_connection: _,
             gain_id,
             param_id,
             param_serializer: _,
@@ -807,6 +941,8 @@ impl InjectedGainConstruction {
             ids,
             gain,
             param,
+            gain_connection: _,
+            param_connection: _,
             gain_id: _,
             param_id: _,
             param_serializer,

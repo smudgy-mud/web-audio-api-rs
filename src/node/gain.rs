@@ -174,15 +174,23 @@ impl GainNode {
 
         // Public handles are created only after the graph accepted the entire four-command batch
         // and both exact lifetime slots were armed by its mandatory finalizer.
-        let param_registration = AudioContextRegistration::from_injected(
+        let param_registration = AudioContextRegistration::from_injected_with_connection(
             param_id,
             context.clone(),
             constructed.param_registration,
+            constructed.param_connection,
+            crate::context::InjectedConnectionEndpointKind::AudioParam,
+            1,
+            1,
         );
-        let registration = AudioContextRegistration::from_injected(
+        let registration = AudioContextRegistration::from_injected_with_connection(
             gain_id,
             context.clone(),
             constructed.gain_registration,
+            constructed.gain_connection,
+            crate::context::InjectedConnectionEndpointKind::AudioNode,
+            1,
+            1,
         );
         let gain = AudioParam::from_injected_raw_parts(
             param_registration,

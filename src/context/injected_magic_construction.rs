@@ -9,6 +9,7 @@
 #![allow(dead_code)] // private prerequisite; selected by the later injected context builder
 
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::Weak;
 
 use arrayvec::ArrayVec;
 
@@ -20,6 +21,7 @@ use super::injected_control::{
 };
 use super::injected_ids::{InjectedNodeIdIdentity, ProvisionalNodeIdError, ProvisionalNodeIds};
 use super::injected_node_construction::InjectedNodeConstructor;
+use super::injected_node_lifetime::NodeLifetimeInner;
 use super::{AudioNodeId, DESTINATION_NODE_ID, LISTENER_NODE_ID, LISTENER_PARAM_IDS};
 use crate::message::ControlMessage;
 use crate::node::{
@@ -62,9 +64,30 @@ pub(crate) const MAGIC_TEST_REJECT_EXACT: u8 = 7;
 pub(crate) struct InjectedMagicGraph {
     control_identity: super::injected_control::InjectedControlIdentity,
     node_id_identity: InjectedNodeIdIdentity,
+    registry_identity: Weak<NodeLifetimeInner>,
     pub(crate) destination_channel_config: ChannelConfig,
     pub(crate) listener_params: AudioListenerParams,
     pub(crate) outcome: CommitControlOutcome,
+}
+
+/// Single-use, accepted magic authority consumed by the connection module. Private fields mean
+/// numeric magic IDs can never mint permanent endpoints by convention.
+pub(super) struct AcceptedMagicConnectionBrand {
+    registry: Weak<NodeLifetimeInner>,
+    control: super::injected_control::InjectedControlIdentity,
+    node_ids: InjectedNodeIdIdentity,
+}
+
+impl AcceptedMagicConnectionBrand {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Weak<NodeLifetimeInner>,
+        super::injected_control::InjectedControlIdentity,
+        InjectedNodeIdIdentity,
+    ) {
+        (self.registry, self.control, self.node_ids)
+    }
 }
 
 /// One-shot proof that the exact control/allocator accepted the permanent magic namespace.
@@ -96,12 +119,22 @@ impl InjectedMagicGraph {
         ChannelConfig,
         AudioListenerParams,
         CommitControlOutcome,
+        super::injected_connections::InjectedMagicConnectionEndpoints,
         MagicGraphInstalled,
     ) {
+        let connections =
+            super::injected_connections::InjectedMagicConnectionEndpoints::from_accepted_magic(
+                AcceptedMagicConnectionBrand {
+                    registry: self.registry_identity,
+                    control: self.control_identity.clone(),
+                    node_ids: self.node_id_identity.clone(),
+                },
+            );
         (
             self.destination_channel_config,
             self.listener_params,
             self.outcome,
+            connections,
             MagicGraphInstalled {
                 control_identity: self.control_identity,
                 node_id_identity: self.node_id_identity,
@@ -145,6 +178,7 @@ struct MagicPayload {
 struct InjectedMagicConstruction {
     control: super::injected_control::InjectedControlProducer,
     ids: ProvisionalNodeIds,
+    registry_identity: Weak<NodeLifetimeInner>,
     #[cfg(test)]
     test_behavior: u8,
     #[cfg(test)]
@@ -187,6 +221,7 @@ impl InjectedNodeConstructor {
         InjectedMagicConstruction {
             control: self.control().clone(),
             ids,
+            registry_identity: self.registry_identity(),
             #[cfg(test)]
             test_behavior: self.take_magic_behavior_for_test(),
             #[cfg(test)]
@@ -403,6 +438,7 @@ impl InjectedMagicConstruction {
                 Ok(InjectedMagicGraph {
                     control_identity: self.control.identity(),
                     node_id_identity,
+                    registry_identity: self.registry_identity,
                     destination_channel_config: host.destination_channel_config,
                     listener_params: host.listener_params,
                     outcome,
@@ -433,6 +469,7 @@ impl InjectedMagicConstruction {
         let Self {
             control: _,
             ids,
+            registry_identity: _,
             #[cfg(test)]
                 test_behavior: _,
             #[cfg(test)]

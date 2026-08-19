@@ -6,13 +6,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::injected_connections::{
+    InjectedConnectionOperationError, InjectedConnectionOperationOutcome,
+    InjectedConnectionOperationTestPoint,
+};
 use super::injected_control::{
-    injected_control_channel, InjectedControlLifecycleOwner, InjectedControlProducer,
+    injected_control_channel, CommitControlOutcome, InjectedControlLifecycleOwner,
+    InjectedControlProducer,
 };
 use super::injected_ids::{injected_node_id_pair, InjectedNodeIdAllocator};
 use super::injected_node_construction::{
-    InjectedGainConstructionError, InjectedGainPayload, InjectedNodeConstructor,
-    InjectedNodeConstructorBuildError,
+    InjectedConstructedGain, InjectedGainConstructionError, InjectedGainPayload,
+    InjectedNodeConstructor, InjectedNodeConstructorBuildError,
 };
 use super::injected_node_lifetime::{
     injected_node_lifetime_registry, InjectedNodeLifetimeOwner, InjectedNodeLifetimeRegistrar,
@@ -137,6 +142,20 @@ fn gain_descriptor() -> AudioParamDescriptor {
         min_value: f32::MIN,
         max_value: f32::MAX,
     }
+}
+
+fn construct_silent_gain(harness: &Harness) -> InjectedConstructedGain {
+    harness
+        .base()
+        .injected_node_constructor()
+        .unwrap()
+        .try_begin_gain()
+        .unwrap()
+        .commit(payload(
+            Box::new(SilentProcessor),
+            Box::new(SilentProcessor),
+        ))
+        .unwrap()
 }
 
 struct Harness {
@@ -288,11 +307,14 @@ impl Harness {
     }
 
     fn drive_node_lifetimes_until_vacant(&mut self) {
+        self.drive_node_lifetimes_until_counts([SLOT_CAPACITY, 0, 0, 0, 0, 0]);
+    }
+
+    fn drive_node_lifetimes_until_counts(&mut self, expected: [usize; 6]) {
         for _ in 0..64 {
             match self.lifetimes.try_drive_once() {
                 NodeLifetimeDriveOutcome::Idle
-                    if self.lifetimes.slot_phase_counts_for_test()
-                        == [SLOT_CAPACITY, 0, 0, 0, 0, 0] =>
+                    if self.lifetimes.slot_phase_counts_for_test() == expected =>
                 {
                     return;
                 }
@@ -305,7 +327,7 @@ impl Harness {
                 outcome => panic!("unexpected lifetime-drive outcome: {outcome:?}"),
             }
         }
-        panic!("node lifetimes did not reconcile within the bounded test drive");
+        panic!("node lifetimes did not reach {expected:?} within the bounded test drive");
     }
 }
 
@@ -473,6 +495,751 @@ fn admitted_gain_is_one_real_four_command_batch_and_handles_request_lifetime_tea
         .is_ok());
     // Handle Drop only publishes a request hint; the later lifecycle driver owns teardown sends.
     assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+}
+
+#[test]
+fn ordinary_endpoint_attachment_rejects_a_foreign_exact_base_and_fails_both_contexts_closed() {
+    let mut first = Harness::new(4);
+    let second = Harness::new(4);
+    let constructed = construct_silent_gain(&first);
+    first.callback();
+    first.wait_for_transport_idle();
+
+    let attached = panic::catch_unwind(AssertUnwindSafe(|| {
+        AudioContextRegistration::from_injected_with_connection(
+            constructed.gain_id,
+            second.base().clone(),
+            constructed.gain_registration,
+            constructed.gain_connection,
+            super::InjectedConnectionEndpointKind::AudioNode,
+            1,
+            1,
+        )
+    }));
+    assert!(attached.is_err());
+    for harness in [&first, &second] {
+        assert!(matches!(
+            harness
+                .base()
+                .injected_node_constructor()
+                .unwrap()
+                .try_begin_gain(),
+            Err(InjectedGainConstructionError::Control(
+                super::injected_control::InjectedControlError::ProtocolViolation
+            ))
+        ));
+    }
+    drop(constructed.param_registration);
+}
+
+#[test]
+fn exact_public_connect_disconnect_remain_not_supported_without_host_or_transport_mutation() {
+    let mut harness = Harness::new(8);
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let before_sequence = harness.base().applied_control_batch_sequence();
+
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        source.connect(&destination);
+    }))
+    .is_err());
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| {
+        source.disconnect_dest(&destination);
+    }))
+    .is_err());
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+    assert_eq!(
+        harness.base().applied_control_batch_sequence(),
+        before_sequence
+    );
+    assert_eq!(
+        harness
+            .base()
+            .injected_node_constructor()
+            .unwrap()
+            .connection_edge_count_for_test(),
+        0
+    );
+}
+
+#[test]
+fn internal_exact_connect_duplicate_and_disconnect_are_fixed_mirror_transactions() {
+    let mut harness = Harness::new(8);
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let source_cap = source
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_cap = destination
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+
+    assert!(matches!(
+        constructor.connect_exact(&source_cap, &destination_cap, 0, 0),
+        Ok(InjectedConnectionOperationOutcome::Committed(
+            CommitControlOutcome::Enqueued { .. }
+        ))
+    ));
+    assert_eq!(constructor.connection_edge_count_for_test(), 1);
+    let duplicate_sequence = constructor.last_submitted_batch_sequence();
+    let duplicate_accounting = harness.producer.accounting();
+    assert_eq!(
+        constructor.connect_exact(&source_cap, &destination_cap, 0, 0),
+        Ok(InjectedConnectionOperationOutcome::Noop)
+    );
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        duplicate_sequence
+    );
+    assert_eq!(harness.producer.accounting(), duplicate_accounting);
+    assert_eq!(
+        constructor.connect_exact(&source_cap, &destination_cap, 1, 0),
+        Err(InjectedConnectionOperationError::InvalidPort)
+    );
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        duplicate_sequence
+    );
+    assert_eq!(harness.producer.accounting(), duplicate_accounting);
+    harness.callback();
+    harness.wait_for_transport_idle();
+
+    assert!(matches!(
+        constructor.disconnect_exact(&source_cap, None, Some(&destination_cap), None),
+        Ok(InjectedConnectionOperationOutcome::Committed(
+            CommitControlOutcome::Enqueued { .. }
+        ))
+    ));
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    harness.callback();
+    harness.wait_for_transport_idle();
+    assert_eq!(
+        constructor.disconnect_exact(&source_cap, None, None, None),
+        Ok(InjectedConnectionOperationOutcome::Noop)
+    );
+    assert_eq!(
+        constructor.disconnect_exact(&source_cap, None, Some(&destination_cap), None),
+        Err(InjectedConnectionOperationError::Unconnected)
+    );
+}
+
+#[test]
+fn multi_edge_disconnect_not_accepted_restores_every_command_before_admission_releases() {
+    let mut harness = Harness::new(12);
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination_a = GainNode::new(harness.base(), GainOptions::default());
+    let destination_b = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let source_cap = source
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_a_cap = destination_a
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_b_cap = destination_b
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+    constructor
+        .connect_exact(&source_cap, &destination_a_cap, 0, 0)
+        .unwrap();
+    constructor
+        .connect_exact(&source_cap, &destination_b_cap, 0, 0)
+        .unwrap();
+    harness.callback();
+    harness.wait_for_transport_idle();
+    assert_eq!(constructor.connection_edge_count_for_test(), 2);
+    let sequence_before_disconnect = constructor.last_submitted_batch_sequence();
+
+    let (commit_send, commit_recv) = crossbeam_channel::bounded(1);
+    let (commit_release_send, commit_release_recv) = crossbeam_channel::bounded(1);
+    constructor.hold_connection_operation_for_test(
+        InjectedConnectionOperationTestPoint::BeforeCommit,
+        commit_send,
+        commit_release_recv,
+        false,
+    );
+    let (rollback_send, rollback_recv) = crossbeam_channel::bounded(1);
+    let (rollback_release_send, rollback_release_recv) = crossbeam_channel::bounded(1);
+    constructor.hold_connection_operation_for_test(
+        InjectedConnectionOperationTestPoint::RejectedRollback,
+        rollback_send,
+        rollback_release_recv,
+        false,
+    );
+    let operation_base = harness.base().clone();
+    let disconnect = thread::spawn(move || {
+        operation_base
+            .injected_node_constructor()
+            .unwrap()
+            .disconnect_exact(&source_cap, None, None, None)
+    });
+    commit_recv.recv().unwrap();
+
+    // Make commit return a healthy, retryable NotAccepted outcome after its exact two-command
+    // batch has acquired every bounded authority.
+    let (state_entered_send, state_entered_recv) = crossbeam_channel::bounded(1);
+    let (state_release_send, state_release_recv) = crossbeam_channel::bounded(1);
+    let state_producer = harness.producer.clone();
+    let state_holder = thread::spawn(move || {
+        state_producer.hold_transport_state_for_test(state_entered_send, state_release_recv);
+    });
+    state_entered_recv.recv().unwrap();
+    commit_release_send.send(()).unwrap();
+    rollback_recv.recv().unwrap();
+    assert_eq!(harness.producer.accounting(), (2, 1, 1, 0));
+    state_release_send.send(()).unwrap();
+    state_holder.join().unwrap();
+
+    let retirement = harness
+        .lifecycle
+        .take()
+        .unwrap()
+        .try_begin_close()
+        .ok()
+        .unwrap();
+    let (close_send, close_recv) = crossbeam_channel::bounded(1);
+    let close_thread = thread::spawn(move || {
+        close_send.send(retirement.retire_and_wait()).unwrap();
+    });
+    assert!(close_recv.try_recv().is_err());
+    rollback_release_send.send(()).unwrap();
+    assert_eq!(
+        disconnect.join().unwrap(),
+        Err(InjectedConnectionOperationError::Control(
+            super::injected_control::InjectedControlError::Contended
+        ))
+    );
+    let (snapshot, drained) = close_recv.recv().unwrap();
+    assert!(snapshot.is_drained());
+    drop(drained);
+    close_thread.join().unwrap();
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+    assert_eq!(constructor.connection_edge_count_for_test(), 2);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        sequence_before_disconnect
+    );
+}
+
+#[test]
+fn post_seal_duplicate_and_no_match_are_rejected_before_noop_inspection() {
+    let mut harness = Harness::new(12);
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination = GainNode::new(harness.base(), GainOptions::default());
+    let unconnected = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let source_cap = source
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_cap = destination
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let unconnected_cap = unconnected
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+    constructor
+        .connect_exact(&source_cap, &destination_cap, 0, 0)
+        .unwrap();
+    harness.callback();
+    harness.wait_for_transport_idle();
+    assert_eq!(
+        constructor.connect_exact(&source_cap, &destination_cap, 0, 0),
+        Ok(InjectedConnectionOperationOutcome::Noop)
+    );
+    assert_eq!(
+        constructor.disconnect_exact(&unconnected_cap, None, None, None),
+        Ok(InjectedConnectionOperationOutcome::Noop)
+    );
+
+    let retirement = harness
+        .lifecycle
+        .take()
+        .unwrap()
+        .try_begin_close()
+        .ok()
+        .unwrap();
+    let sealed = Err(InjectedConnectionOperationError::Control(
+        super::injected_control::InjectedControlError::Sealed,
+    ));
+    assert_eq!(
+        constructor.connect_exact(&source_cap, &destination_cap, 0, 0),
+        sealed
+    );
+    assert_eq!(
+        constructor.disconnect_exact(&unconnected_cap, None, None, None),
+        sealed
+    );
+    let (snapshot, drained) = retirement.retire_and_wait();
+    assert!(snapshot.is_drained());
+    drop(drained);
+}
+
+#[test]
+fn incident_cleanup_wins_serializer_then_stale_generation_cannot_send_after_id_reuse() {
+    let mut harness = Harness::new(8);
+    harness.install_persistent_destination_for_recycle_test();
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let source_id = source.registration().id();
+    let source_cap = source
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_cap = destination
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+    constructor
+        .connect_exact(&source_cap, &destination_cap, 0, 0)
+        .unwrap();
+    harness.callback();
+    harness.wait_for_transport_idle();
+    assert_eq!(constructor.connection_edge_count_for_test(), 1);
+
+    let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+    let (release_send, release_recv) = crossbeam_channel::bounded(1);
+    constructor.hold_connection_operation_for_test(
+        InjectedConnectionOperationTestPoint::BeforeSerializer,
+        entered_send,
+        release_recv,
+        false,
+    );
+    let operation_base = harness.base().clone();
+    let stale_source = source_cap.clone();
+    let live_destination = destination_cap.clone();
+    let operation = thread::spawn(move || {
+        operation_base
+            .injected_node_constructor()
+            .unwrap()
+            .connect_exact(&stale_source, &live_destination, 0, 0)
+    });
+    entered_recv.recv().unwrap();
+
+    drop(source);
+    harness.drive_node_lifetimes_until_counts([SLOT_CAPACITY - 2, 0, 2, 0, 0, 0]);
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    let replacement = GainNode::new(harness.base(), GainOptions::default());
+    assert_eq!(replacement.registration().id(), source_id);
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let sequence_before_stale_release = constructor.last_submitted_batch_sequence();
+
+    release_send.send(()).unwrap();
+    assert_eq!(
+        operation.join().unwrap(),
+        Err(InjectedConnectionOperationError::ForeignEndpoint)
+    );
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        sequence_before_stale_release
+    );
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+}
+
+#[test]
+fn incident_cleanup_retries_serializer_contention_and_prevents_id_reuse_until_success() {
+    let mut harness = Harness::new(8);
+    harness.install_persistent_destination_for_recycle_test();
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let source_id = source.registration().id();
+    let source_cap = source
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_cap = destination
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+    constructor
+        .connect_exact(&source_cap, &destination_cap, 0, 0)
+        .unwrap();
+    harness.callback();
+    harness.wait_for_transport_idle();
+
+    let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+    let (release_send, release_recv) = crossbeam_channel::bounded(1);
+    constructor.hold_connection_operation_for_test(
+        InjectedConnectionOperationTestPoint::BeforeReserve,
+        entered_send,
+        release_recv,
+        false,
+    );
+    let operation_base = exact_base.clone();
+    let operation_source = source_cap.clone();
+    let operation_destination = destination_cap.clone();
+    let disconnect = thread::spawn(move || {
+        operation_base
+            .injected_node_constructor()
+            .unwrap()
+            .disconnect_exact(&operation_source, None, Some(&operation_destination), None)
+    });
+    entered_recv.recv().unwrap();
+    drop(source);
+
+    let mut observed_retry = false;
+    for _ in 0..32 {
+        match harness.lifetimes.try_drive_once() {
+            NodeLifetimeDriveOutcome::Submitted { .. } => {
+                harness.render_quantum();
+                harness.wait_for_transport_idle();
+            }
+            NodeLifetimeDriveOutcome::Retry { .. } => {
+                observed_retry = true;
+                break;
+            }
+            NodeLifetimeDriveOutcome::Idle | NodeLifetimeDriveOutcome::Reconciled { .. } => {}
+            outcome => panic!("unexpected lifetime-drive outcome: {outcome:?}"),
+        }
+    }
+    assert!(
+        observed_retry,
+        "incident cleanup never exposed benign contention"
+    );
+    let while_contended = harness.allocator.try_reserve(1).unwrap();
+    assert_ne!(while_contended.id(0), source_id);
+    drop(while_contended);
+
+    release_send.send(()).unwrap();
+    assert!(matches!(
+        disconnect.join().unwrap(),
+        Ok(InjectedConnectionOperationOutcome::Committed(_))
+    ));
+    harness.callback();
+    harness.wait_for_transport_idle();
+    harness.drive_node_lifetimes_until_counts([SLOT_CAPACITY - 2, 0, 2, 0, 0, 0]);
+    let after_cleanup = harness.allocator.try_reserve(3).unwrap();
+    assert!((0..3).any(|index| after_cleanup.id(index) == source_id));
+}
+
+#[test]
+fn preboxed_preparation_panic_latches_before_zero_credit_admission_releases_to_close() {
+    let mut harness = Harness::new(8);
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let source_cap = source
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_cap = destination
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+    let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+    let (release_send, release_recv) = crossbeam_channel::bounded(1);
+    constructor.hold_connection_operation_for_test(
+        InjectedConnectionOperationTestPoint::BeforeReserve,
+        entered_send,
+        release_recv,
+        true,
+    );
+    let operation_base = harness.base().clone();
+    let operation = thread::spawn(move || {
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            operation_base
+                .injected_node_constructor()
+                .unwrap()
+                .connect_exact(&source_cap, &destination_cap, 0, 0)
+        }))
+    });
+    entered_recv.recv().unwrap();
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+
+    let retirement = harness
+        .lifecycle
+        .take()
+        .unwrap()
+        .try_begin_close()
+        .ok()
+        .unwrap();
+    let (close_send, close_recv) = crossbeam_channel::bounded(1);
+    let close_thread = thread::spawn(move || {
+        close_send.send(retirement.retire_and_wait()).unwrap();
+    });
+    assert!(close_recv.try_recv().is_err());
+    release_send.send(()).unwrap();
+    assert!(operation.join().unwrap().is_err());
+    let (snapshot, drained) = close_recv.recv().unwrap();
+    assert!(snapshot.is_drained());
+    let sealed = match drained.finish() {
+        Ok(sealed) => sealed,
+        Err(_) => panic!("drained exact close must retain its Close slot"),
+    };
+    assert!(sealed.degradation.prior_transport_failure);
+    drop(sealed);
+    close_thread.join().unwrap();
+}
+
+#[test]
+fn prepared_batch_panic_retains_fence_after_primary_admission_transfer_and_recovers_credits() {
+    let mut harness = Harness::new(8);
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let source_cap = source
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_cap = destination
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+    let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+    let (release_send, release_recv) = crossbeam_channel::bounded(1);
+    constructor.hold_connection_operation_for_test(
+        InjectedConnectionOperationTestPoint::BeforeCommit,
+        entered_send,
+        release_recv,
+        true,
+    );
+    let operation_base = harness.base().clone();
+    let operation = thread::spawn(move || {
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            operation_base
+                .injected_node_constructor()
+                .unwrap()
+                .connect_exact(&source_cap, &destination_cap, 0, 0)
+        }))
+    });
+    entered_recv.recv().unwrap();
+    assert_eq!(harness.producer.accounting(), (1, 1, 1, 0));
+
+    let retirement = harness
+        .lifecycle
+        .take()
+        .unwrap()
+        .try_begin_close()
+        .ok()
+        .unwrap();
+    let (close_send, close_recv) = crossbeam_channel::bounded(1);
+    let close_thread = thread::spawn(move || {
+        close_send.send(retirement.retire_and_wait()).unwrap();
+    });
+    assert!(close_recv.try_recv().is_err());
+    release_send.send(()).unwrap();
+    assert!(operation.join().unwrap().is_err());
+    let (snapshot, drained) = close_recv.recv().unwrap();
+    assert!(snapshot.is_drained());
+    let sealed = match drained.finish() {
+        Ok(sealed) => sealed,
+        Err(_) => panic!("drained exact close must retain its Close slot"),
+    };
+    assert!(sealed.degradation.prior_transport_failure);
+    drop(sealed);
+    close_thread.join().unwrap();
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+}
+
+#[test]
+fn rejected_rollback_panic_keeps_failure_admission_until_fail_closed_latch() {
+    let mut harness = Harness::new(8);
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let source_cap = source
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_cap = destination
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+    let (commit_send, commit_recv) = crossbeam_channel::bounded(1);
+    let (commit_release_send, commit_release_recv) = crossbeam_channel::bounded(1);
+    constructor.hold_connection_operation_for_test(
+        InjectedConnectionOperationTestPoint::BeforeCommit,
+        commit_send,
+        commit_release_recv,
+        false,
+    );
+    let (rollback_send, rollback_recv) = crossbeam_channel::bounded(1);
+    let (rollback_release_send, rollback_release_recv) = crossbeam_channel::bounded(1);
+    constructor.hold_connection_operation_for_test(
+        InjectedConnectionOperationTestPoint::RejectedRollback,
+        rollback_send,
+        rollback_release_recv,
+        true,
+    );
+    let operation_base = harness.base().clone();
+    let operation = thread::spawn(move || {
+        operation_base
+            .injected_node_constructor()
+            .unwrap()
+            .connect_exact(&source_cap, &destination_cap, 0, 0)
+    });
+    commit_recv.recv().unwrap();
+    let (state_entered_send, state_entered_recv) = crossbeam_channel::bounded(1);
+    let (state_release_send, state_release_recv) = crossbeam_channel::bounded(1);
+    let state_producer = harness.producer.clone();
+    let state_holder = thread::spawn(move || {
+        state_producer.hold_transport_state_for_test(state_entered_send, state_release_recv);
+    });
+    state_entered_recv.recv().unwrap();
+    commit_release_send.send(()).unwrap();
+    rollback_recv.recv().unwrap();
+    state_release_send.send(()).unwrap();
+    state_holder.join().unwrap();
+
+    let retirement = harness
+        .lifecycle
+        .take()
+        .unwrap()
+        .try_begin_close()
+        .ok()
+        .unwrap();
+    let (close_send, close_recv) = crossbeam_channel::bounded(1);
+    let close_thread = thread::spawn(move || {
+        close_send.send(retirement.retire_and_wait()).unwrap();
+    });
+    assert!(close_recv.try_recv().is_err());
+    rollback_release_send.send(()).unwrap();
+    assert_eq!(
+        operation.join().unwrap(),
+        Err(InjectedConnectionOperationError::RejectedPayloadPanicked)
+    );
+    let (snapshot, drained) = close_recv.recv().unwrap();
+    assert!(snapshot.is_drained());
+    let sealed = match drained.finish() {
+        Ok(sealed) => sealed,
+        Err(_) => panic!("drained exact close must retain its Close slot"),
+    };
+    assert!(sealed.degradation.prior_transport_failure);
+    drop(sealed);
+    close_thread.join().unwrap();
+    assert_eq!(harness.producer.accounting(), (0, 0, 0, 0));
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+}
+
+#[test]
+fn accepted_mirror_panic_latches_before_accepted_admission_and_keeps_payload_queue_owned() {
+    let mut harness = Harness::new(8);
+    let source = GainNode::new(harness.base(), GainOptions::default());
+    let destination = GainNode::new(harness.base(), GainOptions::default());
+    harness.callback();
+    harness.wait_for_transport_idle();
+    let source_cap = source
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let destination_cap = destination
+        .registration()
+        .injected_connection_endpoint()
+        .unwrap()
+        .clone();
+    let exact_base = harness.base().clone();
+    let constructor = exact_base.injected_node_constructor().unwrap();
+    let (entered_send, entered_recv) = crossbeam_channel::bounded(1);
+    let (release_send, release_recv) = crossbeam_channel::bounded(1);
+    constructor.hold_connection_operation_for_test(
+        InjectedConnectionOperationTestPoint::AcceptedMutation,
+        entered_send,
+        release_recv,
+        true,
+    );
+    let operation_base = harness.base().clone();
+    let operation = thread::spawn(move || {
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            operation_base
+                .injected_node_constructor()
+                .unwrap()
+                .connect_exact(&source_cap, &destination_cap, 0, 0)
+        }))
+    });
+    entered_recv.recv().unwrap();
+    assert_eq!(harness.producer.accounting(), (1, 1, 1, 0));
+
+    let retirement = harness
+        .lifecycle
+        .take()
+        .unwrap()
+        .try_begin_close()
+        .ok()
+        .unwrap();
+    let (close_send, close_recv) = crossbeam_channel::bounded(1);
+    let close_thread = thread::spawn(move || {
+        close_send.send(retirement.retire_and_wait()).unwrap();
+    });
+    assert!(close_recv.try_recv().is_err());
+    release_send.send(()).unwrap();
+    assert!(operation.join().unwrap().is_err());
+    let (snapshot, drained) = close_recv.recv().unwrap();
+    assert!(snapshot.is_drained());
+    let sealed = match drained.finish() {
+        Ok(sealed) => sealed,
+        Err(_) => panic!("drained exact close must retain its Close slot"),
+    };
+    assert!(sealed.degradation.prior_transport_failure);
+    drop(sealed);
+    close_thread.join().unwrap();
+    // The host mirror never moved, while the accepted renderer payload remains queue-owned until
+    // the callback consumes it. No accepted payload is rolled back or dropped on the caller.
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+    harness.callback();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while harness.producer.accounting() != (0, 0, 0, 0) {
+        assert!(
+            Instant::now() < deadline,
+            "accepted edge credits did not retire"
+        );
+        thread::yield_now();
+    }
 }
 
 #[test]
