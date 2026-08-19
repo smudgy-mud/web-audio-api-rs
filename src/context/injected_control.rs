@@ -189,6 +189,13 @@ struct InjectedControlInner {
     /// the render payload remains owned by the queue/staging, but its paired mirror/lifetime
     /// transition cannot be reported as ordinary success.
     accepted_finalizer_failed: AtomicBool,
+    #[cfg(test)]
+    audio_param_reservation_hook: Mutex<
+        Option<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+    >,
 }
 
 /// Opaque weak identity used to bind later private lifecycle foundations to this exact transport.
@@ -804,6 +811,8 @@ pub(crate) fn injected_control_channel(
         last_submitted_batch_sequence: AtomicU64::new(0),
         applied: applied.clone(),
         accepted_finalizer_failed: AtomicBool::new(false),
+        #[cfg(test)]
+        audio_param_reservation_hook: Mutex::new(None),
     });
     Ok((
         InjectedControlProducer {
@@ -854,6 +863,11 @@ pub(crate) struct ControlBatchReservation {
 /// whitelist while still using the same bounded transport and admission accounting.
 #[must_use]
 pub(crate) struct ControlHandleDroppedReservation(ControlBatchReservation);
+
+/// Dedicated one-command reservation for an exact AudioParam value update. The closed wrapper
+/// keeps that runtime command out of the general mutation whitelist.
+#[must_use]
+pub(crate) struct InjectedAudioParamValueReservation(ControlBatchReservation);
 
 impl ControlBatchReservation {
     pub(crate) fn prepare_with<F>(
@@ -913,6 +927,17 @@ impl ControlHandleDroppedReservation {
     pub(crate) fn prepare(self, id: super::AudioNodeId) -> PreparedControlBatch {
         self.0
             .into_prevalidated(vec![ControlMessage::ControlHandleDropped { id }])
+    }
+}
+
+impl InjectedAudioParamValueReservation {
+    pub(crate) fn prepare(
+        self,
+        id: super::AudioNodeId,
+        value: crate::param::InjectedAudioParamValue,
+    ) -> PreparedControlBatch {
+        self.0
+            .into_prevalidated(vec![ControlMessage::InjectedAudioParamValue { id, value }])
     }
 }
 
@@ -1264,6 +1289,35 @@ impl InjectedControlProducer {
             .map(ControlHandleDroppedReservation)
     }
 
+    pub(crate) fn try_begin_audio_param_value(
+        &self,
+    ) -> Result<InjectedAudioParamValueReservation, InjectedControlError> {
+        let reservation = self.try_begin_operation(1)?;
+        #[cfg(test)]
+        if let Some((entered, release)) = self
+            .inner
+            .audio_param_reservation_hook
+            .lock()
+            .unwrap()
+            .take()
+        {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+        Ok(InjectedAudioParamValueReservation(reservation))
+    }
+
+    /// Latches an impossible typed-transaction shape mismatch as terminal while its caller still
+    /// owns graph admission. No future mutation may treat structural corruption as retryable.
+    pub(super) fn fail_closed_protocol(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.phase = TransportPhase::Failed;
+    }
+
     pub(crate) fn try_commit(
         &self,
         batch: PreparedControlBatch,
@@ -1544,6 +1598,15 @@ impl InjectedControlProducer {
     #[cfg(test)]
     pub(crate) fn fail_transport(&self) {
         self.inner.state.lock().unwrap().phase = TransportPhase::Failed;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_audio_param_after_reservation_for_test(
+        &self,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    ) {
+        *self.inner.audio_param_reservation_hook.lock().unwrap() = Some((entered, release));
     }
 
     #[cfg(test)]
@@ -1899,8 +1962,21 @@ impl ControlCloseRetirement {
         }
         let snapshot = self.drain.wait();
         debug_assert!(snapshot.is_drained());
-        // A pre-seal operation may have been inside its accepted finalizer when sealing began.
-        // Refresh only after the admission drain proves that finalizer has returned.
+        // A pre-seal operation may have terminalized either its accepted finalizer or an exact
+        // rejected-payload proof while sealing was already waiting. Refresh only after the
+        // admission drain proves that every such operation has returned.
+        let state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                self.degradation.transport_poison_recovered = true;
+                poisoned.into_inner()
+            }
+        };
+        self.degradation.prior_transport_failure |= matches!(
+            state.phase,
+            TransportPhase::Transitioning | TransportPhase::Failed
+        );
+        drop(state);
         self.degradation.prior_transport_failure |=
             self.inner.accepted_finalizer_failed.load(Ordering::Acquire);
         (

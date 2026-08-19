@@ -33,7 +33,7 @@ mod injected_node_lifetime;
 pub(crate) use injected_node_lifetime::RetiredInjectedGraph;
 
 mod injected_node_construction;
-pub(crate) use injected_node_construction::InjectedGainPayload;
+pub(crate) use injected_node_construction::{InjectedAudioParamMutation, InjectedGainPayload};
 #[cfg(test)]
 mod injected_node_construction_tests;
 
@@ -180,6 +180,15 @@ impl AudioContextRegistration {
     #[must_use]
     pub(crate) fn context(&self) -> &ConcreteBaseAudioContext {
         &self.context
+    }
+
+    pub(crate) fn matches_injected_lifetime_identity(
+        &self,
+        identity: &injected_node_lifetime::InjectedNodeRegistrationIdentity,
+    ) -> bool {
+        self.injected_lifetime
+            .as_ref()
+            .is_some_and(|lifetime| lifetime.matches_identity(identity))
     }
 
     /// Send a message to the corresponding audio processor of this node

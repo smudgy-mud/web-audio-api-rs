@@ -887,6 +887,15 @@ pub(crate) enum ControlMessage {
         value: crate::param::AudioParamInitialValue,
     },
 
+    /// Closed, fixed-size post-construction value update for an exact injected AudioParam.
+    ///
+    /// This is deliberately excluded from the general injected batch whitelist. Only its typed
+    /// one-command reservation can construct it.
+    InjectedAudioParamValue {
+        id: AudioNodeId,
+        value: crate::param::InjectedAudioParamValue,
+    },
+
     /// Request a diagnostic report of the audio graph
     #[cfg(feature = "diagnostics")]
     RunDiagnostics { backend: AudioBackendDiagnostics },
@@ -999,6 +1008,12 @@ mod tests {
         assert!(ControlMessage::AudioParamInitialValue {
             id: AudioNodeId(3),
             value: crate::param::AudioParamInitialValue::new(0.5),
+        }
+        .is_batchable());
+        assert!(!std::mem::needs_drop::<crate::param::InjectedAudioParamValue>());
+        assert!(!ControlMessage::InjectedAudioParamValue {
+            id: AudioNodeId(3),
+            value: crate::param::InjectedAudioParamValue::new(0.5),
         }
         .is_batchable());
     }

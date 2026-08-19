@@ -728,6 +728,9 @@ impl RenderThread {
             AudioParamInitialValue { id, mut value } => {
                 self.graph.as_mut().unwrap().route_message(id, &mut value);
             }
+            InjectedAudioParamValue { id, mut value } => {
+                self.graph.as_mut().unwrap().route_message(id, &mut value);
+            }
             #[cfg(feature = "diagnostics")]
             RunDiagnostics { backend } => {
                 let diagnostics = AudioContextDiagnostics {

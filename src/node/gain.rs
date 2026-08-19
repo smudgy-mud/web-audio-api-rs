@@ -1,7 +1,7 @@
 use crate::context::{
     AudioContextRegistration, AudioParamId, BaseAudioContext, ConcreteBaseAudioContext,
 };
-use crate::param::{audio_param_raw_parts, AudioParam, AudioParamDescriptor};
+use crate::param::{injected_audio_param_raw_parts, AudioParam, AudioParamDescriptor};
 use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope,
 };
@@ -146,7 +146,7 @@ impl GainNode {
             default_value: 1.,
             automation_rate: crate::param::AutomationRate::A,
         };
-        let (param_raw_parts, param_processor) = audio_param_raw_parts(descriptor);
+        let (param_raw_parts, param_processor) = injected_audio_param_raw_parts(descriptor);
         let initial_value = param_raw_parts.set_initial_value_for_injected(options.gain);
         let channel_config: ChannelConfig = options.audio_node_options.into();
         let param_channel_config: ChannelConfig = AudioNodeOptions {
@@ -159,7 +159,7 @@ impl GainNode {
         let param_id = transaction.param_id();
         let constructed = transaction
             .commit(crate::context::InjectedGainPayload {
-                param_processor: Box::new(param_processor),
+                param_processor,
                 gain_processor: Box::new(GainRenderer {
                     gain: AudioParamId::from_node_id(param_id),
                 }),
@@ -184,7 +184,11 @@ impl GainNode {
             context.clone(),
             constructed.gain_registration,
         );
-        let gain = AudioParam::from_raw_parts(param_registration, param_raw_parts);
+        let gain = AudioParam::from_injected_raw_parts(
+            param_registration,
+            param_raw_parts,
+            constructed.param_mutation,
+        );
 
         Self {
             registration,
@@ -197,9 +201,11 @@ impl GainNode {
     ///
     /// The default value is `1.0` (pass-through). Setting `0.0` mutes the
     /// signal; values greater than `1.0` boost it (and may clip downstream
-    /// nodes if uncompensated). Because the parameter is `a-rate`, it can be
-    /// scheduled with the full automation API such as
-    /// [`AudioParam::linear_ramp_to_value_at_time`] for fades.
+    /// nodes if uncompensated). On legacy contexts, this `a-rate` parameter can
+    /// be scheduled with the full automation API such as
+    /// [`AudioParam::linear_ramp_to_value_at_time`] for fades. The private exact
+    /// injected context currently admits only scalar [`AudioParam::set_value`]
+    /// updates; its bounded scheduled-automation transport is deferred.
     #[must_use]
     pub fn gain(&self) -> &AudioParam {
         &self.gain
