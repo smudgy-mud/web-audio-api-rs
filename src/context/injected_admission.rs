@@ -6,7 +6,7 @@
 //! control-owned producers only: raw render-owned `EventDispatch` production remains outside this
 //! phase.
 
-#![allow(dead_code)] // Private foundation consumed by the later injected-context integration.
+#![allow(dead_code)] // Private foundation; public injected-context selection remains deferred.
 
 use std::any::Any;
 use std::num::NonZeroU64;
@@ -506,7 +506,7 @@ impl InjectedContextAdmissionGate {
 
     /// Irreversibly seals all control-owned admissions and extracts committed worker owners.
     ///
-    /// This method is non-waiting and must run off RT. A future lifecycle worker will explicitly
+    /// This method is non-waiting and must run off RT. The private lifecycle worker explicitly
     /// retire the extracted workers and then wait on the returned drain. The resulting drain report
     /// is deliberately not `EventProducersQuiesced`: render-owned events remain outside this gate,
     /// and queued event/control payloads remain owned by their existing channels/staging buffers.
@@ -570,7 +570,7 @@ impl AdmissionSnapshot {
 
 /// Wait authority transferred by sealing.
 ///
-/// `wait` may block and is restricted to the future lifecycle worker. Completion only means all
+/// `wait` may block and is restricted to the private lifecycle worker. Completion only means all
 /// gate-accounted control-owned operations/producers ended. It does not mean render producers are
 /// quiescent, staged payloads were reclaimed, or the public event queue was drained.
 #[must_use = "the lifecycle worker must observe the sealed admission drain"]

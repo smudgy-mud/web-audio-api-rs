@@ -6,7 +6,9 @@ use crate::context::{AudioContextRegistration, BaseAudioContext};
 use crate::node::{
     AudioNode, AudioNodeOptions, ChannelConfig, ChannelCountMode, ChannelInterpretation,
 };
-use crate::param::{AudioParam, AudioParamDescriptor, AudioParamInner, AutomationRate};
+use crate::param::{
+    audio_param_raw_parts, AudioParam, AudioParamDescriptor, AudioParamInner, AutomationRate,
+};
 use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope,
 };
@@ -195,6 +197,58 @@ pub(crate) struct AudioListenerParams {
     pub up_x: AudioParamInner,
     pub up_y: AudioParamInner,
     pub up_z: AudioParamInner,
+}
+
+/// Host and render payload for the injected magic-listener transaction.
+///
+/// The parameter defaults are intrinsic to these raw parts and processors, so publishing this
+/// payload requires no separate `AudioParamInitialValue` records.
+pub(crate) struct AudioListenerRawParts {
+    pub(crate) params: AudioListenerParams,
+    pub(crate) param_processors: [Box<dyn AudioProcessor>; 9],
+    pub(crate) listener_processor: Box<dyn AudioProcessor>,
+}
+
+pub(crate) fn audio_listener_raw_parts() -> AudioListenerRawParts {
+    let forward_z_opts = AudioParamDescriptor {
+        default_value: -1.,
+        ..PARAM_OPTS
+    };
+    let up_y_opts = AudioParamDescriptor {
+        default_value: 1.,
+        ..PARAM_OPTS
+    };
+    let descriptors = [
+        PARAM_OPTS,
+        PARAM_OPTS,
+        PARAM_OPTS,
+        PARAM_OPTS,
+        PARAM_OPTS,
+        forward_z_opts,
+        PARAM_OPTS,
+        up_y_opts,
+        PARAM_OPTS,
+    ];
+    let parts = descriptors.map(audio_param_raw_parts);
+    let params = AudioListenerParams {
+        position_x: parts[0].0.clone(),
+        position_y: parts[1].0.clone(),
+        position_z: parts[2].0.clone(),
+        forward_x: parts[3].0.clone(),
+        forward_y: parts[4].0.clone(),
+        forward_z: parts[5].0.clone(),
+        up_x: parts[6].0.clone(),
+        up_y: parts[7].0.clone(),
+        up_z: parts[8].0.clone(),
+    };
+    // Box every processor before the injected transaction moves its first exact reclaim token.
+    let param_processors =
+        parts.map(|(_, processor)| Box::new(processor) as Box<dyn AudioProcessor>);
+    AudioListenerRawParts {
+        params,
+        param_processors,
+        listener_processor: Box::new(ListenerRenderer {}),
+    }
 }
 
 use vecmath::{

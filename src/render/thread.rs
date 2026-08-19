@@ -133,6 +133,12 @@ pub(crate) struct RenderThread {
     fail_reclaim: bool,
     #[cfg(test)]
     disconnect_lifecycle_on_next_render: bool,
+    #[cfg(test)]
+    panic_magic_apply: bool,
+    #[cfg(test)]
+    magic_bootstrap_shape: [bool; crate::context::MAGIC_COMMAND_COUNT],
+    #[cfg(test)]
+    magic_bootstrap_command_count: usize,
 }
 
 // SAFETY:
@@ -160,6 +166,14 @@ impl std::fmt::Debug for RenderThread {
 }
 
 impl RenderThread {
+    pub(crate) fn injected_base_facts(&self) -> (f32, usize, Arc<AtomicU64>) {
+        (
+            self.sample_rate,
+            self.number_of_channels,
+            Arc::clone(&self.frames_played),
+        )
+    }
+
     pub(crate) fn matches_output_format(
         &self,
         sample_rate: f32,
@@ -242,6 +256,12 @@ impl RenderThread {
             fail_reclaim: false,
             #[cfg(test)]
             disconnect_lifecycle_on_next_render: false,
+            #[cfg(test)]
+            panic_magic_apply: false,
+            #[cfg(test)]
+            magic_bootstrap_shape: [false; crate::context::MAGIC_COMMAND_COUNT],
+            #[cfg(test)]
+            magic_bootstrap_command_count: 0,
         }
     }
 
@@ -276,7 +296,7 @@ impl RenderThread {
     }
 
     /// Installs the persistent injected lifecycle acknowledgement publisher.
-    #[allow(dead_code)] // Used by the later injected-context integration; exercised in tests.
+    #[allow(dead_code)] // Used by the private injected-context integration.
     pub(crate) fn set_graph_lifecycle_publisher(
         &mut self,
         publisher: GraphLifecyclePublisher,
@@ -453,6 +473,43 @@ impl RenderThread {
         }
     }
 
+    /// Applies a complete injected bootstrap envelope before an audio callback can be published.
+    /// The batch capacity is statically bounded by the per-callback command budget, so an envelope
+    /// is either left untouched or consumed completely. Success proves both its exact applied
+    /// sequence and destination node 0 are present.
+    pub(crate) fn apply_injected_magic_before_publication(
+        &mut self,
+        required_sequence: u64,
+    ) -> bool {
+        #[cfg(test)]
+        if self.panic_magic_apply {
+            self.panic_magic_apply = false;
+            panic!("forced prepublication magic application panic");
+        }
+        let mut budget = crate::message::CONTROL_COMMANDS_PER_CALLBACK;
+        self.handle_control_messages_with_budget(&mut budget);
+        self.pending_control_batch.is_none()
+            && self.control_batch_applied.load() >= required_sequence
+            && self
+                .graph
+                .as_ref()
+                .is_some_and(|graph| graph.contains_node(crate::context::DESTINATION_NODE_ID))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_magic_apply_for_test(&mut self) {
+        self.panic_magic_apply = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn magic_bootstrap_shape_is_exact_for_test(&self) -> bool {
+        self.magic_bootstrap_command_count == crate::context::MAGIC_COMMAND_COUNT
+            && self
+                .magic_bootstrap_shape
+                .into_iter()
+                .all(std::convert::identity)
+    }
+
     #[inline]
     fn reclaim_control_batch(&mut self, batch: ControlBatchNode) {
         if let Some(gc) = self.garbage_collector.as_mut() {
@@ -578,6 +635,9 @@ impl RenderThread {
 
     fn handle_control_message(&mut self, msg: ControlMessage) -> ControlFlow<()> {
         use ControlMessage::*;
+
+        #[cfg(test)]
+        self.record_magic_bootstrap_shape_for_test(&msg);
 
         match msg {
             Batch(_) | InjectedBatch { .. } => {
@@ -719,6 +779,71 @@ impl RenderThread {
         }
 
         ControlFlow::Continue(()) // continue handling more messages
+    }
+
+    #[cfg(test)]
+    fn record_magic_bootstrap_shape_for_test(&mut self, message: &ControlMessage) {
+        use crate::node::{ChannelCountMode, ChannelInterpretation};
+
+        let position = self.magic_bootstrap_command_count;
+        if position >= crate::context::MAGIC_COMMAND_COUNT {
+            return;
+        }
+        let exact = match message {
+            ControlMessage::RegisterNode {
+                id,
+                reclaim_id,
+                inputs,
+                outputs,
+                channel_config,
+                ..
+            } if position <= 10 => {
+                let expected_id = crate::context::AudioNodeId(position as u64);
+                let (expected_inputs, expected_outputs, expected_count, expected_interpretation) =
+                    match position {
+                        0 => (
+                            1,
+                            1,
+                            2.min(self.number_of_channels),
+                            ChannelInterpretation::Speakers,
+                        ),
+                        1 => (0, 9, 1, ChannelInterpretation::Discrete),
+                        _ => (1, 1, 1, ChannelInterpretation::Discrete),
+                    };
+                *id == expected_id
+                    && **reclaim_id == expected_id
+                    && *inputs == expected_inputs
+                    && *outputs == expected_outputs
+                    && channel_config.count == expected_count
+                    && channel_config.count_mode == ChannelCountMode::Explicit
+                    && channel_config.interpretation == expected_interpretation
+            }
+            ControlMessage::ConnectNode {
+                from,
+                to,
+                output,
+                input,
+            } if (11..20).contains(&position) => {
+                *from == crate::context::AudioNodeId((position - 9) as u64)
+                    && *to == crate::context::AudioNodeId(1)
+                    && *output == 0
+                    && *input == usize::MAX
+            }
+            ControlMessage::ConnectNode {
+                from,
+                to,
+                output,
+                input,
+            } if position == 20 => {
+                *from == crate::context::AudioNodeId(1)
+                    && *to == crate::context::AudioNodeId(0)
+                    && *output == 0
+                    && *input == usize::MAX
+            }
+            _ => false,
+        };
+        self.magic_bootstrap_shape[position] = exact;
+        self.magic_bootstrap_command_count += 1;
     }
 
     // Render method of the `OfflineAudioContext::start_rendering_sync`

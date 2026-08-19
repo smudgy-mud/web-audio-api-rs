@@ -272,6 +272,10 @@ impl Graph {
         !self.nodes.is_empty()
     }
 
+    pub(crate) fn contains_node(&self, id: AudioNodeId) -> bool {
+        self.nodes.contains(id)
+    }
+
     pub fn add_node(
         &mut self,
         index: AudioNodeId,

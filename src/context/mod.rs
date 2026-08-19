@@ -23,6 +23,12 @@ mod injected_ids;
 pub(crate) use injected_ids::injected_node_id_pair;
 pub(crate) use injected_ids::{InjectedGraphReclaimInit, InjectedGraphReclaimPublisher};
 
+mod injected_magic_construction;
+#[cfg(test)]
+pub(crate) use injected_magic_construction::MAGIC_COMMAND_COUNT;
+#[cfg(test)]
+mod injected_magic_construction_tests;
+
 mod injected_node_lifetime;
 pub(crate) use injected_node_lifetime::RetiredInjectedGraph;
 

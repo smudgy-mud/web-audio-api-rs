@@ -18,6 +18,9 @@ use crate::context::injected_control::{
 use crate::context::injected_ids::injected_node_id_pair;
 use crate::context::injected_node_construction::{InjectedGainPayload, InjectedNodeConstructor};
 use crate::context::injected_node_lifetime::injected_node_lifetime_registry;
+use crate::context::injected_node_lifetime::{
+    BoundInjectedOutputRenderer, MagicInitializedInjectedOutputRenderer,
+};
 use crate::context::{
     AdmissionError, AudioContextState, ConcreteBaseAudioContext, ControlEventSendOutcome,
     InjectedContextAdmissionGate,
@@ -42,28 +45,18 @@ use crate::stats::AudioStats;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 struct LifecycleFixture {
-    renderer: BoundInjectedOutputRenderer,
+    renderer: MagicInitializedInjectedOutputRenderer,
     events: AudioOutputEventSink,
     output_events: AudioOutputEventWatcher,
     gate: InjectedContextAdmissionGate,
-    constructor: Option<InjectedNodeConstructor>,
-    concrete_events: Option<InjectedConcreteEventBinding>,
+    base: ConcreteBaseAudioContext,
     allocator: crate::context::injected_ids::InjectedNodeIdAllocator,
     registrar: crate::context::injected_node_lifetime::InjectedNodeLifetimeRegistrar,
 }
 
 impl LifecycleFixture {
-    fn take_exact_base(&mut self) -> ConcreteBaseAudioContext {
-        ConcreteBaseAudioContext::try_new_exact_injected_node_construction_base(
-            48_000.,
-            2,
-            Arc::new(AtomicU64::new(0)),
-            self.constructor.take().unwrap(),
-            self.concrete_events.take().unwrap(),
-            false,
-        )
-        .ok()
-        .unwrap()
+    fn take_exact_base(&self) -> ConcreteBaseAudioContext {
+        self.base.clone()
     }
 }
 
@@ -109,7 +102,7 @@ fn lifecycle_fixture_inner(
     let gate = InjectedContextAdmissionGate::new();
     let (producer, lifecycle, render_init) =
         injected_control_channel(gate.clone(), capacity, initially_suspended).unwrap();
-    let (allocator, node_ids, graph) = injected_node_id_pair(1);
+    let (allocator, node_ids, graph) = injected_node_id_pair(0);
     let (registrar, bootstrap) =
         injected_node_lifetime_registry(capacity, &producer, node_ids, graph)
             .ok()
@@ -118,36 +111,6 @@ fn lifecycle_fixture_inner(
         InjectedNodeConstructor::new(producer.clone(), allocator.clone(), registrar.clone())
             .ok()
             .unwrap();
-    producer
-        .try_commit_prevalidated_for_test(vec![ControlMessage::RegisterNode {
-            id: crate::context::AudioNodeId(0),
-            reclaim_id: llq::Node::new(crate::context::AudioNodeId(0)),
-            node: Box::new(SilentProcessor),
-            inputs: 1,
-            outputs: 1,
-            channel_config: ChannelConfigInner {
-                count: 2,
-                count_mode: ChannelCountMode::Explicit,
-                interpretation: ChannelInterpretation::Speakers,
-            },
-        }])
-        .unwrap();
-    if stage_hostile_payload {
-        producer
-            .try_commit_prevalidated_for_test(vec![ControlMessage::RegisterNode {
-                id: crate::context::AudioNodeId(7),
-                reclaim_id: llq::Node::new(crate::context::AudioNodeId(7)),
-                node: Box::new(PanicDropProcessor),
-                inputs: 1,
-                outputs: 1,
-                channel_config: ChannelConfigInner {
-                    count: 1,
-                    count_mode: ChannelCountMode::Explicit,
-                    interpretation: ChannelInterpretation::Discrete,
-                },
-            }])
-            .unwrap();
-    }
     let renderer = render_init
         .build_output_render_thread(
             bootstrap,
@@ -163,6 +126,33 @@ fn lifecycle_fixture_inner(
         .ok()
         .unwrap();
     let (renderer, concrete_events) = renderer;
+    let renderer = ConcreteBaseAudioContext::try_prepare_exact_injected_base(
+        renderer,
+        constructor,
+        concrete_events,
+    )
+    .ok()
+    .unwrap()
+    .try_build()
+    .ok()
+    .unwrap();
+    let base = renderer.base().clone();
+    if stage_hostile_payload {
+        producer
+            .try_commit_prevalidated_for_test(vec![ControlMessage::RegisterNode {
+                id: crate::context::AudioNodeId(77),
+                reclaim_id: llq::Node::new(crate::context::AudioNodeId(77)),
+                node: Box::new(PanicDropProcessor),
+                inputs: 1,
+                outputs: 1,
+                channel_config: ChannelConfigInner {
+                    count: 1,
+                    count_mode: ChannelCountMode::Explicit,
+                    interpretation: ChannelInterpretation::Discrete,
+                },
+            }])
+            .unwrap();
+    }
     drop(producer);
     let (events, output_events) = AudioOutputEventSink::bounded(8);
     LifecycleFixture {
@@ -170,8 +160,7 @@ fn lifecycle_fixture_inner(
         events,
         output_events,
         gate,
-        constructor: Some(constructor),
-        concrete_events: Some(concrete_events),
+        base,
         allocator,
         registrar,
     }
@@ -216,6 +205,19 @@ fn unbound_event_renderer_with_gate_and_setup(
         .unwrap();
     drop(producer);
     (renderer, lifecycle, constructor)
+}
+
+fn initialize_exact_output(
+    renderer: BoundInjectedOutputRenderer,
+    constructor: InjectedNodeConstructor,
+    binding: InjectedConcreteEventBinding,
+) -> MagicInitializedInjectedOutputRenderer {
+    ConcreteBaseAudioContext::try_prepare_exact_injected_base(renderer, constructor, binding)
+        .ok()
+        .unwrap()
+        .try_build()
+        .ok()
+        .unwrap()
 }
 
 struct PumpControl {
@@ -610,18 +612,17 @@ fn confirmed(outcome: OutputShutdownOutcome) -> OutputShutdownReport {
 }
 
 fn retire_fixture_without_event_loop(
-    mut fixture: LifecycleFixture,
+    fixture: LifecycleFixture,
 ) -> (
     InjectedLifecycleEventLoop,
     crate::context::RetiredInjectedGraph,
 ) {
-    fixture.constructor.take();
-    fixture.concrete_events.take();
-    let (owner, callback, event_loop) = fixture
+    let (owner, callback, event_loop, base) = fixture
         .renderer
         .try_into_audio_output_pair(format(48_000.), fixture.events)
         .ok()
         .unwrap();
+    drop(base);
     drop(callback);
     drop(fixture.output_events);
     let pending = owner
@@ -651,9 +652,9 @@ fn retire_fixture_without_event_loop(
 
 #[test]
 fn foreign_control_event_branch_returns_both_exact_bundles_for_clean_reuse() {
-    let (mut first_renderer, first_control, _first_constructor) =
+    let (mut first_renderer, first_control, first_constructor) =
         unbound_event_renderer_with_gate(InjectedContextAdmissionGate::new());
-    let (mut second_renderer, second_control, _second_constructor) =
+    let (mut second_renderer, second_control, second_constructor) =
         unbound_event_renderer_with_gate(InjectedContextAdmissionGate::new());
     first_renderer.swap_control_event_branches_for_test(&mut second_renderer);
 
@@ -663,16 +664,16 @@ fn foreign_control_event_branch_returns_both_exact_bundles_for_clean_reuse() {
         .expect("foreign control-event producer must fail before callback publication");
     let (mut first_renderer, first_control) = failure.into_parts();
     first_renderer.swap_control_event_branches_for_test(&mut second_renderer);
-    let first = first_renderer
+    let (first_renderer, first_binding) = first_renderer
         .bind_output_lifecycle_exact(first_control)
         .ok()
-        .unwrap()
-        .0;
-    let second = second_renderer
+        .unwrap();
+    let (second_renderer, second_binding) = second_renderer
         .bind_output_lifecycle_exact(second_control)
         .ok()
-        .unwrap()
-        .0;
+        .unwrap();
+    let first = initialize_exact_output(first_renderer, first_constructor, first_binding);
+    let second = initialize_exact_output(second_renderer, second_constructor, second_binding);
 
     for renderer in [first, second] {
         let (events, output_events) = AudioOutputEventSink::bounded(8);
@@ -765,26 +766,11 @@ fn same_gate_event_branch_swap_rejects_by_brand_then_both_branches_deliver() {
         .bind_output_lifecycle_exact(second_control)
         .ok()
         .unwrap();
-    let first_base = ConcreteBaseAudioContext::try_new_exact_injected_node_construction_base(
-        48_000.,
-        2,
-        Arc::new(AtomicU64::new(0)),
-        first_constructor,
-        first_events,
-        false,
-    )
-    .ok()
-    .unwrap();
-    let second_base = ConcreteBaseAudioContext::try_new_exact_injected_node_construction_base(
-        48_000.,
-        2,
-        Arc::new(AtomicU64::new(0)),
-        second_constructor,
-        second_events,
-        false,
-    )
-    .ok()
-    .unwrap();
+    let first_renderer = initialize_exact_output(first_renderer, first_constructor, first_events);
+    let second_renderer =
+        initialize_exact_output(second_renderer, second_constructor, second_events);
+    let first_base = first_renderer.base().clone();
+    let second_base = second_renderer.base().clone();
     assert_eq!(
         first_base.send_event_with(EventDispatch::sink_change),
         Ok(())
@@ -854,9 +840,13 @@ fn output_build_mismatch_returns_single_use_event_setup_for_exact_retry() {
     let second_gate = InjectedContextAdmissionGate::new();
     let (second_producer, second_lifecycle, second_init) =
         injected_control_channel(second_gate, 8, false).unwrap();
-    let (_second_allocator, second_ids, second_graph) = injected_node_id_pair(0);
-    let (_second_registrar, second_bootstrap) =
+    let (second_allocator, second_ids, second_graph) = injected_node_id_pair(0);
+    let (second_registrar, second_bootstrap) =
         injected_node_lifetime_registry(8, &second_producer, second_ids, second_graph)
+            .ok()
+            .unwrap();
+    let second_constructor =
+        InjectedNodeConstructor::new(second_producer.clone(), second_allocator, second_registrar)
             .ok()
             .unwrap();
 
@@ -898,16 +888,8 @@ fn output_build_mismatch_returns_single_use_event_setup_for_exact_retry() {
         .bind_output_lifecycle_exact(first_lifecycle)
         .ok()
         .unwrap();
-    let first_base = ConcreteBaseAudioContext::try_new_exact_injected_node_construction_base(
-        48_000.,
-        2,
-        Arc::new(AtomicU64::new(0)),
-        first_constructor,
-        first_binding,
-        false,
-    )
-    .ok()
-    .unwrap();
+    let first_renderer = initialize_exact_output(first_renderer, first_constructor, first_binding);
+    let first_base = first_renderer.base().clone();
     assert_eq!(
         first_base.send_event_with(EventDispatch::sink_change),
         Ok(())
@@ -935,7 +917,8 @@ fn output_build_mismatch_returns_single_use_event_setup_for_exact_retry() {
         .bind_output_lifecycle_exact(second_lifecycle)
         .ok()
         .unwrap();
-    drop(second_binding);
+    let second_renderer =
+        initialize_exact_output(second_renderer, second_constructor, second_binding);
     drop(first_producer);
     drop(second_producer);
 
@@ -965,52 +948,47 @@ fn output_build_mismatch_returns_single_use_event_setup_for_exact_retry() {
 
 #[test]
 fn exact_concrete_base_mismatch_returns_constructor_and_event_binding_for_reuse() {
-    let mut first = lifecycle_fixture();
-    let mut second = lifecycle_fixture();
-    let first_constructor = first.constructor.take().unwrap();
-    let first_events = first.concrete_events.take().unwrap();
-    let second_constructor = second.constructor.take().unwrap();
-    let second_events = second.concrete_events.take().unwrap();
+    let (first_renderer, first_control, first_constructor) =
+        unbound_event_renderer_with_gate(InjectedContextAdmissionGate::new());
+    let (second_renderer, second_control, second_constructor) =
+        unbound_event_renderer_with_gate(InjectedContextAdmissionGate::new());
+    let (first_renderer, first_events) = first_renderer
+        .bind_output_lifecycle_exact(first_control)
+        .ok()
+        .unwrap();
+    let (second_renderer, second_events) = second_renderer
+        .bind_output_lifecycle_exact(second_control)
+        .ok()
+        .unwrap();
 
-    let failure = ConcreteBaseAudioContext::try_new_exact_injected_node_construction_base(
-        48_000.,
-        2,
-        Arc::new(AtomicU64::new(0)),
+    let failure = match ConcreteBaseAudioContext::try_prepare_exact_injected_base(
+        first_renderer,
         first_constructor,
         second_events,
-        false,
-    )
-    .expect_err("foreign exact event binding must be rejected before base publication");
-    let (first_constructor, second_events) = failure.into_parts();
-    let first_base = ConcreteBaseAudioContext::try_new_exact_injected_node_construction_base(
-        48_000.,
-        2,
-        Arc::new(AtomicU64::new(0)),
-        first_constructor,
-        first_events,
-        false,
-    )
-    .ok()
-    .unwrap();
-    let second_base = ConcreteBaseAudioContext::try_new_exact_injected_node_construction_base(
-        48_000.,
-        2,
-        Arc::new(AtomicU64::new(0)),
-        second_constructor,
-        second_events,
-        false,
-    )
-    .ok()
-    .unwrap();
+    ) {
+        Err(failure) => failure,
+        Ok(_) => panic!("foreign exact event binding must be rejected before base publication"),
+    };
+    let (first_renderer, first_constructor, second_events) = failure.into_parts();
+    let first = initialize_exact_output(first_renderer, first_constructor, first_events);
+    let second = initialize_exact_output(second_renderer, second_constructor, second_events);
+    let first_base = first.base().clone();
+    let second_base = second.base().clone();
     for base in [&first_base, &second_base] {
         assert_eq!(base.state(), AudioContextState::Running);
         assert_eq!(base.send_event_with(EventDispatch::sink_change), Ok(()));
     }
 
-    for (fixture, base) in [(first, first_base), (second, second_base)] {
-        let lifecycle = start(
-            TestPrepared::new(format(48_000.), PreparedBehavior::Partial),
-            fixture,
+    for (renderer, base) in [(first, first_base), (second, second_base)] {
+        let (events, output_events) = AudioOutputEventSink::bounded(8);
+        let lifecycle = start_injected_output(
+            Box::new(TestPrepared::new(
+                format(48_000.),
+                PreparedBehavior::Partial,
+            )),
+            renderer,
+            events,
+            output_events,
         )
         .ok()
         .unwrap();
@@ -1041,7 +1019,7 @@ fn exact_control_event_rejection_drops_under_admission_and_seal_waits() {
         );
     })
     .unwrap();
-    let mut fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
+    let fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
     let base = fixture.take_exact_base();
     let surviving_dispatch = base.control_event_dispatch();
     let pump = PumpControl::new(false, true);
@@ -1124,7 +1102,7 @@ fn exact_base_cannot_publish_closed_before_physical_retirement() {
         );
     })
     .unwrap();
-    let mut fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
+    let fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
     let base = fixture.take_exact_base();
     base.set_state(AudioContextState::Closed);
     assert_eq!(base.state(), AudioContextState::Running);
@@ -1155,7 +1133,7 @@ fn exact_base_cannot_publish_closed_before_physical_retirement() {
 #[test]
 fn suspended_graceful_close_resumes_once_and_retires_exact_graph() {
     let control = PumpControl::new(true, true);
-    let mut fixture = lifecycle_fixture_with_suspension(true, false);
+    let fixture = lifecycle_fixture_with_suspension(true, false);
     let base = fixture.take_exact_base();
     assert_eq!(base.state(), AudioContextState::Suspended);
     let lifecycle = start(
@@ -1170,6 +1148,7 @@ fn suspended_graceful_close_resumes_once_and_retires_exact_graph() {
     let InjectedOutputStart::Running(controller) = lifecycle else {
         panic!("pumping endpoint must start running");
     };
+    assert_eq!(controller.base().address(), base.address());
 
     let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
     assert_eq!(report.mode(), OutputShutdownMode::Graceful);
@@ -1197,23 +1176,15 @@ fn graceful_closed_handler_runs_only_after_graph_processors_are_destroyed() {
         );
     })
     .unwrap();
-    let mut fixture = lifecycle_fixture_with_event_setup(false, false, 8, event_pair);
-    let constructor = fixture.constructor.take().unwrap();
-    let live_gain = constructor
+    let fixture = lifecycle_fixture_with_event_setup(false, false, 8, event_pair);
+    let base = fixture.take_exact_base();
+    let live_gain = base
+        .injected_node_constructor()
+        .unwrap()
         .try_begin_gain()
         .unwrap()
         .commit(gain_payload_with_drop_probe(&processor_drops))
         .unwrap();
-    let base = ConcreteBaseAudioContext::try_new_exact_injected_node_construction_base(
-        48_000.,
-        2,
-        Arc::new(AtomicU64::new(0)),
-        constructor,
-        fixture.concrete_events.take().unwrap(),
-        false,
-    )
-    .ok()
-    .unwrap();
     let control = PumpControl::new(false, true);
     let lifecycle = start(
         TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
@@ -1255,16 +1226,15 @@ fn explicit_silent_and_controller_drop_publish_one_terminal_closed_after_reclaim
             );
         })
         .unwrap();
-        let mut fixture = lifecycle_fixture_with_event_setup(false, false, 8, event_pair);
-        let live_gain = fixture
-            .constructor
-            .as_ref()
+        let fixture = lifecycle_fixture_with_event_setup(false, false, 8, event_pair);
+        let base = fixture.take_exact_base();
+        let live_gain = base
+            .injected_node_constructor()
             .unwrap()
             .try_begin_gain()
             .unwrap()
             .commit(gain_payload_with_drop_probe(&processor_drops))
             .unwrap();
-        let base = fixture.take_exact_base();
         let surviving_base = base.clone();
         assert_eq!(base.state(), AudioContextState::Running);
         let reader_base = base.clone();
@@ -1358,7 +1328,7 @@ fn endpoint_death_racing_ready_forces_silent_final_classification() {
         );
     })
     .unwrap();
-    let mut fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
+    let fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
     let base = fixture.take_exact_base();
     let lifecycle = start(
         TestPrepared::new(
@@ -1427,7 +1397,7 @@ fn partial_start_physically_reclaims_without_close_ack_and_reports_silent() {
         );
     })
     .unwrap();
-    let mut fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
+    let fixture = lifecycle_fixture_with_event_setup(false, false, 8, setup);
     let base = fixture.take_exact_base();
     let lifecycle = start(
         TestPrepared::new(format(48_000.), PreparedBehavior::Partial),
@@ -1696,8 +1666,9 @@ fn disconnected_close_publisher_is_terminal_silent_not_a_live_stall() {
 
 #[test]
 fn open_worker_automatically_services_drop_and_reuses_ids_only_after_reconcile() {
-    let mut fixture = lifecycle_fixture();
-    let constructor = fixture.constructor.take().unwrap();
+    let fixture = lifecycle_fixture();
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
     let allocator = fixture.allocator.clone();
     let registrar = fixture.registrar.clone();
     let constructed = constructor
@@ -1749,8 +1720,8 @@ fn open_worker_automatically_services_drop_and_reuses_ids_only_after_reconcile()
 
 #[test]
 fn continuously_replenished_node_teardown_cannot_starve_shutdown_command() {
-    let mut fixture = lifecycle_fixture_with_capacity(false, false, 128);
-    let constructor = Arc::new(fixture.constructor.take().unwrap());
+    let fixture = lifecycle_fixture_with_capacity(false, false, 128);
+    let base = Arc::new(fixture.take_exact_base());
     let control = PumpControl::new(false, true);
     let lifecycle = start(
         TestPrepared::new(
@@ -1768,12 +1739,13 @@ fn continuously_replenished_node_teardown_cannot_starve_shutdown_command() {
     let keep_producing = Arc::new(AtomicBool::new(true));
     let produced = Arc::new(AtomicUsize::new(0));
     let producer = {
-        let constructor = Arc::clone(&constructor);
+        let base = Arc::clone(&base);
         let keep_producing = Arc::clone(&keep_producing);
         let produced = Arc::clone(&produced);
         thread::spawn(move || {
             while keep_producing.load(Ordering::Acquire) {
-                if let Ok(transaction) = constructor.try_begin_gain() {
+                if let Ok(transaction) = base.injected_node_constructor().unwrap().try_begin_gain()
+                {
                     if let Ok(handle) = transaction.commit(gain_payload()) {
                         drop(handle);
                         produced.fetch_add(2, Ordering::AcqRel);
@@ -1876,6 +1848,7 @@ fn assert_running_transfer_failure(
     expects_worker: bool,
 ) {
     let fixture = lifecycle_fixture();
+    let expected_base_address = fixture.base.address();
     let result = start_injected_output_with_spawner(
         Box::new(TestPrepared::new(
             format(48_000.),
@@ -1899,15 +1872,25 @@ fn assert_running_transfer_failure(
     let InjectedOutputStartFailureParts::Running {
         endpoint,
         owner,
+        base,
         output_events,
         event_loop,
     } = parts
     else {
         panic!("post-start transfer failure must return running resources");
     };
-    let controller = start_running(endpoint, owner, output_events, event_loop, &ThreadSpawner)
-        .ok()
-        .unwrap();
+    assert_eq!(base.address(), expected_base_address);
+    let controller = start_running(
+        endpoint,
+        owner,
+        base,
+        output_events,
+        event_loop,
+        &ThreadSpawner,
+    )
+    .ok()
+    .unwrap();
+    assert_eq!(controller.base().address(), expected_base_address);
     assert_eq!(
         confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
         OutputShutdownMode::Graceful

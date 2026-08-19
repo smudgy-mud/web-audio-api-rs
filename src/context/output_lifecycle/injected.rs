@@ -6,11 +6,12 @@ use std::thread::JoinHandle;
 use super::*;
 use crate::context::injected_control::InjectedControlError;
 use crate::context::injected_node_lifetime::{
-    BoundInjectedOutputPairFailure, BoundInjectedOutputRenderer, InjectedCloseObservation,
-    InjectedNodeRetireOutcome, InjectedOutputRenderOwner, InjectedRenderReclaimOutcome,
-    NodeLifetimeDriveOutcome, ReadyForInjectedPhysicalReclaim, ReclaimedInjectedGraph,
-    SealedInjectedOutput, NODE_LIFETIME_RETRY_INTERVAL,
+    InjectedCloseObservation, InjectedNodeRetireOutcome, InjectedOutputRenderOwner,
+    InjectedRenderReclaimOutcome, MagicInitializedInjectedOutputRenderer,
+    MagicInitializedOutputPairFailure, NodeLifetimeDriveOutcome, ReadyForInjectedPhysicalReclaim,
+    ReclaimedInjectedGraph, SealedInjectedOutput, NODE_LIFETIME_RETRY_INTERVAL,
 };
+use crate::context::ConcreteBaseAudioContext;
 use crate::events::{
     InjectedConfirmedEventRetirement, InjectedLifecycleEventLoop, InjectedTerminalStateOutcome,
 };
@@ -64,13 +65,14 @@ pub(crate) enum InjectedOutputStart {
 enum InjectedStartFailureResources {
     Prepared {
         prepared: Box<dyn PreparedAudioOutput>,
-        renderer: BoundInjectedOutputRenderer,
+        renderer: MagicInitializedInjectedOutputRenderer,
         events: AudioOutputEventSink,
         output_events: AudioOutputEventWatcher,
     },
     Running {
         endpoint: Box<dyn RunningAudioOutput>,
         owner: InjectedOutputRenderOwner,
+        base: ConcreteBaseAudioContext,
         output_events: AudioOutputEventWatcher,
         event_loop: InjectedLifecycleEventLoop,
     },
@@ -97,13 +99,14 @@ pub(crate) struct InjectedOutputStartFailure {
 pub(crate) enum InjectedOutputStartFailureParts {
     Prepared {
         prepared: Box<dyn PreparedAudioOutput>,
-        renderer: BoundInjectedOutputRenderer,
+        renderer: MagicInitializedInjectedOutputRenderer,
         events: AudioOutputEventSink,
         output_events: AudioOutputEventWatcher,
     },
     Running {
         endpoint: Box<dyn RunningAudioOutput>,
         owner: InjectedOutputRenderOwner,
+        base: ConcreteBaseAudioContext,
         output_events: AudioOutputEventWatcher,
         event_loop: InjectedLifecycleEventLoop,
     },
@@ -147,11 +150,13 @@ impl InjectedOutputStartFailure {
             InjectedStartFailureResources::Running {
                 endpoint,
                 owner,
+                base,
                 output_events,
                 event_loop,
             } => InjectedOutputStartFailureParts::Running {
                 endpoint,
                 owner,
+                base,
                 output_events,
                 event_loop,
             },
@@ -206,9 +211,11 @@ impl Drop for InjectedOutputStartFailure {
                 InjectedStartFailureResources::Running {
                     endpoint,
                     owner,
+                    base,
                     output_events,
                     event_loop,
                 } => {
+                    drop(base);
                     std::mem::forget(endpoint);
                     quarantine_open_owner(owner);
                     drop(output_events);
@@ -241,6 +248,7 @@ impl Drop for InjectedOutputStartFailure {
 }
 
 pub(crate) struct InjectedOutputLifecycleController {
+    base: ConcreteBaseAudioContext,
     command_send: Sender<InjectedLifecycleCommand>,
     receipt: OutputShutdownReceipt,
     worker: Option<JoinHandle<()>>,
@@ -248,6 +256,10 @@ pub(crate) struct InjectedOutputLifecycleController {
 }
 
 impl InjectedOutputLifecycleController {
+    pub(crate) const fn base(&self) -> &ConcreteBaseAudioContext {
+        &self.base
+    }
+
     pub(crate) fn receipt(&self) -> OutputShutdownReceipt {
         self.receipt.clone()
     }
@@ -345,7 +357,7 @@ impl Drop for InjectedPartialResources {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_injected_output(
     prepared: Box<dyn PreparedAudioOutput>,
-    renderer: BoundInjectedOutputRenderer,
+    renderer: MagicInitializedInjectedOutputRenderer,
     events: AudioOutputEventSink,
     output_events: AudioOutputEventWatcher,
 ) -> Result<InjectedOutputStart, Box<InjectedOutputStartFailure>> {
@@ -355,7 +367,7 @@ pub(crate) fn start_injected_output(
 #[allow(clippy::too_many_arguments)]
 fn start_injected_output_with_spawner(
     prepared: Box<dyn PreparedAudioOutput>,
-    renderer: BoundInjectedOutputRenderer,
+    renderer: MagicInitializedInjectedOutputRenderer,
     events: AudioOutputEventSink,
     output_events: AudioOutputEventWatcher,
     spawner: &dyn LifecycleWorkerSpawner,
@@ -390,10 +402,10 @@ fn start_injected_output_with_spawner(
         }
     };
 
-    let (owner, callback, event_loop) =
+    let (owner, callback, event_loop, base) =
         match renderer.try_into_audio_output_pair(format, events.clone()) {
             Ok(pair) => pair,
-            Err(BoundInjectedOutputPairFailure {
+            Err(MagicInitializedOutputPairFailure {
                 error,
                 renderer,
                 events: returned_events,
@@ -410,9 +422,12 @@ fn start_injected_output_with_spawner(
         };
 
     match panic::catch_unwind(AssertUnwindSafe(|| prepared.start(callback, events))) {
-        Ok(Ok(endpoint)) => start_running(endpoint, owner, output_events, event_loop, spawner)
-            .map(InjectedOutputStart::Running),
+        Ok(Ok(endpoint)) => {
+            start_running(endpoint, owner, base, output_events, event_loop, spawner)
+                .map(InjectedOutputStart::Running)
+        }
         Ok(Err(start_failure)) => {
+            drop(base);
             let (startup_error, endpoint_shutdown) = start_failure.into_parts();
             start_partial(
                 startup_error,
@@ -426,6 +441,7 @@ fn start_injected_output_with_spawner(
         }
         Err(payload) => {
             quarantine_panic_payload(payload);
+            drop(base);
             start_uncertain(owner, output_events, event_loop, spawner)
                 .map(InjectedOutputStart::Cleanup)
         }
@@ -436,7 +452,7 @@ fn start_injected_output_with_spawner(
 fn prepared_failure(
     issue: OutputShutdownIssue,
     prepared: Box<dyn PreparedAudioOutput>,
-    renderer: BoundInjectedOutputRenderer,
+    renderer: MagicInitializedInjectedOutputRenderer,
     events: AudioOutputEventSink,
     output_events: AudioOutputEventWatcher,
 ) -> Box<InjectedOutputStartFailure> {
@@ -455,6 +471,7 @@ fn prepared_failure(
 fn start_running(
     endpoint: Box<dyn RunningAudioOutput>,
     owner: InjectedOutputRenderOwner,
+    base: ConcreteBaseAudioContext,
     output_events: AudioOutputEventWatcher,
     event_loop: InjectedLifecycleEventLoop,
     spawner: &dyn LifecycleWorkerSpawner,
@@ -471,16 +488,18 @@ fn start_running(
     let job = Box::new(move || injected_running_worker(bootstrap_recv, command_recv, completer));
     let worker = match spawner.spawn(job) {
         Ok(worker) => worker,
-        Err(error) => return Err(running_transfer_failure(error, resources, None)),
+        Err(error) => return Err(running_transfer_failure(error, resources, base, None)),
     };
     if let Err(error) = bootstrap_send.send(resources) {
         return Err(running_transfer_failure(
             io::Error::other("injected lifecycle worker rejected ownership bootstrap"),
             error.0,
+            base,
             Some(worker),
         ));
     }
     Ok(InjectedOutputLifecycleController {
+        base,
         command_send,
         receipt,
         worker: Some(worker),
@@ -491,6 +510,7 @@ fn start_running(
 fn running_transfer_failure(
     error: io::Error,
     mut resources: InjectedRunningResources,
+    base: ConcreteBaseAudioContext,
     worker: Option<JoinHandle<()>>,
 ) -> Box<InjectedOutputStartFailure> {
     Box::new(InjectedOutputStartFailure {
@@ -505,6 +525,7 @@ fn running_transfer_failure(
         resources: Some(InjectedStartFailureResources::Running {
             endpoint: resources.endpoint.take().unwrap(),
             owner: resources.owner.take().unwrap(),
+            base,
             output_events: resources.output_events.take().unwrap(),
             event_loop: resources.event_loop.take().unwrap(),
         }),
