@@ -226,6 +226,57 @@ fn permanent_magic_listener_param_rejects_runtime_mutation_before_host_change() 
 }
 
 #[test]
+fn public_exact_connections_select_gain_param_destination_and_listener_endpoint_roles() {
+    let initialized = initialize(harness(false));
+    let base = initialized.base().clone();
+    let destination = base.destination();
+    let listener = base.listener();
+    let gain = GainNode::new(&base, GainOptions::default());
+    let constructor = base.injected_node_constructor().unwrap();
+    assert_eq!(
+        constructor.connection_edge_count_for_test(),
+        0,
+        "magic and Gain parameter-owner edges remain hidden from the public mirror"
+    );
+
+    gain.connect(&destination);
+    gain.gain().connect(&destination);
+    destination.connect(&gain);
+    listener.position_x().connect(&gain);
+    gain.connect(listener.position_y());
+    listener.position_z().connect(listener.forward_x());
+    gain.gain().connect(&gain);
+    gain.connect(gain.gain());
+    assert_eq!(constructor.connection_edge_count_for_test(), 8);
+    let sequence_after_unique = constructor.last_submitted_batch_sequence();
+    gain.connect(&destination);
+    listener.position_z().connect(listener.forward_x());
+    assert_eq!(constructor.connection_edge_count_for_test(), 8);
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        sequence_after_unique
+    );
+
+    destination.disconnect_dest(&gain);
+    listener.position_x().disconnect();
+    gain.disconnect_dest(&destination);
+    gain.gain().disconnect_dest(&destination);
+    gain.disconnect_dest(listener.position_y());
+    listener
+        .position_z()
+        .disconnect_dest_from_output_to_input(listener.forward_x(), 0, 0);
+    gain.gain().disconnect_dest(&gain);
+    gain.disconnect_dest(gain.gain());
+    assert_eq!(constructor.connection_edge_count_for_test(), 0);
+
+    drop(gain);
+    drop(listener);
+    drop(destination);
+    drop(base);
+    retire(initialized, true);
+}
+
+#[test]
 fn permanent_magic_attachment_rejects_foreign_base_and_misindexed_listener_cap_fail_closed() {
     let first = initialize(harness(false));
     let second = initialize(harness(false));

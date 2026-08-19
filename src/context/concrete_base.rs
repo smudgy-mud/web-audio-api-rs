@@ -1,7 +1,9 @@
 //! The `ConcreteBaseAudioContext` type
 
 use crate::context::injected_connections::{
-    InjectedConnectionEndpointKind, InjectedMagicConnectionEndpoints,
+    InjectedConnectionEndpoint, InjectedConnectionEndpointKind, InjectedConnectionOperationError,
+    InjectedConnectionOperationOutcome, InjectedDisconnectSelector,
+    InjectedMagicConnectionEndpoints, MAX_INJECTED_EXPLICIT_CONNECTIONS,
 };
 use crate::context::injected_control::InjectedConcreteEventBinding;
 use crate::context::injected_magic_construction::{
@@ -597,6 +599,50 @@ impl ExactInjectedBaseBootstrap {
                     renderer,
                 },
             )
+    }
+}
+
+fn exact_connection_endpoint(
+    registration: &AudioContextRegistration,
+) -> &InjectedConnectionEndpoint {
+    registration
+        .injected_connection_endpoint()
+        .unwrap_or_else(|| {
+            panic!("NotSupportedError - this exact AudioNode has no connection capability")
+        })
+}
+
+fn finish_exact_connection(
+    result: Result<InjectedConnectionOperationOutcome, InjectedConnectionOperationError>,
+) {
+    match result {
+        Ok(InjectedConnectionOperationOutcome::Noop)
+        | Ok(InjectedConnectionOperationOutcome::Committed(_)) => {}
+        Err(InjectedConnectionOperationError::ForeignEndpoint) => {
+            panic!("InvalidAccessError - exact connection endpoint does not belong to this context")
+        }
+        Err(InjectedConnectionOperationError::InactiveEndpoint) => {
+            panic!("InvalidStateError - exact connection endpoint is no longer active")
+        }
+        Err(InjectedConnectionOperationError::InvalidPort) => {
+            panic!("IndexSizeError - exact connection port is out of bounds")
+        }
+        Err(InjectedConnectionOperationError::Capacity) => {
+            panic!(
+                "NotSupportedError - exact connection capacity of {MAX_INJECTED_EXPLICIT_CONNECTIONS} edges exceeded"
+            )
+        }
+        Err(InjectedConnectionOperationError::Unconnected) => {
+            panic!("InvalidAccessError - attempting to disconnect unconnected nodes")
+        }
+        Err(
+            error @ (InjectedConnectionOperationError::Control(_)
+            | InjectedConnectionOperationError::SerializerPoisoned
+            | InjectedConnectionOperationError::RejectedPayloadPanicked
+            | InjectedConnectionOperationError::ProtocolViolation),
+        ) => {
+            panic!("InvalidStateError - exact connection transaction failed: {error:?}")
+        }
     }
 }
 
@@ -1210,9 +1256,8 @@ impl ConcreteBaseAudioContext {
         self.send_control_msg(message);
     }
 
-    /// Registration-carrying public AudioNode seam. H2a preserves the legacy path while keeping
-    /// exact endpoint brands inseparable from their handles; h2b selects the serialized exact
-    /// transaction after its overload matrix is frozen.
+    /// Registration-carrying public AudioNode seam. Legacy contexts retain their original mirror
+    /// and raw message behavior; exact contexts select the serialized branded transaction.
     pub(crate) fn connect_registrations(
         &self,
         from: &AudioContextRegistration,
@@ -1224,12 +1269,10 @@ impl ConcreteBaseAudioContext {
             ConcreteGraphControl::Legacy(_) => {
                 self.connect(from.id(), to.id(), output, input);
             }
-            ConcreteGraphControl::Injected(_) => {
-                let _ = (
-                    from.injected_connection_endpoint(),
-                    to.injected_connection_endpoint(),
-                );
-                panic!("NotSupportedError - exact AudioNode connections are not selected yet")
+            ConcreteGraphControl::Injected(constructor) => {
+                let from = exact_connection_endpoint(from);
+                let to = exact_connection_endpoint(to);
+                finish_exact_connection(constructor.connect_exact(from, to, output, input));
             }
         }
     }
@@ -1307,12 +1350,33 @@ impl ConcreteBaseAudioContext {
                     input,
                 );
             }
-            ConcreteGraphControl::Injected(_) => {
-                let _ = (
-                    from.injected_connection_endpoint(),
-                    to.and_then(AudioContextRegistration::injected_connection_endpoint),
-                );
-                panic!("NotSupportedError - exact AudioNode disconnections are not selected yet")
+            ConcreteGraphControl::Injected(constructor) => {
+                let from = exact_connection_endpoint(from);
+                let to = to.map(exact_connection_endpoint);
+                let selector = match (output, to, input) {
+                    (None, None, None) => InjectedDisconnectSelector::All,
+                    (None, Some(destination), None) => {
+                        InjectedDisconnectSelector::Destination(destination)
+                    }
+                    (Some(output), None, None) => InjectedDisconnectSelector::Output(output),
+                    (Some(output), Some(destination), None) => {
+                        InjectedDisconnectSelector::DestinationOutput {
+                            destination,
+                            output,
+                        }
+                    }
+                    (Some(output), Some(destination), Some(input)) => {
+                        InjectedDisconnectSelector::Exact {
+                            destination,
+                            output,
+                            input,
+                        }
+                    }
+                    (None, None, Some(_)) | (Some(_), None, Some(_)) | (None, Some(_), Some(_)) => {
+                        panic!("InvalidStateError - illegal exact disconnect selector")
+                    }
+                };
+                finish_exact_connection(constructor.disconnect_exact(from, selector));
             }
         }
     }
@@ -1414,6 +1478,21 @@ mod tests {
             })
             .collect();
         assert_eq!(values, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn inactive_exact_endpoint_maps_to_invalid_state_not_invalid_access() {
+        let payload = panic::catch_unwind(|| {
+            finish_exact_connection(Err(InjectedConnectionOperationError::InactiveEndpoint));
+        })
+        .expect_err("inactive exact endpoint must panic");
+        let message = payload
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .expect("panic mapping uses a string payload");
+        assert!(message.starts_with("InvalidStateError"));
+        assert!(!message.starts_with("InvalidAccessError"));
     }
 
     #[test]

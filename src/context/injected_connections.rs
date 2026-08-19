@@ -1,10 +1,9 @@
 //! Opaque wire records for the private injected explicit-edge renderer.
 //!
-//! B5b-h2a adds the private, admitted Gain/magic host-registry producer for these fixed records.
-//! Public `AudioNode` overload selection intentionally remains unavailable until h2b freezes its
-//! complete dispatch/error matrix. Exact DelayNode/cycle-breaker semantics still require a
-//! separate re-audit: the renderer preserves fixed records while computing a non-destructive
-//! cycle-break ordering, but this module mints no Delay capability.
+//! B5b-h2 selects the admitted Gain/magic host-registry producer for public `AudioNode`
+//! connect/disconnect overloads. Exact DelayNode/cycle-breaker semantics still require a separate
+//! re-audit: the renderer preserves fixed records while computing a non-destructive cycle-break
+//! ordering, but this module mints no Delay capability.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
@@ -51,7 +50,6 @@ impl InjectedExplicitConnect {
         (self.from, self.output, self.to, self.input)
     }
 
-    #[allow(dead_code)] // selected only by h2b's public overload dispatch
     const fn new(from: AudioNodeId, to: AudioNodeId, output: usize, input: usize) -> Self {
         Self {
             from,
@@ -90,7 +88,6 @@ impl InjectedExplicitDisconnect {
         (self.from, self.output, self.to, self.input)
     }
 
-    #[allow(dead_code)] // selected only by h2b's public overload dispatch
     const fn new(from: AudioNodeId, to: AudioNodeId, output: usize, input: usize) -> Self {
         Self {
             from,
@@ -323,7 +320,6 @@ impl InjectedConnectionEndpoint {
         }))
     }
 
-    #[allow(dead_code)] // selected only by h2b's public overload dispatch
     fn is_current(&self, owner: &NodeLifetimeInner) -> bool {
         match self.stamp.lifetime {
             InjectedConnectionEndpointLifetime::Ordinary(stamp) => {
@@ -383,7 +379,6 @@ pub(super) struct InjectedHostExplicitConnection {
     input: usize,
 }
 
-#[allow(dead_code)] // wire conversion is selected only by h2b's public overload dispatch
 impl InjectedHostExplicitConnection {
     fn wire_connect(self) -> InjectedExplicitConnect {
         InjectedExplicitConnect::new(self.source.id, self.destination.id, self.output, self.input)
@@ -408,10 +403,10 @@ struct InjectedConnectionRegistryState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // returned by the frozen h2a transaction before h2b selects it publicly
 pub(crate) enum InjectedConnectionOperationError {
     Control(InjectedControlError),
     ForeignEndpoint,
+    InactiveEndpoint,
     InvalidPort,
     Capacity,
     Unconnected,
@@ -421,10 +416,74 @@ pub(crate) enum InjectedConnectionOperationError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // returned by the frozen h2a transaction before h2b selects it publicly
 pub(crate) enum InjectedConnectionOperationOutcome {
     Noop,
     Committed(CommitControlOutcome),
+}
+
+/// Closed set of legal public disconnect overloads.
+///
+/// In particular, an input selector can exist only together with both a destination and output;
+/// the exact host registry never accepts independently swappable `Option` fields.
+pub(crate) enum InjectedDisconnectSelector<'a> {
+    All,
+    Destination(&'a InjectedConnectionEndpoint),
+    Output(usize),
+    DestinationOutput {
+        destination: &'a InjectedConnectionEndpoint,
+        output: usize,
+    },
+    Exact {
+        destination: &'a InjectedConnectionEndpoint,
+        output: usize,
+        input: usize,
+    },
+}
+
+impl<'a> InjectedDisconnectSelector<'a> {
+    fn destination(&self) -> Option<&'a InjectedConnectionEndpoint> {
+        match self {
+            Self::All | Self::Output(_) => None,
+            Self::Destination(destination)
+            | Self::DestinationOutput { destination, .. }
+            | Self::Exact { destination, .. } => Some(destination),
+        }
+    }
+
+    fn output(&self) -> Option<usize> {
+        match self {
+            Self::All | Self::Destination(_) => None,
+            Self::Output(output)
+            | Self::DestinationOutput { output, .. }
+            | Self::Exact { output, .. } => Some(*output),
+        }
+    }
+
+    fn input(&self) -> Option<usize> {
+        match self {
+            Self::Exact { input, .. } => Some(*input),
+            Self::All | Self::Destination(_) | Self::Output(_) | Self::DestinationOutput { .. } => {
+                None
+            }
+        }
+    }
+
+    fn matches(
+        &self,
+        source: InjectedConnectionEndpointStamp,
+        edge: &InjectedHostExplicitConnection,
+    ) -> bool {
+        edge.source == source
+            && self.output().is_none_or(|output| output == edge.output)
+            && self
+                .destination()
+                .is_none_or(|destination| destination.stamp == edge.destination)
+            && self.input().is_none_or(|input| input == edge.input)
+    }
+
+    fn missing_is_error(&self) -> bool {
+        self.destination().is_some()
+    }
 }
 
 #[cfg(test)]
@@ -445,14 +504,12 @@ struct InjectedConnectionOperationTestHook {
     panics: bool,
 }
 
-#[allow(dead_code)] // armed by the frozen h2a transaction selected publicly in h2b
 struct FailClosedConnectionOperation<'a> {
     registry: &'a InjectedConnectionRegistryInner,
     control: &'a InjectedControlProducer,
     armed: bool,
 }
 
-#[allow(dead_code)]
 impl<'a> FailClosedConnectionOperation<'a> {
     fn new(
         registry: &'a InjectedConnectionRegistryInner,
@@ -555,12 +612,10 @@ impl InjectedConnectionRegistryInner {
         self.protocol_failed.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)] // armed by h2's transaction unwind guards
     pub(super) fn fail_closed_protocol(&self) {
         self.protocol_failed.store(true, Ordering::Release);
     }
 
-    #[allow(dead_code)] // read by h2 producer and cleanup preflights
     pub(super) fn is_open(&self) -> bool {
         ConnectionRegistryPhase::from_u8(self.phase.load(Ordering::Acquire))
             == ConnectionRegistryPhase::Open
@@ -568,7 +623,6 @@ impl InjectedConnectionRegistryInner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)] // selected only by h2b's public overload dispatch
     pub(super) fn connect(
         control: &InjectedControlProducer,
         node_ids: &InjectedNodeIdIdentity,
@@ -613,7 +667,7 @@ impl InjectedConnectionRegistryInner {
         }
         if !source.is_current(&owner) || !destination.is_current(&owner) {
             fail_closed.disarm();
-            return Err(InjectedConnectionOperationError::ForeignEndpoint);
+            return Err(InjectedConnectionOperationError::InactiveEndpoint);
         }
         let record = InjectedHostExplicitConnection {
             source: source.stamp,
@@ -691,20 +745,23 @@ impl InjectedConnectionRegistryInner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)] // selected only by h2b's public overload dispatch
     pub(super) fn disconnect(
         control: &InjectedControlProducer,
         node_ids: &InjectedNodeIdIdentity,
         exact_registry: &Weak<NodeLifetimeInner>,
         source: &InjectedConnectionEndpoint,
-        output: Option<usize>,
-        destination: Option<&InjectedConnectionEndpoint>,
-        input: Option<usize>,
+        selector: InjectedDisconnectSelector<'_>,
     ) -> Result<InjectedConnectionOperationOutcome, InjectedConnectionOperationError> {
+        let destination = selector.destination();
         let owner = validate_endpoints(control, node_ids, exact_registry, source, destination)?;
-        if output.is_some_and(|value| value >= source.outputs)
-            || destination
-                .is_some_and(|endpoint| input.is_some_and(|value| value >= endpoint.inputs))
+        if selector
+            .output()
+            .is_some_and(|value| value >= source.outputs)
+            || destination.is_some_and(|endpoint| {
+                selector
+                    .input()
+                    .is_some_and(|value| value >= endpoint.inputs)
+            })
         {
             return Err(InjectedConnectionOperationError::InvalidPort);
         }
@@ -740,22 +797,18 @@ impl InjectedConnectionRegistryInner {
             || destination.is_some_and(|endpoint| !endpoint.is_current(&owner))
         {
             fail_closed.disarm();
-            return Err(InjectedConnectionOperationError::ForeignEndpoint);
+            return Err(InjectedConnectionOperationError::InactiveEndpoint);
         }
         let mut removed =
             ArrayVec::<InjectedHostExplicitConnection, MAX_INJECTED_EXPLICIT_CONNECTIONS>::new();
         for edge in &state.edges {
-            if edge.source == source.stamp
-                && output.is_none_or(|value| value == edge.output)
-                && destination.is_none_or(|endpoint| endpoint.stamp == edge.destination)
-                && input.is_none_or(|value| value == edge.input)
-            {
+            if selector.matches(source.stamp, edge) {
                 removed.push(*edge);
             }
         }
         if removed.is_empty() {
             fail_closed.disarm();
-            return if destination.is_some() {
+            return if selector.missing_is_error() {
                 Err(InjectedConnectionOperationError::Unconnected)
             } else {
                 Ok(InjectedConnectionOperationOutcome::Noop)
@@ -914,7 +967,6 @@ impl InjectedConnectionRegistryInner {
     }
 }
 
-#[allow(dead_code)] // selected only by h2b's public overload dispatch
 fn validate_endpoints(
     control: &InjectedControlProducer,
     node_ids: &InjectedNodeIdIdentity,
@@ -935,17 +987,18 @@ fn validate_endpoints(
     }
     let owner = exact_registry
         .upgrade()
-        .ok_or(InjectedConnectionOperationError::ForeignEndpoint)?;
-    if !owner.matches_connection_brands(&source.control, &source.node_ids)
-        || !source.is_current(&owner)
+        .ok_or(InjectedConnectionOperationError::InactiveEndpoint)?;
+    if !owner.matches_connection_brands(&source.control, &source.node_ids) {
+        return Err(InjectedConnectionOperationError::ForeignEndpoint);
+    }
+    if !source.is_current(&owner)
         || destination.is_some_and(|destination| !destination.is_current(&owner))
     {
-        return Err(InjectedConnectionOperationError::ForeignEndpoint);
+        return Err(InjectedConnectionOperationError::InactiveEndpoint);
     }
     Ok(owner)
 }
 
-#[allow(dead_code)] // selected only by h2b's public overload dispatch
 fn reserve_after_serialization(
     mut admitted: super::injected_control::AdmittedGraphOperation,
     command_count: usize,
