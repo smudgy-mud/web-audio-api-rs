@@ -3,16 +3,22 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::buffer::AudioBuffer;
-use crate::context::{AudioContextRegistration, AudioParamId, BaseAudioContext};
-use crate::param::{AudioParam, AudioParamDescriptor, AutomationRate};
+use crate::context::{
+    AudioContextRegistration, AudioControlBatchReservation, AudioParamId, BaseAudioContext,
+    ConcreteBaseAudioContext, InjectedAudioBufferSourceControl,
+    InjectedAudioBufferSourceMutationError, InjectedAudioBufferSourcePayload,
+};
+use crate::param::{
+    injected_audio_param_raw_parts, AudioParam, AudioParamDescriptor, AutomationRate,
+};
 use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope,
 };
 use crate::{assert_valid_time_value, AtomicF64, RENDER_QUANTUM_SIZE};
 
 use super::{
-    AudioNode, AudioScheduledSourceNode, AudioScheduledSourceNodeExt, ChannelConfig,
-    ScheduledSourceCompletionToken,
+    AudioNode, AudioNodeOptions, AudioScheduledSourceNode, AudioScheduledSourceNodeExt,
+    ChannelConfig, ScheduledSourceCompletionToken,
 };
 
 /// Options for constructing an [`AudioBufferSourceNode`]
@@ -118,6 +124,7 @@ pub struct AudioBufferSourceNode {
     loop_state: LoopState,
     has_start: bool,
     completion: ScheduledSourceCompletionToken,
+    injected_control: Option<InjectedAudioBufferSourceControl>,
 }
 
 impl AudioNode for AudioBufferSourceNode {
@@ -155,6 +162,10 @@ impl AudioScheduledSourceNode for AudioBufferSourceNode {
 
     fn stop_at(&mut self, when: f64) {
         assert_valid_time_value(when);
+        if let Some(control) = &self.injected_control {
+            finish_exact_buffer_source_mutation(control.try_stop(when));
+            return;
+        }
         assert!(
             self.has_start,
             "InvalidStateError - cannot stop before start"
@@ -173,6 +184,9 @@ impl AudioScheduledSourceNodeExt for AudioBufferSourceNode {
 impl AudioBufferSourceNode {
     /// Create a new [`AudioBufferSourceNode`] instance
     pub fn new<C: BaseAudioContext>(context: &C, options: AudioBufferSourceOptions) -> Self {
+        if context.base().injected_node_constructor().is_some() {
+            return Self::new_injected(context.base(), options);
+        }
         let AudioBufferSourceOptions {
             buffer,
             detune,
@@ -228,6 +242,7 @@ impl AudioBufferSourceNode {
                 loop_state,
                 render_state: AudioBufferRendererState::default(),
                 completion: completion.clone(),
+                exact_key: None,
             };
 
             let node = Self {
@@ -240,6 +255,7 @@ impl AudioBufferSourceNode {
                 loop_state,
                 has_start: false,
                 completion,
+                injected_control: None,
             };
 
             (node, Box::new(renderer))
@@ -250,6 +266,177 @@ impl AudioBufferSourceNode {
             node.set_buffer(buf);
         }
 
+        node
+    }
+
+    fn new_injected(context: &ConcreteBaseAudioContext, options: AudioBufferSourceOptions) -> Self {
+        Self::new_injected_with_lifetime(context, options, None)
+    }
+
+    pub(crate) fn new_injected_with_lifetime(
+        context: &ConcreteBaseAudioContext,
+        options: AudioBufferSourceOptions,
+        lifetime: Option<crate::context::AudioNodeLifetimeReservation>,
+    ) -> Self {
+        Self::new_injected_with_reservations(context, options, lifetime, None)
+    }
+
+    pub(crate) fn new_injected_with_reservations(
+        context: &ConcreteBaseAudioContext,
+        options: AudioBufferSourceOptions,
+        lifetime: Option<crate::context::AudioNodeLifetimeReservation>,
+        control: Option<AudioControlBatchReservation>,
+    ) -> Self {
+        let AudioBufferSourceOptions {
+            buffer,
+            detune,
+            loop_,
+            loop_start,
+            loop_end,
+            playback_rate,
+        } = options;
+        let transaction = context
+            .try_begin_injected_audio_buffer_source_with_reservations(lifetime, control)
+            .unwrap_or_else(|error| {
+                panic!("injected AudioBufferSource admission failed: {error:?}")
+            });
+        let source_id = transaction.source_id();
+        let playback_rate_id = transaction.playback_rate_id();
+        let detune_id = transaction.detune_id();
+        let completion = ScheduledSourceCompletionToken::new_exact(transaction.completion_key());
+
+        let playback_rate_descriptor = AudioParamDescriptor {
+            name: String::new(),
+            min_value: f32::MIN,
+            max_value: f32::MAX,
+            default_value: 1.,
+            automation_rate: AutomationRate::K,
+        };
+        let detune_descriptor = AudioParamDescriptor {
+            name: String::new(),
+            min_value: f32::MIN,
+            max_value: f32::MAX,
+            default_value: 0.,
+            automation_rate: AutomationRate::K,
+        };
+        let (playback_rate_raw, playback_rate_processor) =
+            injected_audio_param_raw_parts(playback_rate_descriptor);
+        let playback_rate_initial_value =
+            playback_rate_raw.set_initial_value_for_injected(playback_rate);
+        let (detune_raw, detune_processor) = injected_audio_param_raw_parts(detune_descriptor);
+        let detune_initial_value = detune_raw.set_initial_value_for_injected(detune);
+
+        let channel_config = ChannelConfig::default();
+        let param_channel_config: ChannelConfig = AudioNodeOptions {
+            channel_count: 1,
+            channel_count_mode: super::ChannelCountMode::Explicit,
+            channel_interpretation: super::ChannelInterpretation::Discrete,
+        }
+        .into();
+        let loop_state = LoopState {
+            is_looping: loop_,
+            start: loop_start,
+            end: loop_end,
+        };
+        let render_state = AudioBufferRendererState::default();
+        let buffer_time = Arc::clone(&render_state.buffer_time);
+        let renderer = Box::new(AudioBufferSourceRenderer {
+            start_time: f64::MAX,
+            stop_time: f64::MAX,
+            duration: f64::MAX,
+            offset: 0.,
+            buffer: None,
+            detune: AudioParamId::from_node_id(detune_id),
+            playback_rate: AudioParamId::from_node_id(playback_rate_id),
+            loop_state,
+            render_state,
+            completion: completion.clone(),
+            exact_key: Some(transaction.completion_key()),
+        });
+        let constructed = transaction
+            .commit(InjectedAudioBufferSourcePayload {
+                playback_rate_processor,
+                detune_processor,
+                source_processor: renderer,
+                param_channel_config: param_channel_config.inner(),
+                source_channel_config: channel_config.inner(),
+                playback_rate_initial_value,
+                detune_initial_value,
+                loop_enabled: loop_,
+                loop_start,
+                loop_end,
+            })
+            .unwrap_or_else(|error| {
+                panic!("injected AudioBufferSource construction failed: {error:?}")
+            });
+        debug_assert_eq!(constructed.source_id, source_id);
+        debug_assert_eq!(constructed.playback_rate_id, playback_rate_id);
+        debug_assert_eq!(constructed.detune_id, detune_id);
+        let _accepted_placement = constructed.outcome;
+
+        let playback_rate_registration = AudioContextRegistration::from_injected_with_connection(
+            playback_rate_id,
+            context.clone(),
+            constructed.playback_rate_registration,
+            constructed.playback_rate_connection,
+            crate::context::InjectedConnectionEndpointKind::AudioParam,
+            1,
+            1,
+        );
+        let detune_registration = AudioContextRegistration::from_injected_with_connection(
+            detune_id,
+            context.clone(),
+            constructed.detune_registration,
+            constructed.detune_connection,
+            crate::context::InjectedConnectionEndpointKind::AudioParam,
+            1,
+            1,
+        );
+        let registration = AudioContextRegistration::from_injected_scheduled_source(
+            source_id,
+            context.clone(),
+            constructed.source_registration,
+            constructed.source_connection,
+            constructed.source_control.ended_target(),
+        );
+        let constructor = context
+            .injected_node_constructor()
+            .expect("exact AudioBufferSource context retains constructor");
+        if !constructed
+            .source_control
+            .matches_registration(&registration, constructor)
+        {
+            context.fail_closed_injected_protocol();
+            panic!("exact AudioBufferSource control does not match its registration");
+        }
+        let mut playback_rate = AudioParam::from_injected_raw_parts(
+            playback_rate_registration,
+            playback_rate_raw,
+            constructed.playback_rate_mutation,
+        );
+        playback_rate.set_automation_rate_constrained(true);
+        let mut detune = AudioParam::from_injected_raw_parts(
+            detune_registration,
+            detune_raw,
+            constructed.detune_mutation,
+        );
+        detune.set_automation_rate_constrained(true);
+
+        let mut node = Self {
+            registration,
+            channel_config,
+            detune,
+            playback_rate,
+            buffer_time,
+            buffer: None,
+            loop_state,
+            has_start: false,
+            completion,
+            injected_control: Some(constructed.source_control),
+        };
+        if let Some(buffer) = buffer {
+            node.set_buffer(buffer);
+        }
         node
     }
 
@@ -271,6 +458,10 @@ impl AudioBufferSourceNode {
         assert_valid_time_value(start);
         assert_valid_time_value(offset);
         assert_valid_time_value(duration);
+        if let Some(control) = &self.injected_control {
+            finish_exact_buffer_source_mutation(control.try_start(start, offset, duration));
+            return;
+        }
         assert!(
             !self.has_start,
             "InvalidStateError - Cannot call `start` twice"
@@ -281,9 +472,60 @@ impl AudioBufferSourceNode {
         self.registration.post_message(control);
     }
 
+    /// Starts an exact hosted BufferSource while attaching one host reservation to its submitted
+    /// command. Legacy nodes do not support this accounting hook.
+    ///
+    /// # Panics
+    ///
+    /// Panics for invalid time values, a legacy/inactive source, duplicate start, or rejected
+    /// exact control submission.
+    pub fn start_at_with_offset_and_duration_with_control_reservation(
+        &mut self,
+        start: f64,
+        offset: f64,
+        duration: f64,
+        reservation: AudioControlBatchReservation,
+    ) {
+        assert_valid_time_value(start);
+        assert_valid_time_value(offset);
+        assert_valid_time_value(duration);
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!("NotSupportedError - control reservations require an exact hosted BufferSource")
+        });
+        finish_exact_buffer_source_mutation(control.try_start_with_host_reservation(
+            start,
+            offset,
+            duration,
+            reservation,
+        ));
+    }
+
+    /// Stops an exact hosted BufferSource while attaching one host reservation.
+    ///
+    /// # Panics
+    ///
+    /// Panics for an invalid time, a legacy/inactive or not-yet-started source, or rejected exact
+    /// control submission.
+    pub fn stop_at_with_control_reservation(
+        &mut self,
+        when: f64,
+        reservation: AudioControlBatchReservation,
+    ) {
+        assert_valid_time_value(when);
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!("NotSupportedError - control reservations require an exact hosted BufferSource")
+        });
+        finish_exact_buffer_source_mutation(
+            control.try_stop_with_host_reservation(when, reservation),
+        );
+    }
+
     /// Current buffer value (nullable)
     pub fn buffer(&self) -> Option<&AudioBuffer> {
-        self.buffer.as_ref()
+        self.injected_control
+            .as_ref()
+            .and_then(InjectedAudioBufferSourceControl::buffer)
+            .or(self.buffer.as_ref())
     }
 
     /// Provide an [`AudioBuffer`] as the source of data to be played bask
@@ -293,6 +535,10 @@ impl AudioBufferSourceNode {
     /// Panics if a buffer has already been given to the source (though `new` or through
     /// `set_buffer`)
     pub fn set_buffer(&mut self, audio_buffer: AudioBuffer) {
+        if let Some(control) = &self.injected_control {
+            finish_exact_buffer_source_mutation(control.try_set_buffer(audio_buffer));
+            return;
+        }
         let clone = audio_buffer.clone();
 
         assert!(
@@ -302,6 +548,25 @@ impl AudioBufferSourceNode {
         self.buffer = Some(audio_buffer);
 
         self.registration.post_message(clone);
+    }
+
+    /// Assigns an exact hosted BufferSource buffer while attaching one host reservation.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a legacy/inactive source, a second buffer assignment, or rejected exact control
+    /// submission.
+    pub fn set_buffer_with_control_reservation(
+        &mut self,
+        audio_buffer: AudioBuffer,
+        reservation: AudioControlBatchReservation,
+    ) {
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!("NotSupportedError - control reservations require an exact hosted BufferSource")
+        });
+        finish_exact_buffer_source_mutation(
+            control.try_set_buffer_with_host_reservation(audio_buffer, reservation),
+        );
     }
 
     /// K-rate [`AudioParam`] that defines the speed at which the [`AudioBuffer`]
@@ -335,34 +600,142 @@ impl AudioBufferSourceNode {
     /// Defines if the playback the [`AudioBuffer`] should be looped
     #[allow(clippy::missing_panics_doc)]
     pub fn loop_(&self) -> bool {
-        self.loop_state.is_looping
+        self.injected_control.as_ref().map_or(
+            self.loop_state.is_looping,
+            InjectedAudioBufferSourceControl::loop_,
+        )
     }
 
     pub fn set_loop(&mut self, value: bool) {
+        if let Some(control) = &self.injected_control {
+            finish_exact_buffer_source_mutation(control.try_set_loop(value));
+            return;
+        }
         self.loop_state.is_looping = value;
         self.registration.post_message(ControlMessage::Loop(value));
     }
 
+    /// Updates exact loop enablement while attaching one host reservation.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a legacy/inactive source or rejected exact control submission.
+    pub fn set_loop_with_control_reservation(
+        &mut self,
+        value: bool,
+        reservation: AudioControlBatchReservation,
+    ) {
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!("NotSupportedError - control reservations require an exact hosted BufferSource")
+        });
+        finish_exact_buffer_source_mutation(
+            control.try_set_loop_with_host_reservation(value, reservation),
+        );
+    }
+
     /// Defines the loop start point, in the time reference of the [`AudioBuffer`]
     pub fn loop_start(&self) -> f64 {
-        self.loop_state.start
+        self.injected_control.as_ref().map_or(
+            self.loop_state.start,
+            InjectedAudioBufferSourceControl::loop_start,
+        )
     }
 
     pub fn set_loop_start(&mut self, value: f64) {
+        if let Some(control) = &self.injected_control {
+            finish_exact_buffer_source_mutation(control.try_set_loop_start(value));
+            return;
+        }
         self.loop_state.start = value;
         self.registration
             .post_message(ControlMessage::LoopStart(value));
     }
 
+    /// Updates the exact loop start while attaching one host reservation.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a legacy/inactive source or rejected exact control submission.
+    pub fn set_loop_start_with_control_reservation(
+        &mut self,
+        value: f64,
+        reservation: AudioControlBatchReservation,
+    ) {
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!("NotSupportedError - control reservations require an exact hosted BufferSource")
+        });
+        finish_exact_buffer_source_mutation(
+            control.try_set_loop_start_with_host_reservation(value, reservation),
+        );
+    }
+
     /// Defines the loop end point, in the time reference of the [`AudioBuffer`]
     pub fn loop_end(&self) -> f64 {
-        self.loop_state.end
+        self.injected_control.as_ref().map_or(
+            self.loop_state.end,
+            InjectedAudioBufferSourceControl::loop_end,
+        )
     }
 
     pub fn set_loop_end(&mut self, value: f64) {
+        if let Some(control) = &self.injected_control {
+            finish_exact_buffer_source_mutation(control.try_set_loop_end(value));
+            return;
+        }
         self.loop_state.end = value;
         self.registration
             .post_message(ControlMessage::LoopEnd(value));
+    }
+
+    /// Updates the exact loop end while attaching one host reservation.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a legacy/inactive source or rejected exact control submission.
+    pub fn set_loop_end_with_control_reservation(
+        &mut self,
+        value: f64,
+        reservation: AudioControlBatchReservation,
+    ) {
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!("NotSupportedError - control reservations require an exact hosted BufferSource")
+        });
+        finish_exact_buffer_source_mutation(
+            control.try_set_loop_end_with_host_reservation(value, reservation),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn injected_control_for_test(&self) -> &InjectedAudioBufferSourceControl {
+        self.injected_control
+            .as_ref()
+            .expect("test requires an exact injected AudioBufferSource")
+    }
+}
+
+fn finish_exact_buffer_source_mutation(
+    result: Result<crate::context::CommitControlOutcome, InjectedAudioBufferSourceMutationError>,
+) {
+    match result {
+        Ok(_) => {}
+        Err(InjectedAudioBufferSourceMutationError::DuplicateStart) => {
+            panic!("InvalidStateError - Cannot call `start` twice")
+        }
+        Err(InjectedAudioBufferSourceMutationError::StopBeforeStart) => {
+            panic!("InvalidStateError - cannot stop before start")
+        }
+        Err(InjectedAudioBufferSourceMutationError::BufferAlreadySet) => {
+            panic!("InvalidStateError - cannot assign buffer twice")
+        }
+        Err(InjectedAudioBufferSourceMutationError::Inactive) => {
+            panic!("InvalidStateError - exact AudioBufferSource is no longer active")
+        }
+        Err(InjectedAudioBufferSourceMutationError::Control(error)) => {
+            panic!("InvalidStateError - exact AudioBufferSource command was rejected: {error:?}")
+        }
+        Err(error) => {
+            panic!("InvalidStateError - exact AudioBufferSource transaction failed: {error:?}")
+        }
     }
 }
 
@@ -399,6 +772,7 @@ struct AudioBufferSourceRenderer {
     loop_state: LoopState,
     render_state: AudioBufferRendererState,
     completion: ScheduledSourceCompletionToken,
+    exact_key: Option<crate::events::ExactEndedEventKey>,
 }
 
 impl AudioBufferSourceRenderer {
@@ -867,6 +1241,54 @@ impl AudioProcessor for AudioBufferSourceRenderer {
     }
 
     fn onmessage(&mut self, msg: &mut dyn Any) {
+        if let Some(message) =
+            msg.downcast_mut::<crate::context::InjectedAudioBufferSourceScalarRenderMessage>()
+        {
+            let Some(key) = self.exact_key else {
+                return;
+            };
+            let Some(command) = message.apply_to(key) else {
+                return;
+            };
+            match command {
+                crate::context::InjectedAudioBufferSourceScalarCommand::StartWithOffsetAndDuration {
+                    start,
+                    offset,
+                    duration,
+                } => {
+                    self.start_time = start;
+                    self.offset = offset;
+                    self.duration = duration;
+                }
+                crate::context::InjectedAudioBufferSourceScalarCommand::Stop(value) => {
+                    self.stop_time = value;
+                }
+                crate::context::InjectedAudioBufferSourceScalarCommand::Loop(value) => {
+                    self.loop_state.is_looping = value;
+                }
+                crate::context::InjectedAudioBufferSourceScalarCommand::LoopStart(value) => {
+                    self.loop_state.start = value;
+                }
+                crate::context::InjectedAudioBufferSourceScalarCommand::LoopEnd(value) => {
+                    self.loop_state.end = value;
+                }
+            }
+            self.clamp_loop_boundaries();
+            return;
+        }
+
+        if let Some(message) =
+            msg.downcast_mut::<crate::context::InjectedAudioBufferSourceBufferRenderMessage>()
+        {
+            let Some(key) = self.exact_key else {
+                return;
+            };
+            if message.apply_to(key, &mut self.buffer) {
+                self.clamp_loop_boundaries();
+            }
+            return;
+        }
+
         if let Some(control) = msg.downcast_ref::<ControlMessage>() {
             self.handle_control_message(control);
             return;

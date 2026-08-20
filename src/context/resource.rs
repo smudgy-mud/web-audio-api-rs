@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 
 /// A host-owned reservation released with an exact hosted node construction.
 ///
-/// This is an accounting attachment, not graph authority. The hosted Gain and Oscillator
-/// constructors move it into their exact lifetime records before allocating node IDs. Successful
-/// construction retains it until every node created by that compound constructor has been
-/// physically reclaimed (or the whole graph retires). Rejected construction releases it during
-/// rollback. A fail-closed lifetime quarantine deliberately retains it.
+/// This is an accounting attachment, not graph authority. Hosted Gain, Oscillator, and
+/// AudioBufferSource constructors move it into their exact lifetime records before allocating node
+/// IDs. Successful construction retains it until every node created by that compound constructor
+/// has been physically reclaimed (or the whole graph retires). Rejected construction releases it
+/// during rollback. A fail-closed lifetime quarantine deliberately retains it.
 ///
 /// The wrapped value must have a nonblocking destructor. A destructor panic is contained rather
 /// than allowed to unwind through the audio lifecycle worker.

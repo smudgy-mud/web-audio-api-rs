@@ -659,9 +659,9 @@ pub(crate) struct InjectedExactEndedEventTarget {
 }
 
 impl InjectedExactEndedEventTarget {
-    pub(crate) fn from_oscillator_mint(
+    pub(crate) fn from_scheduled_source_mint(
         events: &InjectedControlEventDispatch,
-        mint: crate::context::InjectedOscillatorEventMint,
+        mint: crate::context::InjectedScheduledSourceEventMint,
     ) -> Option<Self> {
         let (id, lifetime) = mint.into_parts();
         let key = events.exact_ended_key_after_graph_admission(id, &lifetime)?;

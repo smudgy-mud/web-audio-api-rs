@@ -25,8 +25,9 @@ use crate::context::injected_node_lifetime::{
     BoundInjectedOutputRenderer, MagicInitializedInjectedOutputRenderer,
 };
 use crate::context::{
-    AdmissionError, AudioContextState, AudioNodeId, BaseAudioContext, ConcreteBaseAudioContext,
-    ControlEventSendOutcome, InjectedContextAdmissionGate,
+    AdmissionError, AudioContextState, AudioControlBatchReservation, AudioNodeId,
+    AudioNodeLifetimeReservation, BaseAudioContext, ConcreteBaseAudioContext,
+    ControlEventSendOutcome, InjectedAudioBufferSourcePayload, InjectedContextAdmissionGate,
 };
 use crate::events::{
     injected_event_dispatch_setup, injected_event_dispatch_setup_bounded_for_test,
@@ -35,9 +36,9 @@ use crate::events::{
 };
 use crate::message::ControlMessage;
 use crate::node::{
-    AudioNode, AudioScheduledSourceNode, AudioScheduledSourceNodeExt, ChannelConfigInner,
-    ChannelCountMode, ChannelInterpretation, GainNode, GainOptions, OscillatorNode,
-    OscillatorOptions, OscillatorType,
+    AudioBufferSourceNode, AudioBufferSourceOptions, AudioNode, AudioScheduledSourceNode,
+    AudioScheduledSourceNodeExt, ChannelConfigInner, ChannelCountMode, ChannelInterpretation,
+    GainNode, GainOptions, OscillatorNode, OscillatorOptions, OscillatorType,
 };
 use crate::output::{
     AudioOutputConfig, AudioOutputDeathReason, AudioOutputErrorKind, AudioRenderCallback,
@@ -51,6 +52,7 @@ use crate::render::{
     AudioParamValues, AudioProcessor, AudioRenderQuantum, AudioWorkletGlobalScope,
 };
 use crate::stats::AudioStats;
+use crate::{AudioBuffer, AudioBufferStorageLease};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -258,6 +260,7 @@ struct PumpControl {
     suspend_entered: AtomicBool,
     shutdown_behavior: AtomicU8,
     future_drop_ran: AtomicBool,
+    render_thread_id: Mutex<Option<thread::ThreadId>>,
 }
 
 impl PumpControl {
@@ -283,6 +286,7 @@ impl PumpControl {
             suspend_entered: AtomicBool::new(false),
             shutdown_behavior: AtomicU8::new(0),
             future_drop_ran: AtomicBool::new(false),
+            render_thread_id: Mutex::new(None),
         })
     }
 }
@@ -497,6 +501,7 @@ impl PreparedAudioOutput for TestPrepared {
                 let thread_control = Arc::clone(&control);
                 let (done_send, done) = futures_channel::oneshot::channel();
                 let join = thread::spawn(move || {
+                    *thread_control.render_thread_id.lock().unwrap() = Some(thread::current().id());
                     let mut output = [0.; 256];
                     while !thread_control.stop.load(Ordering::Acquire) {
                         if thread_control.running.load(Ordering::Acquire)
@@ -578,6 +583,8 @@ fn start(
 }
 
 struct SilentProcessor;
+
+struct PanicOnMessageProcessor;
 
 struct PanicDropProcessor;
 
@@ -666,6 +673,22 @@ impl AudioProcessor for SilentProcessor {
         _scope: &AudioWorkletGlobalScope,
     ) -> bool {
         false
+    }
+}
+
+impl AudioProcessor for PanicOnMessageProcessor {
+    fn process(
+        &mut self,
+        _inputs: &[AudioRenderQuantum],
+        _outputs: &mut [AudioRenderQuantum],
+        _params: AudioParamValues<'_>,
+        _scope: &AudioWorkletGlobalScope,
+    ) -> bool {
+        false
+    }
+
+    fn onmessage(&mut self, _message: &mut dyn std::any::Any) {
+        panic!("forced wrong BufferSource processor message panic");
     }
 }
 
@@ -1755,6 +1778,548 @@ fn exact_fixed_oscillators_use_ids_eleven_through_thirteen_render_without_alloca
     let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
     assert_eq!(report.mode(), OutputShutdownMode::Graceful);
     assert!(report.reclaim_issue().is_none());
+}
+
+#[test]
+fn exact_buffer_source_uses_source_detune_playback_ids_and_renders_owned_pcm_without_allocation() {
+    let fixture = lifecycle_fixture_inner(
+        false,
+        false,
+        32,
+        8,
+        injected_event_dispatch_setup().unwrap(),
+    );
+    let base = fixture.take_exact_base();
+    let destination = base.destination();
+    let buffer = AudioBuffer::from(vec![vec![0.75; crate::RENDER_QUANTUM_SIZE * 4]], 48_000.);
+    let mut source = AudioBufferSourceNode::new(
+        &base,
+        AudioBufferSourceOptions {
+            buffer: Some(buffer),
+            detune: 120.,
+            playback_rate: 0.5,
+            ..AudioBufferSourceOptions::default()
+        },
+    );
+    assert_eq!(source.registration().id(), AudioNodeId(11));
+    assert_eq!(source.detune().registration().id(), AudioNodeId(12));
+    assert_eq!(source.playback_rate().registration().id(), AudioNodeId(13));
+    assert_eq!(source.detune().value(), 120.);
+    assert_eq!(source.playback_rate().value(), 0.5);
+    assert!(source.buffer().is_some());
+    let completion = source.completion_token();
+    let ended = Arc::new(AtomicUsize::new(0));
+    let ended_for_handler = Arc::clone(&ended);
+    source.set_onended(move |_| {
+        ended_for_handler.fetch_add(1, Ordering::AcqRel);
+    });
+    source.connect(&destination);
+    source.start_at_with_offset_and_duration(0., 1. / 48_000., 0.004);
+
+    let control = PumpControl::new(false, true);
+    control
+        .deny_next_render_allocation
+        .store(true, Ordering::Release);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || control.output_nonzero.load(Ordering::Acquire),
+        "exact BufferSource did not render its owned PCM",
+    );
+    wait_until(
+        || completion.is_complete(),
+        "exact BufferSource did not complete at its explicit duration",
+    );
+    wait_until(
+        || ended.load(Ordering::Acquire) == 1,
+        "exact BufferSource did not dispatch one generation-keyed ended event",
+    );
+
+    drop(source);
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.reclaim_issue().is_none());
+}
+
+struct BufferSourceDropProbe(Arc<AtomicUsize>);
+
+impl Drop for BufferSourceDropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct BufferSourceAdmissionDropProbe {
+    gate: InjectedContextAdmissionGate,
+    observed_graph_controls: Arc<AtomicUsize>,
+}
+
+struct BufferSourceOffRenderDropProbe {
+    control: Arc<PumpControl>,
+    drops: Arc<AtomicUsize>,
+    dropped_off_render: Arc<AtomicBool>,
+}
+
+impl Drop for BufferSourceOffRenderDropProbe {
+    fn drop(&mut self) {
+        let render_thread = *self.control.render_thread_id.lock().unwrap();
+        self.dropped_off_render.store(
+            render_thread.is_some_and(|id| id != thread::current().id()),
+            Ordering::Release,
+        );
+        self.drops.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for BufferSourceAdmissionDropProbe {
+    fn drop(&mut self) {
+        self.observed_graph_controls.store(
+            self.gate.snapshot_for_test().graph_controls,
+            Ordering::Release,
+        );
+    }
+}
+
+#[test]
+fn exact_buffer_source_host_reservations_follow_batches_and_three_node_reclaim() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 32);
+    let base = fixture.take_exact_base();
+    let destination = base.destination();
+    let lifetime_drops = Arc::new(AtomicUsize::new(0));
+    let command_drops = Arc::new(AtomicUsize::new(0));
+    let lifetime =
+        AudioNodeLifetimeReservation::new(BufferSourceDropProbe(Arc::clone(&lifetime_drops)));
+    let construction =
+        AudioControlBatchReservation::new(BufferSourceDropProbe(Arc::clone(&command_drops)));
+    let mut source = AudioBufferSourceNode::new_injected_with_reservations(
+        &base,
+        AudioBufferSourceOptions::default(),
+        Some(lifetime),
+        Some(construction),
+    );
+    assert_eq!(source.registration().id(), AudioNodeId(11));
+    assert_eq!(source.detune().registration().id(), AudioNodeId(12));
+    assert_eq!(source.playback_rate().registration().id(), AudioNodeId(13));
+    source.set_buffer_with_control_reservation(
+        AudioBuffer::from(vec![vec![0.5; crate::RENDER_QUANTUM_SIZE * 4]], 48_000.),
+        AudioControlBatchReservation::new(BufferSourceDropProbe(Arc::clone(&command_drops))),
+    );
+    source.connect(&destination);
+    source.start_at_with_offset_and_duration_with_control_reservation(
+        0.,
+        0.,
+        f64::MAX,
+        AudioControlBatchReservation::new(BufferSourceDropProbe(Arc::clone(&command_drops))),
+    );
+    source.stop_at_with_control_reservation(
+        0.004,
+        AudioControlBatchReservation::new(BufferSourceDropProbe(Arc::clone(&command_drops))),
+    );
+    assert_eq!(lifetime_drops.load(Ordering::Acquire), 0);
+    assert_eq!(command_drops.load(Ordering::Acquire), 0);
+
+    let completion = source.completion_token();
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || completion.is_complete(),
+        "reserved exact BufferSource did not complete",
+    );
+    wait_until(
+        || command_drops.load(Ordering::Acquire) == 4,
+        "construction/runtime command reservations did not follow GC reclamation",
+    );
+    assert_eq!(lifetime_drops.load(Ordering::Acquire), 0);
+    drop(source);
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Graceful);
+    assert!(report.reclaim_issue().is_none());
+    assert_eq!(lifetime_drops.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn exact_buffer_source_payload_token_exhaustion_destroys_storage_under_admission() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 16);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let mut source = AudioBufferSourceNode::new(&base, AudioBufferSourceOptions::default());
+    let submitted_before = constructor.last_submitted_batch_sequence();
+    source
+        .injected_control_for_test()
+        .exhaust_payload_tokens_for_test();
+    let observed_graph_controls = Arc::new(AtomicUsize::new(0));
+    let mut buffer = AudioBuffer::from(vec![vec![0.; 8]], 48_000.);
+    buffer.attach_storage_lease(AudioBufferStorageLease::new(
+        BufferSourceAdmissionDropProbe {
+            gate: fixture.gate.clone(),
+            observed_graph_controls: Arc::clone(&observed_graph_controls),
+        },
+    ));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        source.set_buffer(buffer);
+    }))
+    .is_err());
+    assert_eq!(observed_graph_controls.load(Ordering::Acquire), 1);
+    assert!(source.buffer().is_none());
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        submitted_before
+    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        source.set_loop(true);
+    }))
+    .is_err());
+    assert_eq!(
+        constructor.last_submitted_batch_sequence(),
+        submitted_before
+    );
+
+    let control = PumpControl::new(false, true);
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    drop(source);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+        OutputShutdownMode::Silent
+    );
+}
+
+#[test]
+fn exact_buffer_source_rejected_scalar_and_buffer_leave_host_mirrors_unchanged() {
+    {
+        let fixture = lifecycle_fixture_with_capacity(false, false, 16);
+        let base = fixture.take_exact_base();
+        let constructor = base.injected_node_constructor().unwrap();
+        let mut source = AudioBufferSourceNode::new(&base, AudioBufferSourceOptions::default());
+        let construction_sequence = constructor.last_submitted_batch_sequence();
+        let control = PumpControl::new(false, true);
+        let lifecycle = start(
+            TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+            fixture,
+        )
+        .ok()
+        .unwrap();
+        let InjectedOutputStart::Running(controller) = lifecycle else {
+            panic!("pumping endpoint must start running")
+        };
+        wait_until(
+            || base.applied_control_batch_sequence() >= construction_sequence,
+            "BufferSource construction did not apply before scalar rejection",
+        );
+        wait_until(
+            || constructor.connection_transport_accounting_for_test() == (0, 0, 0, 0),
+            "BufferSource construction credits did not retire before scalar rejection",
+        );
+        source
+            .injected_control_for_test()
+            .fail_next_scalar_commit_for_test();
+        let submitted_before = constructor.last_submitted_batch_sequence();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            source.set_loop(true);
+        }))
+        .is_err());
+        assert!(!source.loop_());
+        assert_eq!(
+            constructor.last_submitted_batch_sequence(),
+            submitted_before
+        );
+        assert_eq!(
+            confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+            OutputShutdownMode::Silent
+        );
+    }
+
+    {
+        let fixture = lifecycle_fixture_with_capacity(false, false, 16);
+        let base = fixture.take_exact_base();
+        let constructor = base.injected_node_constructor().unwrap();
+        let mut source = AudioBufferSourceNode::new(&base, AudioBufferSourceOptions::default());
+        let construction_sequence = constructor.last_submitted_batch_sequence();
+        let control = PumpControl::new(false, true);
+        let lifecycle = start(
+            TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+            fixture,
+        )
+        .ok()
+        .unwrap();
+        let InjectedOutputStart::Running(controller) = lifecycle else {
+            panic!("pumping endpoint must start running")
+        };
+        wait_until(
+            || base.applied_control_batch_sequence() >= construction_sequence,
+            "BufferSource construction did not apply before buffer rejection",
+        );
+        wait_until(
+            || constructor.connection_transport_accounting_for_test() == (0, 0, 0, 0),
+            "BufferSource construction credits did not retire before buffer rejection",
+        );
+        let storage_drops = Arc::new(AtomicUsize::new(0));
+        let command_drops = Arc::new(AtomicUsize::new(0));
+        let mut buffer = AudioBuffer::from(vec![vec![0.; 8]], 48_000.);
+        buffer.attach_storage_lease(AudioBufferStorageLease::new(BufferSourceDropProbe(
+            Arc::clone(&storage_drops),
+        )));
+        source
+            .injected_control_for_test()
+            .fail_next_buffer_commit_for_test();
+        let submitted_before = constructor.last_submitted_batch_sequence();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            source.set_buffer_with_control_reservation(
+                buffer,
+                AudioControlBatchReservation::new(BufferSourceDropProbe(Arc::clone(
+                    &command_drops,
+                ))),
+            );
+        }))
+        .is_err());
+        assert!(source.buffer().is_none());
+        assert_eq!(storage_drops.load(Ordering::Acquire), 1);
+        assert_eq!(command_drops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            constructor.last_submitted_batch_sequence(),
+            submitted_before
+        );
+        assert_eq!(
+            constructor.connection_transport_accounting_for_test(),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+            OutputShutdownMode::Silent
+        );
+    }
+}
+
+#[test]
+fn accepted_buffer_source_finalizers_fail_closed_without_retracting_queue_ownership() {
+    {
+        let fixture = lifecycle_fixture_with_capacity(false, false, 16);
+        let base = fixture.take_exact_base();
+        let constructor = base.injected_node_constructor().unwrap();
+        let mut source = AudioBufferSourceNode::new(&base, AudioBufferSourceOptions::default());
+        source
+            .injected_control_for_test()
+            .panic_next_scalar_finalizer_for_test();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            source.set_loop(true);
+        }))
+        .is_err());
+        assert!(source.loop_());
+        let accepted_sequence = constructor.last_submitted_batch_sequence();
+        let control = PumpControl::new(false, true);
+        let lifecycle = start(
+            TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+            fixture,
+        )
+        .ok()
+        .unwrap();
+        let InjectedOutputStart::Running(controller) = lifecycle else {
+            panic!("pumping endpoint must start running")
+        };
+        wait_until(
+            || base.applied_control_batch_sequence() >= accepted_sequence,
+            "accepted scalar command was retracted after finalizer panic",
+        );
+        assert_eq!(
+            confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+            OutputShutdownMode::Silent
+        );
+    }
+
+    {
+        let fixture = lifecycle_fixture_with_capacity(false, false, 16);
+        let base = fixture.take_exact_base();
+        let constructor = base.injected_node_constructor().unwrap();
+        let mut source = AudioBufferSourceNode::new(&base, AudioBufferSourceOptions::default());
+        source
+            .injected_control_for_test()
+            .panic_next_buffer_finalizer_for_test();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            source.set_buffer(AudioBuffer::from(vec![vec![0.5; 8]], 48_000.));
+        }))
+        .is_err());
+        assert!(source.buffer().is_none());
+        let accepted_sequence = constructor.last_submitted_batch_sequence();
+        let control = PumpControl::new(false, true);
+        let lifecycle = start(
+            TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+            fixture,
+        )
+        .ok()
+        .unwrap();
+        let InjectedOutputStart::Running(controller) = lifecycle else {
+            panic!("pumping endpoint must start running")
+        };
+        wait_until(
+            || base.applied_control_batch_sequence() >= accepted_sequence,
+            "accepted buffer command was retracted after finalizer panic",
+        );
+        assert_eq!(
+            confirmed(wait_receipt(controller.shutdown_silently())).mode(),
+            OutputShutdownMode::Silent
+        );
+    }
+}
+
+#[test]
+fn suspended_exact_buffer_source_commands_preserve_stop_fifo() {
+    let fixture =
+        lifecycle_fixture_inner(true, false, 32, 8, injected_event_dispatch_setup().unwrap());
+    let base = fixture.take_exact_base();
+    let mut source = AudioBufferSourceNode::new(&base, AudioBufferSourceOptions::default());
+    let completion = source.completion_token();
+    source.set_buffer(AudioBuffer::from(
+        vec![vec![0.5; crate::RENDER_QUANTUM_SIZE * 2]],
+        48_000.,
+    ));
+    source.set_loop(true);
+    source.set_loop_start(0.001);
+    source.set_loop_end(0.004);
+    source.connect(&base.destination());
+    source.start_at(0.);
+    source.stop_at(1.);
+    source.stop_at(0.01);
+    let applied_before = base.applied_control_batch_sequence();
+
+    let control = PumpControl::new(false, false);
+    control.max_render_count.store(32, Ordering::Release);
+    let lifecycle = start(
+        TestPrepared::new(
+            format(48_000.),
+            PreparedBehavior::Pump(Arc::clone(&control)),
+        ),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    wait_until(
+        || control.suspend_count.load(Ordering::Acquire) == 1,
+        "initially suspended endpoint was not natively reconciled",
+    );
+    assert_eq!(base.applied_control_batch_sequence(), applied_before);
+    control.release.store(true, Ordering::Release);
+    assert_eq!(
+        wait_state(controller.state_control().resume().unwrap()),
+        InjectedStateChangeOutcome::Applied
+    );
+    wait_until(
+        || control.render_count.load(Ordering::Acquire) == 32,
+        "fixed resumed BufferSource render window did not complete",
+    );
+    assert!(
+        completion.is_complete(),
+        "staged BufferSource Stop FIFO was reversed"
+    );
+    assert!(source.loop_());
+    assert_eq!(source.loop_start(), 0.001);
+    assert_eq!(source.loop_end(), 0.004);
+    assert!(base.applied_control_batch_sequence() >= applied_before + 8);
+    control
+        .max_render_count
+        .store(usize::MAX, Ordering::Release);
+    drop(source);
+    assert_eq!(
+        confirmed(wait_receipt(controller.shutdown_gracefully())).mode(),
+        OutputShutdownMode::Graceful
+    );
+}
+
+#[test]
+fn exact_buffer_source_runtime_wrong_processor_fails_before_watermark_and_reclaims_buffer_off_rt() {
+    let fixture = lifecycle_fixture_with_capacity(false, false, 16);
+    let base = fixture.take_exact_base();
+    let constructor = base.injected_node_constructor().unwrap();
+    let transaction = base
+        .try_begin_injected_audio_buffer_source_with_reservations(None, None)
+        .unwrap();
+    let descriptor = AudioParamDescriptor {
+        name: String::new(),
+        min_value: f32::MIN,
+        max_value: f32::MAX,
+        default_value: 0.,
+        automation_rate: AutomationRate::K,
+    };
+    let (detune_raw, detune_processor) = injected_audio_param_raw_parts(descriptor.clone());
+    let (playback_raw, playback_processor) = injected_audio_param_raw_parts(descriptor);
+    let channel_config = ChannelConfigInner {
+        count: 1,
+        count_mode: ChannelCountMode::Explicit,
+        interpretation: ChannelInterpretation::Discrete,
+    };
+    let constructed = transaction
+        .commit(InjectedAudioBufferSourcePayload {
+            playback_rate_processor: playback_processor,
+            detune_processor,
+            source_processor: Box::new(PanicOnMessageProcessor),
+            param_channel_config: channel_config.clone(),
+            source_channel_config: channel_config,
+            playback_rate_initial_value: playback_raw.set_initial_value_for_injected(1.),
+            detune_initial_value: detune_raw.set_initial_value_for_injected(0.),
+            loop_enabled: false,
+            loop_start: 0.,
+            loop_end: 0.,
+        })
+        .unwrap();
+    let construction_sequence = constructor.last_submitted_batch_sequence();
+    let storage_drops = Arc::new(AtomicUsize::new(0));
+    let dropped_off_render = Arc::new(AtomicBool::new(false));
+    let control = PumpControl::new(false, true);
+    let mut buffer = AudioBuffer::from(vec![vec![0.; 8]], 48_000.);
+    buffer.attach_storage_lease(AudioBufferStorageLease::new(
+        BufferSourceOffRenderDropProbe {
+            control: Arc::clone(&control),
+            drops: Arc::clone(&storage_drops),
+            dropped_off_render: Arc::clone(&dropped_off_render),
+        },
+    ));
+    constructed.source_control.try_set_buffer(buffer).unwrap();
+    let failed_sequence = constructor.last_submitted_batch_sequence();
+
+    let lifecycle = start(
+        TestPrepared::new(format(48_000.), PreparedBehavior::Pump(control)),
+        fixture,
+    )
+    .ok()
+    .unwrap();
+    let InjectedOutputStart::Running(controller) = lifecycle else {
+        panic!("pumping endpoint must start running")
+    };
+    let report = confirmed(wait_receipt(controller.shutdown_gracefully()));
+    assert_eq!(report.mode(), OutputShutdownMode::Silent);
+    assert_eq!(base.applied_control_batch_sequence(), construction_sequence);
+    assert!(construction_sequence < failed_sequence);
+    assert!(constructor.control().render_protocol_failed_for_test());
+    drop(constructed);
+    assert_eq!(storage_drops.load(Ordering::Acquire), 1);
+    assert!(dropped_off_render.load(Ordering::Acquire));
 }
 
 #[test]
