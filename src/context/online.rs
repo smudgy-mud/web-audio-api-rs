@@ -338,6 +338,58 @@ impl AudioContext {
         )
     }
 
+    /// Constructs a hosted `ConstantSourceNode` while attaching host accounting to the source
+    /// and its offset parameter.
+    ///
+    /// The reservation is released only after both exact graph nodes are physically reclaimed,
+    /// or after rejected construction has fully rolled back. This operation is available only on
+    /// contexts returned by [`AudioContext::builder`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a legacy context or when exact construction is rejected.
+    pub fn create_constant_source_with_lifetime_reservation(
+        &self,
+        reservation: AudioNodeLifetimeReservation,
+    ) -> node::ConstantSourceNode {
+        assert!(
+            self.is_hosted(),
+            "NotSupportedError - lifetime reservations require an exact hosted AudioContext"
+        );
+        node::ConstantSourceNode::new_injected_with_lifetime(
+            &self.base,
+            node::ConstantSourceOptions::default(),
+            Some(reservation),
+        )
+    }
+
+    /// Constructs a hosted `ConstantSourceNode` with exact graph-lifetime and four-command
+    /// reservations.
+    ///
+    /// The command reservation remains held through suspension, renderer application, and
+    /// off-render-thread batch reclamation. Rejected construction releases both reservations only
+    /// after rollback. This operation is available only on hosted contexts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a legacy context or when exact construction is rejected.
+    pub fn create_constant_source_with_reservations(
+        &self,
+        lifetime: AudioNodeLifetimeReservation,
+        control: AudioControlBatchReservation,
+    ) -> node::ConstantSourceNode {
+        assert!(
+            self.is_hosted(),
+            "NotSupportedError - resource reservations require an exact hosted AudioContext"
+        );
+        node::ConstantSourceNode::new_injected_with_reservations(
+            &self.base,
+            node::ConstantSourceOptions::default(),
+            Some(lifetime),
+            Some(control),
+        )
+    }
+
     /// Constructs a hosted fixed-wave `OscillatorNode` while attaching host accounting to all
     /// three exact graph nodes (oscillator, frequency, and detune).
     ///
@@ -1353,7 +1405,10 @@ mod tests {
         AudioExplicitConnectionReservationProvider, AudioGraphConnectionReservation, AudioNodeId,
     };
     use crate::message::ControlBatchSender;
-    use crate::node::{AudioNode, AudioNodeDisconnectSelector, AudioScheduledSourceNode};
+    use crate::node::{
+        AudioNode, AudioNodeDisconnectSelector, AudioScheduledSourceNode,
+        AudioScheduledSourceNodeExt,
+    };
     use crate::node::{ChannelCountMode, ChannelInterpretation};
     use crate::output::{
         audio_render_thread_pair, AudioOutputConfig, AudioOutputContextId,
@@ -1836,6 +1891,25 @@ mod tests {
         }
         assert!(probe.saw_nonzero.load(AtomicOrdering::Acquire));
 
+        probe.saw_nonzero.store(false, AtomicOrdering::Release);
+        let mut constant = context.create_constant_source();
+        constant.offset().set_value(0.125);
+        constant.connect(&context.destination());
+        let constant_ended = Arc::new(AtomicBool::new(false));
+        let constant_ended_callback = Arc::clone(&constant_ended);
+        constant.set_onended(move |_| constant_ended_callback.store(true, AtomicOrdering::Release));
+        constant.start();
+        constant.stop_at(context.current_time() + 0.02);
+        while !constant_ended.load(AtomicOrdering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "hosted ConstantSource never ended"
+            );
+            thread::yield_now();
+        }
+        assert!(constant.completion_token().is_complete());
+        assert!(probe.saw_nonzero.load(AtomicOrdering::Acquire));
+
         assert_eq!(
             context.request_suspend().unwrap().wait(),
             AudioContextStateChangeOutcome::Applied
@@ -1888,15 +1962,19 @@ mod tests {
 
         let gain_dropped = Arc::new(AtomicBool::new(false));
         let oscillator_dropped = Arc::new(AtomicBool::new(false));
+        let constant_source_dropped = Arc::new(AtomicBool::new(false));
         let buffer_source_dropped = Arc::new(AtomicBool::new(false));
         let gain_commands_dropped = Arc::new(AtomicBool::new(false));
         let oscillator_commands_dropped = Arc::new(AtomicBool::new(false));
+        let constant_source_commands_dropped = Arc::new(AtomicBool::new(false));
         let buffer_source_commands_dropped = Arc::new(AtomicBool::new(false));
         let buffer_payload_command_dropped = Arc::new(AtomicBool::new(false));
         let buffer_start_command_dropped = Arc::new(AtomicBool::new(false));
         let buffer_stop_command_dropped = Arc::new(AtomicBool::new(false));
         let start_command_dropped = Arc::new(AtomicBool::new(false));
         let stop_command_dropped = Arc::new(AtomicBool::new(false));
+        let constant_start_command_dropped = Arc::new(AtomicBool::new(false));
+        let constant_stop_command_dropped = Arc::new(AtomicBool::new(false));
         let gain = context.create_gain_with_reservations(
             AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&gain_dropped))),
             AudioControlBatchReservation::new(DropProbe(Arc::clone(&gain_commands_dropped))),
@@ -1912,6 +1990,24 @@ mod tests {
         oscillator.stop_at_with_control_reservation(
             0.01,
             AudioControlBatchReservation::new(DropProbe(Arc::clone(&stop_command_dropped))),
+        );
+        let mut constant_source = context.create_constant_source_with_reservations(
+            AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&constant_source_dropped))),
+            AudioControlBatchReservation::new(DropProbe(Arc::clone(
+                &constant_source_commands_dropped,
+            ))),
+        );
+        constant_source.start_at_with_control_reservation(
+            0.,
+            AudioControlBatchReservation::new(DropProbe(Arc::clone(
+                &constant_start_command_dropped,
+            ))),
+        );
+        constant_source.stop_at_with_control_reservation(
+            0.01,
+            AudioControlBatchReservation::new(DropProbe(Arc::clone(
+                &constant_stop_command_dropped,
+            ))),
         );
         let mut buffer_source = context.create_buffer_source_with_reservations(
             AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&buffer_source_dropped))),
@@ -1937,21 +2033,26 @@ mod tests {
         );
         drop(gain);
         drop(oscillator);
+        drop(constant_source);
         drop(buffer_source);
 
         // Construction is staged and the renderer has not been allowed to observe either graph
         // insertion or teardown. Wrapper destruction alone must not release host accounting.
         assert!(!gain_dropped.load(AtomicOrdering::Acquire));
         assert!(!oscillator_dropped.load(AtomicOrdering::Acquire));
+        assert!(!constant_source_dropped.load(AtomicOrdering::Acquire));
         assert!(!buffer_source_dropped.load(AtomicOrdering::Acquire));
         assert!(!gain_commands_dropped.load(AtomicOrdering::Acquire));
         assert!(!oscillator_commands_dropped.load(AtomicOrdering::Acquire));
+        assert!(!constant_source_commands_dropped.load(AtomicOrdering::Acquire));
         assert!(!buffer_source_commands_dropped.load(AtomicOrdering::Acquire));
         assert!(!buffer_payload_command_dropped.load(AtomicOrdering::Acquire));
         assert!(!buffer_start_command_dropped.load(AtomicOrdering::Acquire));
         assert!(!buffer_stop_command_dropped.load(AtomicOrdering::Acquire));
         assert!(!start_command_dropped.load(AtomicOrdering::Acquire));
         assert!(!stop_command_dropped.load(AtomicOrdering::Acquire));
+        assert!(!constant_start_command_dropped.load(AtomicOrdering::Acquire));
+        assert!(!constant_stop_command_dropped.load(AtomicOrdering::Acquire));
 
         suspend_release.send(()).unwrap();
         assert_eq!(
@@ -1960,15 +2061,19 @@ mod tests {
         );
         while !gain_dropped.load(AtomicOrdering::Acquire)
             || !oscillator_dropped.load(AtomicOrdering::Acquire)
+            || !constant_source_dropped.load(AtomicOrdering::Acquire)
             || !buffer_source_dropped.load(AtomicOrdering::Acquire)
             || !gain_commands_dropped.load(AtomicOrdering::Acquire)
             || !oscillator_commands_dropped.load(AtomicOrdering::Acquire)
+            || !constant_source_commands_dropped.load(AtomicOrdering::Acquire)
             || !buffer_source_commands_dropped.load(AtomicOrdering::Acquire)
             || !buffer_payload_command_dropped.load(AtomicOrdering::Acquire)
             || !buffer_start_command_dropped.load(AtomicOrdering::Acquire)
             || !buffer_stop_command_dropped.load(AtomicOrdering::Acquire)
             || !start_command_dropped.load(AtomicOrdering::Acquire)
             || !stop_command_dropped.load(AtomicOrdering::Acquire)
+            || !constant_start_command_dropped.load(AtomicOrdering::Acquire)
+            || !constant_stop_command_dropped.load(AtomicOrdering::Acquire)
         {
             assert!(
                 Instant::now() < deadline,

@@ -927,6 +927,10 @@ pub(crate) struct InjectedAudioParamValueReservation(ControlBatchReservation);
 #[must_use]
 pub(crate) struct InjectedOscillatorCommandReservation(ControlBatchReservation);
 
+/// Dedicated one-command reservation for an exact ConstantSource start/stop update.
+#[must_use]
+pub(crate) struct InjectedConstantSourceCommandReservation(ControlBatchReservation);
+
 impl ControlBatchReservation {
     pub(super) fn with_host_reservation(
         mut self,
@@ -1023,6 +1027,16 @@ impl InjectedOscillatorCommandReservation {
     ) -> PreparedControlBatch {
         self.0
             .into_prevalidated(vec![ControlMessage::InjectedOscillator(value)])
+    }
+}
+
+impl InjectedConstantSourceCommandReservation {
+    pub(crate) fn prepare(
+        self,
+        value: super::injected_node_construction::InjectedConstantSourceWireCommand,
+    ) -> PreparedControlBatch {
+        self.0
+            .into_prevalidated(vec![ControlMessage::InjectedConstantSource(value)])
     }
 }
 
@@ -1559,6 +1573,21 @@ impl InjectedControlProducer {
     ) -> Result<InjectedOscillatorCommandReservation, InjectedControlError> {
         self.try_begin_operation_with_host_reservation(1, host_reservation)
             .map(InjectedOscillatorCommandReservation)
+    }
+
+    pub(crate) fn try_begin_constant_source_command(
+        &self,
+    ) -> Result<InjectedConstantSourceCommandReservation, InjectedControlError> {
+        self.try_begin_operation(1)
+            .map(InjectedConstantSourceCommandReservation)
+    }
+
+    pub(crate) fn try_begin_constant_source_command_with_host_reservation(
+        &self,
+        host_reservation: AudioControlBatchReservation,
+    ) -> Result<InjectedConstantSourceCommandReservation, InjectedControlError> {
+        self.try_begin_operation_with_host_reservation(1, host_reservation)
+            .map(InjectedConstantSourceCommandReservation)
     }
 
     /// Latches an impossible typed-transaction shape mismatch as terminal while its caller still
