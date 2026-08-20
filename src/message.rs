@@ -1017,6 +1017,10 @@ pub(crate) enum ControlMessage {
     /// Fixed, non-general exact oscillator start/stop/type command.
     InjectedOscillator(crate::context::InjectedOscillatorWireCommand),
 
+    /// Owned, preboxed exact oscillator PeriodicWave command. The renderer always moves the inner
+    /// node to off-thread GC after routing or protocol failure.
+    InjectedOscillatorPeriodicWave(crate::context::InjectedOscillatorPeriodicWaveWireCommand),
+
     /// Fixed, non-general exact ConstantSource start/stop command.
     InjectedConstantSource(crate::context::InjectedConstantSourceWireCommand),
 

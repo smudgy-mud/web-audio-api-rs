@@ -119,9 +119,9 @@ enum Schedule {
 /// It can generate a few common waveforms (i.e. sine, square, sawtooth, triangle),
 /// or can be set to an arbitrary periodic waveform using a [`PeriodicWave`] object.
 ///
-/// The private exact hosted-output path currently supports only the four fixed waveforms. Custom
-/// `PeriodicWave` construction and [`OscillatorNode::set_periodic_wave`] remain available to
-/// legacy contexts and are deliberately rejected before mutation on that exact path.
+/// Exact hosted contexts additionally bind each custom wave to its creating context and move its
+/// fixed native table through bounded construction or owned replacement commands. Replaced tables
+/// and their host leases are reclaimed off the render thread.
 ///
 /// - MDN documentation: <https://developer.mozilla.org/en-US/docs/Web/API/OscillatorNode>
 /// - specification: <https://webaudio.github.io/web-audio-api/#OscillatorNode>
@@ -242,6 +242,11 @@ impl OscillatorNode {
     ///
     /// * `context` - The `AudioContext`
     /// * `options` - The OscillatorOptions
+    ///
+    /// # Panics
+    ///
+    /// Panics for an invalid custom-wave combination, a `PeriodicWave` from another context, or
+    /// when exact hosted construction cannot acquire its bounded resources.
     pub fn new<C: BaseAudioContext>(context: &C, options: OscillatorOptions) -> Self {
         if context.base().injected_node_constructor().is_some() {
             return Self::new_injected(context.base(), options);
@@ -253,6 +258,12 @@ impl OscillatorNode {
             audio_node_options: channel_config,
             periodic_wave,
         } = options;
+        assert!(
+            !periodic_wave
+                .as_ref()
+                .is_some_and(PeriodicWave::is_injected_context_bound),
+            "InvalidAccessError - PeriodicWave belongs to another AudioContext"
+        );
 
         let mut node = context.base().register(move |registration| {
             let sample_rate = context.sample_rate();
@@ -346,12 +357,34 @@ impl OscillatorNode {
             periodic_wave,
         } = options;
         assert!(
-            periodic_wave.is_none() && type_ != OscillatorType::Custom,
-            "NotSupportedError - custom PeriodicWave oscillators are not available on the exact injected context"
+            periodic_wave.is_some() || type_ != OscillatorType::Custom,
+            "InvalidStateError - a custom oscillator requires a PeriodicWave"
         );
-        let transaction = context
-            .try_begin_injected_oscillator_with_reservations(type_, lifetime, control)
-            .unwrap_or_else(|error| panic!("injected Oscillator admission failed: {error:?}"));
+        let initial_type = if periodic_wave.is_some() {
+            OscillatorType::Custom
+        } else {
+            type_
+        };
+        let transaction = match periodic_wave.as_ref() {
+            Some(periodic_wave) => context.try_begin_injected_custom_oscillator_with_reservations(
+                periodic_wave,
+                lifetime,
+                control,
+            ),
+            None => {
+                context.try_begin_injected_oscillator_with_reservations(type_, lifetime, control)
+            }
+        }
+        .unwrap_or_else(|error| match error {
+            crate::context::InjectedOscillatorConstructionError::ForeignPeriodicWave => {
+                panic!("InvalidAccessError - PeriodicWave belongs to another AudioContext")
+            }
+            error => panic!("injected Oscillator admission failed: {error:?}"),
+        });
+        // Rebind the owned wave after the admitted transaction. From this point through renderer
+        // boxing and commit, unwind destroys the wave/processor before the transaction releases
+        // graph admission, even though options were necessarily destructured first.
+        let periodic_wave = periodic_wave;
         let oscillator_id = transaction.oscillator_id();
         let frequency_id = transaction.frequency_id();
         let detune_id = transaction.detune_id();
@@ -385,11 +418,12 @@ impl OscillatorNode {
         }
         .into();
         let renderer = Box::new(OscillatorRenderer::new_exact(
-            type_,
+            initial_type,
             AudioParamId::from_node_id(frequency_id),
             AudioParamId::from_node_id(detune_id),
             completion.clone(),
             transaction.completion_key(),
+            periodic_wave,
         ));
         let constructed = transaction
             .commit(InjectedOscillatorPayload {
@@ -458,7 +492,7 @@ impl OscillatorNode {
             channel_config,
             frequency,
             detune,
-            type_,
+            type_: initial_type,
             has_start: false,
             completion,
             injected_control: Some(constructed.oscillator_control),
@@ -525,8 +559,34 @@ impl OscillatorNode {
         let control = self.injected_control.as_ref().unwrap_or_else(|| {
             panic!("NotSupportedError - control reservations require an exact hosted oscillator")
         });
+        if control.type_() == OscillatorType::Custom {
+            drop(reservation);
+            return;
+        }
         finish_exact_oscillator_mutation(
             control.try_set_type_with_host_reservation(type_, reservation),
+        );
+    }
+
+    /// Installs a custom waveform on an exact hosted oscillator while attaching one host
+    /// reservation to the owned one-command batch.
+    ///
+    /// The wave's storage lease and the command reservation remain charged through suspended
+    /// staging, renderer replacement, and off-render-thread reclamation.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a legacy oscillator, a wave from another context, or rejected exact control.
+    pub fn set_periodic_wave_with_control_reservation(
+        &mut self,
+        periodic_wave: PeriodicWave,
+        reservation: AudioControlBatchReservation,
+    ) {
+        let control = self.injected_control.as_ref().unwrap_or_else(|| {
+            panic!("NotSupportedError - control reservations require an exact hosted oscillator")
+        });
+        finish_exact_oscillator_mutation(
+            control.try_set_periodic_wave_with_host_reservation(periodic_wave, reservation),
         );
     }
 
@@ -582,6 +642,9 @@ impl OscillatorNode {
         );
 
         if let Some(control) = &self.injected_control {
+            if control.type_() == OscillatorType::Custom {
+                return;
+            }
             finish_exact_oscillator_mutation(control.try_set_type(type_));
             return;
         }
@@ -600,14 +663,20 @@ impl OscillatorNode {
     /// Calling this sets the oscillator type to `custom`, once set to `custom`
     /// the oscillator cannot be reverted back to a standard waveform.
     ///
+    /// Exact hosted oscillators accept only a `PeriodicWave` created for that same context.
+    ///
     /// # Panics
     ///
-    /// Panics with `NotSupportedError` on the private exact injected context, whose current
-    /// fixed-wave slice deliberately excludes custom `PeriodicWave` storage and transport.
+    /// Panics when an exact oscillator receives a wave from another context, or when its bounded
+    /// owned-payload command is rejected.
     pub fn set_periodic_wave(&mut self, periodic_wave: PeriodicWave) {
+        if let Some(control) = &self.injected_control {
+            finish_exact_oscillator_mutation(control.try_set_periodic_wave(periodic_wave));
+            return;
+        }
         assert!(
-            self.injected_control.is_none(),
-            "NotSupportedError - custom PeriodicWave oscillators are not available on the exact injected context"
+            !periodic_wave.is_injected_context_bound(),
+            "InvalidAccessError - PeriodicWave belongs to another AudioContext"
         );
         self.type_ = OscillatorType::Custom;
         self.registration.post_message(periodic_wave);
@@ -627,6 +696,12 @@ fn finish_exact_oscillator_mutation(
         }
         Err(InjectedOscillatorMutationError::CustomType) => {
             panic!("InvalidStateError: Custom type cannot be set manually")
+        }
+        Err(InjectedOscillatorMutationError::ForeignPeriodicWave) => {
+            panic!("InvalidAccessError - PeriodicWave belongs to another AudioContext")
+        }
+        Err(InjectedOscillatorMutationError::PayloadIdentityExhausted) => {
+            panic!("InvalidStateError - exact PeriodicWave command identity exhausted")
         }
         Err(InjectedOscillatorMutationError::Inactive) => {
             panic!("InvalidStateError - exact oscillator is no longer active")
@@ -767,6 +842,18 @@ impl AudioProcessor for OscillatorRenderer {
     }
 
     fn onmessage(&mut self, msg: &mut dyn Any) {
+        if let Some(message) =
+            msg.downcast_mut::<crate::context::InjectedOscillatorPeriodicWaveRenderMessage>()
+        {
+            let Some(key) = self.exact_key else {
+                return;
+            };
+            if message.apply_to(key, &mut self.periodic_wave) {
+                self.type_ = OscillatorType::Custom;
+            }
+            return;
+        }
+
         if let Some(message) = msg.downcast_mut::<crate::context::InjectedOscillatorRenderMessage>()
         {
             let Some(key) = self.exact_key else {
@@ -830,7 +917,13 @@ impl OscillatorRenderer {
         detune: AudioParamId,
         completion: ScheduledSourceCompletionToken,
         exact_key: crate::events::ExactEndedEventKey,
+        periodic_wave: Option<PeriodicWave>,
     ) -> Self {
+        assert_eq!(
+            type_ == OscillatorType::Custom,
+            periodic_wave.is_some(),
+            "exact custom oscillator construction must own exactly one PeriodicWave"
+        );
         Self {
             type_,
             frequency,
@@ -839,7 +932,7 @@ impl OscillatorRenderer {
             start_time: f64::MAX,
             stop_time: f64::MAX,
             started: false,
-            periodic_wave: None,
+            periodic_wave,
             ended_triggered: false,
             completion,
             sine_table: precomputed_sine_table(),

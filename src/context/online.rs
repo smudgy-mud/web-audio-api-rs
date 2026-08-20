@@ -430,13 +430,37 @@ impl AudioContext {
         lifetime: AudioNodeLifetimeReservation,
         control: AudioControlBatchReservation,
     ) -> node::OscillatorNode {
+        self.create_oscillator_with_options_and_reservations(
+            node::OscillatorOptions::default(),
+            lifetime,
+            control,
+        )
+    }
+
+    /// Constructs a hosted `OscillatorNode` with caller-selected options and exact graph/control
+    /// reservations.
+    ///
+    /// A custom oscillator must carry a [`crate::PeriodicWave`] created for this same context. Its
+    /// fixed native table and host lease move into the atomic seven-command construction and remain
+    /// owned through renderer retirement.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a legacy context, an invalid custom-wave combination, a foreign wave, or rejected
+    /// exact construction.
+    pub fn create_oscillator_with_options_and_reservations(
+        &self,
+        options: node::OscillatorOptions,
+        lifetime: AudioNodeLifetimeReservation,
+        control: AudioControlBatchReservation,
+    ) -> node::OscillatorNode {
         assert!(
             self.is_hosted(),
             "NotSupportedError - resource reservations require an exact hosted AudioContext"
         );
         node::OscillatorNode::new_injected_with_reservations(
             &self.base,
-            node::OscillatorOptions::default(),
+            options,
             Some(lifetime),
             Some(control),
         )
@@ -1962,6 +1986,7 @@ mod tests {
 
         let gain_dropped = Arc::new(AtomicBool::new(false));
         let oscillator_dropped = Arc::new(AtomicBool::new(false));
+        let oscillator_wave_dropped = Arc::new(AtomicBool::new(false));
         let constant_source_dropped = Arc::new(AtomicBool::new(false));
         let buffer_source_dropped = Arc::new(AtomicBool::new(false));
         let gain_commands_dropped = Arc::new(AtomicBool::new(false));
@@ -1979,10 +2004,24 @@ mod tests {
             AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&gain_dropped))),
             AudioControlBatchReservation::new(DropProbe(Arc::clone(&gain_commands_dropped))),
         );
-        let mut oscillator = context.create_oscillator_with_reservations(
+        let periodic_wave = crate::PeriodicWave::new_with_storage_lease(
+            &context,
+            crate::PeriodicWaveOptions {
+                real: Some(vec![0., 0.]),
+                imag: Some(vec![0., 1.]),
+                disable_normalization: false,
+            },
+            crate::PeriodicWaveStorageLease::new(DropProbe(Arc::clone(&oscillator_wave_dropped))),
+        );
+        let mut oscillator = context.create_oscillator_with_options_and_reservations(
+            node::OscillatorOptions {
+                periodic_wave: Some(periodic_wave),
+                ..node::OscillatorOptions::default()
+            },
             AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&oscillator_dropped))),
             AudioControlBatchReservation::new(DropProbe(Arc::clone(&oscillator_commands_dropped))),
         );
+        assert_eq!(oscillator.type_(), node::OscillatorType::Custom);
         oscillator.start_at_with_control_reservation(
             0.,
             AudioControlBatchReservation::new(DropProbe(Arc::clone(&start_command_dropped))),
@@ -2040,6 +2079,7 @@ mod tests {
         // insertion or teardown. Wrapper destruction alone must not release host accounting.
         assert!(!gain_dropped.load(AtomicOrdering::Acquire));
         assert!(!oscillator_dropped.load(AtomicOrdering::Acquire));
+        assert!(!oscillator_wave_dropped.load(AtomicOrdering::Acquire));
         assert!(!constant_source_dropped.load(AtomicOrdering::Acquire));
         assert!(!buffer_source_dropped.load(AtomicOrdering::Acquire));
         assert!(!gain_commands_dropped.load(AtomicOrdering::Acquire));
@@ -2061,6 +2101,7 @@ mod tests {
         );
         while !gain_dropped.load(AtomicOrdering::Acquire)
             || !oscillator_dropped.load(AtomicOrdering::Acquire)
+            || !oscillator_wave_dropped.load(AtomicOrdering::Acquire)
             || !constant_source_dropped.load(AtomicOrdering::Acquire)
             || !buffer_source_dropped.load(AtomicOrdering::Acquire)
             || !gain_commands_dropped.load(AtomicOrdering::Acquire)

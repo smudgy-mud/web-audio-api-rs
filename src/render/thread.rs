@@ -870,6 +870,41 @@ impl RenderThread {
                     self.fail_injected_render_protocol();
                 }
             }
+            InjectedOscillatorPeriodicWave(mut value) => {
+                let id = value.id();
+                let Some(mut message) = value.take_render_message() else {
+                    self.fail_injected_render_protocol();
+                };
+                // A corrupt/wrong processor may panic while consuming the authenticated payload.
+                // Contain that unwind until the preboxed message has moved to GC; otherwise its
+                // PeriodicWave storage lease could be destroyed on the render callback thread.
+                let routed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.graph
+                        .as_mut()
+                        .is_some_and(|graph| graph.try_route_message(id, message.as_mut()))
+                }));
+                let applied = message
+                    .as_ref()
+                    .downcast_ref::<crate::context::InjectedOscillatorPeriodicWaveRenderMessage>()
+                    .is_some_and(
+                        crate::context::InjectedOscillatorPeriodicWaveRenderMessage::was_applied,
+                    );
+                if let Some(gc) = self.garbage_collector.as_mut() {
+                    gc.push(message);
+                } else {
+                    // Exact output construction always installs GC. If that invariant is broken,
+                    // leak fail-closed rather than destroying a host storage lease on the RT.
+                    std::mem::forget(message);
+                }
+                match routed {
+                    Ok(true) if applied => {}
+                    Ok(_) => self.fail_injected_render_protocol(),
+                    Err(payload) => {
+                        std::mem::forget(payload);
+                        self.fail_injected_render_protocol();
+                    }
+                }
+            }
             InjectedConstantSource(value) => {
                 let mut message = value.into_render_message();
                 let routed = self
