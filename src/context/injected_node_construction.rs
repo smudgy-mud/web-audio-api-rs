@@ -3,7 +3,9 @@
 //! This is a production capability but not a public context constructor. It binds the exact
 //! control transport, node-id allocator, and lifetime registry. It implements exact two-node Gain
 //! and three-node fixed-wave Oscillator transactions without exposing any of those authorities
-//! separately. Custom `PeriodicWave` oscillators remain outside this private slice.
+//! separately. ConstantSource reuses the same exact two-node transaction shape as Gain while
+//! retaining a distinct scheduled-source command brand. Custom `PeriodicWave` oscillators remain
+//! outside this private slice.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -47,6 +49,21 @@ const GAIN_COMMAND_COUNT: usize = 4;
 const GAIN_NODE_COUNT: usize = 2;
 const GAIN_ID_INDEX: usize = 0;
 const PARAM_ID_INDEX: usize = 1;
+
+#[derive(Clone, Copy)]
+enum InjectedTwoNodeKind {
+    Gain,
+    ConstantSource,
+}
+
+impl InjectedTwoNodeKind {
+    const fn node_inputs(self) -> usize {
+        match self {
+            Self::Gain => 1,
+            Self::ConstantSource => 0,
+        }
+    }
+}
 
 const OSCILLATOR_COMMAND_COUNT: usize = 7;
 const OSCILLATOR_NODE_COUNT: usize = 3;
@@ -428,6 +445,298 @@ impl FailClosedOscillatorRollback {
 }
 
 impl Drop for FailClosedOscillatorRollback {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control.fail_closed_protocol();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum InjectedConstantSourceCommandKind {
+    Start(f64),
+    Stop(f64),
+}
+
+/// Fixed wire command constructible only by an accepted exact ConstantSource capability.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InjectedConstantSourceWireCommand {
+    id: AudioNodeId,
+    key: ExactEndedEventKey,
+    command: InjectedConstantSourceCommandKind,
+}
+
+/// Stack-only renderer dispatch wrapper. The target processor must authenticate the exact
+/// scheduled-source generation before the render thread publishes the batch watermark.
+pub(crate) struct InjectedConstantSourceRenderMessage {
+    wire: InjectedConstantSourceWireCommand,
+    applied: bool,
+}
+
+impl InjectedConstantSourceWireCommand {
+    pub(crate) fn into_render_message(self) -> InjectedConstantSourceRenderMessage {
+        InjectedConstantSourceRenderMessage {
+            wire: self,
+            applied: false,
+        }
+    }
+}
+
+impl InjectedConstantSourceRenderMessage {
+    pub(crate) const fn id(&self) -> AudioNodeId {
+        self.wire.id
+    }
+
+    pub(crate) fn apply_to(
+        &mut self,
+        expected: ExactEndedEventKey,
+    ) -> Option<InjectedConstantSourceCommandKind> {
+        if self.wire.key != expected || self.applied {
+            return None;
+        }
+        self.applied = true;
+        Some(self.wire.command)
+    }
+
+    pub(crate) const fn was_applied(&self) -> bool {
+        self.applied
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedConstantSourceMutationError {
+    Control(InjectedControlError),
+    AcceptedFinalizer(AcceptedBatchFinalizeFailure),
+    DuplicateStart,
+    StopBeforeStart,
+    Inactive,
+    SerializerPoisoned,
+    RejectedPayloadPanicked,
+    ProtocolViolation,
+}
+
+/// Weak post-construction command capability for one exact ConstantSource generation.
+pub(crate) struct InjectedConstantSourceControl {
+    control: InjectedControlProducer,
+    node_ids: InjectedNodeIdIdentity,
+    id: AudioNodeId,
+    lifetime: InjectedNodeRegistrationIdentity,
+    ended: InjectedExactEndedEventTarget,
+    serializer: Arc<Mutex<()>>,
+    has_start: Arc<AtomicBool>,
+    #[cfg(test)]
+    runtime_behavior: Arc<AtomicU8>,
+}
+
+impl std::fmt::Debug for InjectedConstantSourceControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InjectedConstantSourceControl")
+            .field("id", &self.id)
+            .field("has_start", &self.has_start())
+            .finish_non_exhaustive()
+    }
+}
+
+impl InjectedConstantSourceControl {
+    pub(crate) fn ended_target(&self) -> InjectedExactEndedEventTarget {
+        self.ended.clone()
+    }
+
+    pub(crate) fn matches_registration(
+        &self,
+        registration: &AudioContextRegistration,
+        constructor: &InjectedNodeConstructor,
+    ) -> bool {
+        self.id == registration.id()
+            && constructor.matches_control_identity(&self.control.identity())
+            && constructor.matches_node_id_identity(&self.node_ids)
+            && registration.matches_injected_lifetime_identity(&self.lifetime)
+    }
+
+    pub(crate) fn has_start(&self) -> bool {
+        self.has_start.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn try_start(
+        &self,
+        when: f64,
+    ) -> Result<CommitControlOutcome, InjectedConstantSourceMutationError> {
+        self.try_command(InjectedConstantSourceCommandKind::Start(when), None)
+    }
+
+    pub(crate) fn try_start_with_host_reservation(
+        &self,
+        when: f64,
+        reservation: AudioControlBatchReservation,
+    ) -> Result<CommitControlOutcome, InjectedConstantSourceMutationError> {
+        self.try_command(
+            InjectedConstantSourceCommandKind::Start(when),
+            Some(reservation),
+        )
+    }
+
+    pub(crate) fn try_stop(
+        &self,
+        when: f64,
+    ) -> Result<CommitControlOutcome, InjectedConstantSourceMutationError> {
+        self.try_command(InjectedConstantSourceCommandKind::Stop(when), None)
+    }
+
+    pub(crate) fn try_stop_with_host_reservation(
+        &self,
+        when: f64,
+        reservation: AudioControlBatchReservation,
+    ) -> Result<CommitControlOutcome, InjectedConstantSourceMutationError> {
+        self.try_command(
+            InjectedConstantSourceCommandKind::Stop(when),
+            Some(reservation),
+        )
+    }
+
+    fn try_command(
+        &self,
+        command: InjectedConstantSourceCommandKind,
+        host_reservation: Option<AudioControlBatchReservation>,
+    ) -> Result<CommitControlOutcome, InjectedConstantSourceMutationError> {
+        let _serialized = self
+            .serializer
+            .lock()
+            .map_err(|_| InjectedConstantSourceMutationError::SerializerPoisoned)?;
+        match command {
+            InjectedConstantSourceCommandKind::Start(_) if self.has_start() => {
+                return Err(InjectedConstantSourceMutationError::DuplicateStart)
+            }
+            InjectedConstantSourceCommandKind::Stop(_) if !self.has_start() => {
+                return Err(InjectedConstantSourceMutationError::StopBeforeStart)
+            }
+            _ => {}
+        }
+        let reservation = match host_reservation {
+            Some(host_reservation) => self
+                .control
+                .try_begin_constant_source_command_with_host_reservation(host_reservation),
+            None => self.control.try_begin_constant_source_command(),
+        }
+        .map_err(InjectedConstantSourceMutationError::Control)?;
+        if !self.lifetime.is_live_for(self.id) {
+            return Err(InjectedConstantSourceMutationError::Inactive);
+        }
+        let wire = InjectedConstantSourceWireCommand {
+            id: self.id,
+            key: self.ended.render_key(),
+            command,
+        };
+        let batch = reservation.prepare(wire);
+        #[cfg(test)]
+        if self
+            .runtime_behavior
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.control.fail_closed_protocol();
+        }
+        let has_start = &self.has_start;
+        #[cfg(test)]
+        let runtime_behavior = &self.runtime_behavior;
+        match self.control.try_commit_with_finalize(batch, move |_| {
+            if matches!(command, InjectedConstantSourceCommandKind::Start(_)) {
+                has_start.store(true, Ordering::Release);
+            }
+            #[cfg(test)]
+            if runtime_behavior
+                .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                panic!("forced exact ConstantSource accepted-finalizer panic");
+            }
+            Ok(())
+        }) {
+            Ok(outcome) => Ok(outcome),
+            Err(CommitWithFinalizeFailure::AcceptedFinalizer(failure)) => Err(
+                InjectedConstantSourceMutationError::AcceptedFinalizer(failure),
+            ),
+            Err(CommitWithFinalizeFailure::NotAccepted(failure)) => {
+                let control = self.control.clone();
+                let id = self.id;
+                let key = self.ended.render_key();
+                let (error, rollback) = failure.rollback_with_commands(move |commands| {
+                    let mut fail_closed = FailClosedConstantSourceRollback::new(control);
+                    let mut commands = commands.into_vec().into_iter();
+                    let exact = matches!(
+                        (commands.next(), commands.next()),
+                        (Some(ControlMessage::InjectedConstantSource(value)), None)
+                            if value.id == id
+                                && value.key == key
+                                && constant_source_commands_match(value.command, command)
+                    );
+                    if exact {
+                        fail_closed.disarm();
+                    }
+                    exact
+                });
+                match rollback {
+                    RejectedControlRollback::Completed(true) => {
+                        Err(InjectedConstantSourceMutationError::Control(error))
+                    }
+                    RejectedControlRollback::Completed(false) => {
+                        Err(InjectedConstantSourceMutationError::ProtocolViolation)
+                    }
+                    RejectedControlRollback::Panicked => {
+                        Err(InjectedConstantSourceMutationError::RejectedPayloadPanicked)
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_runtime_commit_for_test(&self) {
+        self.runtime_behavior.store(1, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_next_runtime_finalizer_for_test(&self) {
+        self.runtime_behavior.store(2, Ordering::Release);
+    }
+}
+
+fn constant_source_commands_match(
+    left: InjectedConstantSourceCommandKind,
+    right: InjectedConstantSourceCommandKind,
+) -> bool {
+    match (left, right) {
+        (
+            InjectedConstantSourceCommandKind::Start(left),
+            InjectedConstantSourceCommandKind::Start(right),
+        )
+        | (
+            InjectedConstantSourceCommandKind::Stop(left),
+            InjectedConstantSourceCommandKind::Stop(right),
+        ) => left.to_bits() == right.to_bits(),
+        _ => false,
+    }
+}
+
+struct FailClosedConstantSourceRollback {
+    control: InjectedControlProducer,
+    armed: bool,
+}
+
+impl FailClosedConstantSourceRollback {
+    fn new(control: InjectedControlProducer) -> Self {
+        Self {
+            control,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailClosedConstantSourceRollback {
     fn drop(&mut self) {
         if self.armed {
             self.control.fail_closed_protocol();
@@ -1345,6 +1654,15 @@ impl InjectedNodeConstructor {
         lifetime: Option<AudioNodeLifetimeReservation>,
         control: Option<AudioControlBatchReservation>,
     ) -> Result<InjectedGainConstruction, InjectedGainConstructionError> {
+        self.try_begin_two_node_with_reservations(lifetime, control, InjectedTwoNodeKind::Gain)
+    }
+
+    fn try_begin_two_node_with_reservations(
+        &self,
+        lifetime: Option<AudioNodeLifetimeReservation>,
+        control: Option<AudioControlBatchReservation>,
+        node_kind: InjectedTwoNodeKind,
+    ) -> Result<InjectedGainConstruction, InjectedGainConstructionError> {
         // This admission must precede every ID, lifetime-slot, mirror, or payload mutation.
         let reservation = match control {
             Some(control) => self
@@ -1373,7 +1691,7 @@ impl InjectedNodeConstructor {
         let (gain, gain_connection) = self.register_endpoint(
             gain_id,
             InjectedConnectionEndpointKind::AudioNode,
-            1,
+            node_kind.node_inputs(),
             1,
             lifetime.clone(),
         )?;
@@ -1399,6 +1717,7 @@ impl InjectedNodeConstructor {
             param_connection,
             gain_id,
             param_id,
+            node_kind,
             param_serializer,
             #[cfg(test)]
             param_finalizer_hook,
@@ -1922,6 +2241,7 @@ pub(crate) struct InjectedGainConstruction {
     param_connection: InjectedConnectionEndpoint,
     gain_id: AudioNodeId,
     param_id: AudioNodeId,
+    node_kind: InjectedTwoNodeKind,
     param_serializer: Arc<Mutex<()>>,
     #[cfg(test)]
     param_finalizer_hook: Arc<Mutex<Option<AudioParamFinalizerHook>>>,
@@ -1934,6 +2254,159 @@ pub(crate) struct InjectedGainConstruction {
     #[cfg(test)]
     foreign_reclaim: Option<(usize, llq::Node<AudioNodeId>)>,
     reservation: Option<ControlBatchReservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedConstantSourceConstructionError {
+    Control(InjectedControlError),
+    NodeIds(ProvisionalNodeIdError),
+    Registration(NodeRegistrationError),
+    EventIdentityExhausted,
+    AcceptedFinalizer(AcceptedBatchFinalizeFailure),
+    RejectedPayloadPanicked,
+    ProtocolViolation,
+}
+
+impl From<InjectedGainConstructionError> for InjectedConstantSourceConstructionError {
+    fn from(error: InjectedGainConstructionError) -> Self {
+        match error {
+            InjectedGainConstructionError::Control(error) => Self::Control(error),
+            InjectedGainConstructionError::NodeIds(error) => Self::NodeIds(error),
+            InjectedGainConstructionError::Registration(error) => Self::Registration(error),
+            InjectedGainConstructionError::AcceptedFinalizer(error) => {
+                Self::AcceptedFinalizer(error)
+            }
+            InjectedGainConstructionError::RejectedPayloadPanicked => Self::RejectedPayloadPanicked,
+            InjectedGainConstructionError::ProtocolViolation => Self::ProtocolViolation,
+        }
+    }
+}
+
+pub(crate) struct InjectedConstantSourcePayload {
+    pub(crate) offset_processor: InjectedAudioParamProcessor,
+    pub(crate) source_processor: Box<dyn AudioProcessor>,
+    pub(crate) param_channel_config: ChannelConfigInner,
+    pub(crate) source_channel_config: ChannelConfigInner,
+    pub(crate) offset_initial_value: AudioParamInitialValue,
+}
+
+pub(crate) struct InjectedConstructedConstantSource {
+    pub(crate) source_id: AudioNodeId,
+    pub(crate) offset_id: AudioNodeId,
+    pub(crate) source_registration: InjectedNodeRegistration,
+    pub(crate) offset_registration: InjectedNodeRegistration,
+    pub(crate) source_connection: InjectedConnectionEndpoint,
+    pub(crate) offset_connection: InjectedConnectionEndpoint,
+    pub(crate) offset_mutation: InjectedAudioParamMutation,
+    pub(crate) source_control: InjectedConstantSourceControl,
+    pub(crate) outcome: CommitControlOutcome,
+}
+
+/// Distinct scheduled-source brand wrapping the proven two-node/four-command transaction.
+pub(crate) struct InjectedConstantSourceConstruction {
+    ended: InjectedExactEndedEventTarget,
+    serializer: Arc<Mutex<()>>,
+    has_start: Arc<AtomicBool>,
+    // The admitted two-node transaction is last so its reservation outlives every wrapper field
+    // during ordinary Drop or unwind.
+    inner: InjectedGainConstruction,
+}
+
+impl InjectedNodeConstructor {
+    pub(crate) fn try_begin_constant_source_with_reservations(
+        &self,
+        events: &crate::events::InjectedControlEventDispatch,
+        lifetime: Option<AudioNodeLifetimeReservation>,
+        control: Option<AudioControlBatchReservation>,
+    ) -> Result<InjectedConstantSourceConstruction, InjectedConstantSourceConstructionError> {
+        if !events.matches_gate(&self.admission_gate()) {
+            return Err(InjectedConstantSourceConstructionError::ProtocolViolation);
+        }
+        let inner = self
+            .try_begin_two_node_with_reservations(
+                lifetime,
+                control,
+                InjectedTwoNodeKind::ConstantSource,
+            )
+            .map_err(InjectedConstantSourceConstructionError::from)?;
+        let serializer = Arc::new(Mutex::new(()));
+        let has_start = Arc::new(AtomicBool::new(false));
+        let mint = InjectedScheduledSourceEventMint {
+            id: inner.gain_id,
+            lifetime: inner.gain.identity(),
+        };
+        let Some(ended) = InjectedExactEndedEventTarget::from_scheduled_source_mint(events, mint)
+        else {
+            self.fail_closed_protocol();
+            inner.ids.retain_unavailable();
+            return Err(InjectedConstantSourceConstructionError::EventIdentityExhausted);
+        };
+        Ok(InjectedConstantSourceConstruction {
+            ended,
+            serializer,
+            has_start,
+            inner,
+        })
+    }
+}
+
+impl InjectedConstantSourceConstruction {
+    pub(crate) const fn source_id(&self) -> AudioNodeId {
+        self.inner.gain_id
+    }
+
+    pub(crate) const fn offset_id(&self) -> AudioNodeId {
+        self.inner.param_id
+    }
+
+    pub(crate) fn completion_key(&self) -> ExactEndedEventKey {
+        self.ended.render_key()
+    }
+
+    pub(crate) fn commit(
+        self,
+        payload: InjectedConstantSourcePayload,
+    ) -> Result<InjectedConstructedConstantSource, InjectedConstantSourceConstructionError> {
+        let InjectedConstantSourcePayload {
+            offset_processor,
+            source_processor,
+            param_channel_config,
+            source_channel_config,
+            offset_initial_value,
+        } = payload;
+        let source_control = InjectedConstantSourceControl {
+            control: self.inner.control.clone(),
+            node_ids: self.inner.ids.identity(),
+            id: self.inner.gain_id,
+            lifetime: self.inner.gain.identity(),
+            ended: self.ended,
+            serializer: self.serializer,
+            has_start: self.has_start,
+            #[cfg(test)]
+            runtime_behavior: Arc::new(AtomicU8::new(0)),
+        };
+        let constructed = self
+            .inner
+            .commit(InjectedGainPayload {
+                param_processor: offset_processor,
+                gain_processor: source_processor,
+                param_channel_config,
+                gain_channel_config: source_channel_config,
+                initial_value: offset_initial_value,
+            })
+            .map_err(InjectedConstantSourceConstructionError::from)?;
+        Ok(InjectedConstructedConstantSource {
+            source_id: constructed.gain_id,
+            offset_id: constructed.param_id,
+            source_registration: constructed.gain_registration,
+            offset_registration: constructed.param_registration,
+            source_connection: constructed.gain_connection,
+            offset_connection: constructed.param_connection,
+            offset_mutation: constructed.param_mutation,
+            source_control,
+            outcome: constructed.outcome,
+        })
+    }
 }
 
 impl InjectedGainConstruction {
@@ -2043,7 +2516,7 @@ impl InjectedGainConstruction {
             id: self.gain_id,
             reclaim_id: gain_reclaim,
             node: gain_processor,
-            inputs: 1,
+            inputs: self.node_kind.node_inputs(),
             outputs: 1,
             channel_config: gain_channel_config,
         });
@@ -2118,6 +2591,7 @@ impl InjectedGainConstruction {
             param_connection,
             gain_id,
             param_id,
+            node_kind: _,
             param_serializer: _,
             #[cfg(test)]
                 param_finalizer_hook: _,
@@ -2169,6 +2643,7 @@ impl InjectedGainConstruction {
             param_connection: _,
             gain_id,
             param_id,
+            node_kind,
             param_serializer: _,
             #[cfg(test)]
                 param_finalizer_hook: _,
@@ -2183,7 +2658,7 @@ impl InjectedGainConstruction {
             reservation: _,
         } = self;
         let (control_error, rollback) = failure.rollback_with_commands(move |commands| {
-            let recovery = recover_gain_commands(commands, &mut ids, gain_id, param_id);
+            let recovery = recover_gain_commands(commands, &mut ids, gain_id, param_id, node_kind);
             if !recovery.exact {
                 gain.arm_token().quarantine_accepted();
                 param.arm_token().quarantine_accepted();
@@ -2233,6 +2708,7 @@ impl InjectedGainConstruction {
             param_connection: _,
             gain_id: _,
             param_id: _,
+            node_kind: _,
             param_serializer,
             #[cfg(test)]
             param_finalizer_hook,
@@ -2289,6 +2765,7 @@ fn recover_gain_commands(
     ids: &mut ProvisionalNodeIds,
     gain_id: AudioNodeId,
     param_id: AudioNodeId,
+    node_kind: InjectedTwoNodeKind,
 ) -> RejectedGainRecovery {
     let exact_len = commands.len() == GAIN_COMMAND_COUNT;
     let mut exact = exact_len;
@@ -2319,7 +2796,7 @@ fn recover_gain_commands(
                     }
                 } else if id == gain_id && !saw_gain {
                     saw_gain = true;
-                    exact &= index == 2 && inputs == 1 && outputs == 1;
+                    exact &= index == 2 && inputs == node_kind.node_inputs() && outputs == 1;
                     if *reclaim_id == gain_id {
                         Some(ids.restore_reclaim_node(GAIN_ID_INDEX, reclaim_id))
                     } else {
@@ -2380,16 +2857,14 @@ fn recover_gain_commands(
     exact &= saw_gain && saw_param;
 
     // Both exact reclaim nodes are restored before any processor or other command destructor.
-    let destructor_panicked = match panic::catch_unwind(AssertUnwindSafe(|| {
-        drop(other);
-        drop(processors);
-    })) {
-        Ok(()) => false,
-        Err(payload) => {
-            std::mem::forget(payload);
-            true
-        }
-    };
+    // Contain each destructor independently so two hostile payloads cannot double-panic abort.
+    let mut destructor_panicked = false;
+    while let Some(command) = other.pop() {
+        destructor_panicked |= catch_individual_payload_drop(command);
+    }
+    while let Some(processor) = processors.pop() {
+        destructor_panicked |= catch_individual_payload_drop(processor);
+    }
     RejectedGainRecovery {
         exact,
         destructor_panicked,

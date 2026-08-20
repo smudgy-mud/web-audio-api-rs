@@ -990,6 +990,23 @@ impl ConcreteBaseAudioContext {
         constructor.try_begin_audio_buffer_source_with_reservations(events, lifetime, control)
     }
 
+    pub(crate) fn try_begin_injected_constant_source_with_reservations(
+        &self,
+        lifetime: Option<super::AudioNodeLifetimeReservation>,
+        control: Option<super::AudioControlBatchReservation>,
+    ) -> Result<
+        super::InjectedConstantSourceConstruction,
+        super::InjectedConstantSourceConstructionError,
+    > {
+        let constructor = self
+            .injected_node_constructor()
+            .ok_or(super::InjectedConstantSourceConstructionError::ProtocolViolation)?;
+        let events = self
+            .injected_events()
+            .ok_or(super::InjectedConstantSourceConstructionError::ProtocolViolation)?;
+        constructor.try_begin_constant_source_with_reservations(events, lifetime, control)
+    }
+
     pub(crate) fn fail_closed_injected_protocol(&self) {
         if let Some(constructor) = self.injected_node_constructor() {
             constructor.fail_closed_protocol();

@@ -870,6 +870,16 @@ impl RenderThread {
                     self.fail_injected_render_protocol();
                 }
             }
+            InjectedConstantSource(value) => {
+                let mut message = value.into_render_message();
+                let routed = self
+                    .graph
+                    .as_mut()
+                    .is_some_and(|graph| graph.try_route_message(message.id(), &mut message));
+                if !routed || !message.was_applied() {
+                    self.fail_injected_render_protocol();
+                }
+            }
             InjectedAudioBufferSourceScalar(value) => {
                 let mut message = value.into_render_message();
                 let routed = self
