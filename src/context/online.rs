@@ -378,13 +378,36 @@ impl AudioContext {
         lifetime: AudioNodeLifetimeReservation,
         control: AudioControlBatchReservation,
     ) -> node::ConstantSourceNode {
+        self.create_constant_source_with_options_and_reservations(
+            node::ConstantSourceOptions::default(),
+            lifetime,
+            control,
+        )
+    }
+
+    /// Constructs a hosted `ConstantSourceNode` with caller-selected options and exact
+    /// graph/control reservations.
+    ///
+    /// The initial offset is part of the atomic four-command construction transaction. The
+    /// command reservation remains held through suspension, renderer application, and off-render
+    /// reclamation, while the graph reservation follows both exact nodes through physical reclaim.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a legacy context, an invalid offset, or rejected exact construction.
+    pub fn create_constant_source_with_options_and_reservations(
+        &self,
+        options: node::ConstantSourceOptions,
+        lifetime: AudioNodeLifetimeReservation,
+        control: AudioControlBatchReservation,
+    ) -> node::ConstantSourceNode {
         assert!(
             self.is_hosted(),
             "NotSupportedError - resource reservations require an exact hosted AudioContext"
         );
         node::ConstantSourceNode::new_injected_with_reservations(
             &self.base,
-            node::ConstantSourceOptions::default(),
+            options,
             Some(lifetime),
             Some(control),
         )
@@ -2030,12 +2053,14 @@ mod tests {
             0.01,
             AudioControlBatchReservation::new(DropProbe(Arc::clone(&stop_command_dropped))),
         );
-        let mut constant_source = context.create_constant_source_with_reservations(
+        let mut constant_source = context.create_constant_source_with_options_and_reservations(
+            node::ConstantSourceOptions { offset: 0.375 },
             AudioNodeLifetimeReservation::new(DropProbe(Arc::clone(&constant_source_dropped))),
             AudioControlBatchReservation::new(DropProbe(Arc::clone(
                 &constant_source_commands_dropped,
             ))),
         );
+        assert_eq!(constant_source.offset().value(), 0.375);
         constant_source.start_at_with_control_reservation(
             0.,
             AudioControlBatchReservation::new(DropProbe(Arc::clone(
