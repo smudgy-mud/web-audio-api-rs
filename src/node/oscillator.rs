@@ -425,7 +425,7 @@ impl OscillatorNode {
             1,
             1,
         );
-        let registration = AudioContextRegistration::from_injected_oscillator(
+        let registration = AudioContextRegistration::from_injected_scheduled_source(
             oscillator_id,
             context.clone(),
             constructed.oscillator_registration,

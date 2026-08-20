@@ -1017,6 +1017,13 @@ pub(crate) enum ControlMessage {
     /// Fixed, non-general exact oscillator start/stop/type command.
     InjectedOscillator(crate::context::InjectedOscillatorWireCommand),
 
+    /// Fixed, non-general exact BufferSource start/stop/loop command.
+    InjectedAudioBufferSourceScalar(crate::context::InjectedAudioBufferSourceScalarWireCommand),
+
+    /// Owned, preboxed exact BufferSource buffer command. The renderer always moves the inner
+    /// node to off-thread GC after routing or protocol failure.
+    InjectedAudioBufferSourceBuffer(crate::context::InjectedAudioBufferSourceBufferWireCommand),
+
     /// Request a diagnostic report of the audio graph
     #[cfg(feature = "diagnostics")]
     RunDiagnostics { backend: AudioBackendDiagnostics },

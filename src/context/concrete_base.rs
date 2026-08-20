@@ -19,8 +19,9 @@ use crate::context::injected_node_lifetime::{
 use crate::context::{
     AdmissionError, AudioContextRegistration, AudioContextState, AudioControlBatchReservation,
     AudioControlBatchReservationProvider, AudioExplicitConnectionReservationProvider, AudioNodeId,
-    BaseAudioContext, InjectedContextAdmissionGate, DESTINATION_NODE_ID, LISTENER_NODE_ID,
-    LISTENER_PARAM_IDS,
+    BaseAudioContext, InjectedAudioBufferSourceConstruction,
+    InjectedAudioBufferSourceConstructionError, InjectedContextAdmissionGate, DESTINATION_NODE_ID,
+    LISTENER_NODE_ID, LISTENER_PARAM_IDS,
 };
 use crate::events::{
     EventDispatch, EventHandler, EventLoop, EventType, InjectedControlEventDispatch,
@@ -972,6 +973,21 @@ impl ConcreteBaseAudioContext {
             .injected_events()
             .ok_or(InjectedOscillatorConstructionError::ProtocolViolation)?;
         constructor.try_begin_oscillator_with_reservations(events, initial_type, lifetime, control)
+    }
+
+    pub(crate) fn try_begin_injected_audio_buffer_source_with_reservations(
+        &self,
+        lifetime: Option<super::AudioNodeLifetimeReservation>,
+        control: Option<super::AudioControlBatchReservation>,
+    ) -> Result<InjectedAudioBufferSourceConstruction, InjectedAudioBufferSourceConstructionError>
+    {
+        let constructor = self
+            .injected_node_constructor()
+            .ok_or(InjectedAudioBufferSourceConstructionError::ProtocolViolation)?;
+        let events = self
+            .injected_events()
+            .ok_or(InjectedAudioBufferSourceConstructionError::ProtocolViolation)?;
+        constructor.try_begin_audio_buffer_source_with_reservations(events, lifetime, control)
     }
 
     pub(crate) fn fail_closed_injected_protocol(&self) {
