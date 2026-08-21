@@ -27,14 +27,20 @@ enum StartBehavior {
 pub(super) fn prepare(
     request: &AudioOutputRequest,
 ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
-    prepare_inner(request, StartBehavior::Normal)
+    prepare_inner(request, "none", StartBehavior::Normal)
+}
+
+pub(super) fn prepare_default(
+    request: &AudioOutputRequest,
+) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+    prepare_inner(request, "", StartBehavior::Normal)
 }
 
 #[cfg(test)]
 pub(super) fn prepare_with_start_failure_for_test(
     request: &AudioOutputRequest,
 ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
-    prepare_inner(request, StartBehavior::Fail)
+    prepare_inner(request, "none", StartBehavior::Fail)
 }
 
 #[cfg(test)]
@@ -44,6 +50,7 @@ pub(super) fn prepare_with_start_panic_for_test(
 ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
     prepare_inner(
         request,
+        "none",
         if after_response {
             StartBehavior::PanicAfterResponse
         } else {
@@ -54,6 +61,7 @@ pub(super) fn prepare_with_start_panic_for_test(
 
 fn prepare_inner(
     request: &AudioOutputRequest,
+    accepted_sink_id: &str,
     start_behavior: StartBehavior,
 ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
     let format = AudioRenderFormat::new(
@@ -61,7 +69,7 @@ fn prepare_inner(
         request.number_of_channels(),
         NONE_CALLBACK_FRAMES,
     )?;
-    let config = AudioOutputConfig::new(format, "none", 0.)?;
+    let config = AudioOutputConfig::new(format, accepted_sink_id, 0.)?;
     request.validate_config(&config)?;
 
     let (command_send, command_recv) = crossbeam_channel::bounded(1);
