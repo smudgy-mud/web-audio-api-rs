@@ -20,9 +20,9 @@ use std::thread::JoinHandle;
 use futures_channel::oneshot;
 
 use super::{
-    AudioOutputDeathReason, AudioOutputEndpointShutdown, AudioOutputError, AudioOutputErrorKind,
-    AudioOutputEventSink, AudioOutputFactory, AudioOutputRequest, AudioRenderCallback,
-    AudioRenderStatus, PreparedAudioOutput,
+    AudioOutputConfig, AudioOutputDeathReason, AudioOutputEndpointShutdown, AudioOutputError,
+    AudioOutputErrorKind, AudioOutputEventSink, AudioOutputFactory, AudioOutputRequest,
+    AudioRenderCallback, AudioRenderStatus, PreparedAudioOutput,
 };
 
 const BRIDGE_OPEN: u8 = 0;
@@ -126,6 +126,36 @@ impl SilentAudioOutput {
     pub const fn new() -> Self {
         Self
     }
+
+    /// Prepares silent failover with an already-negotiated logical configuration.
+    ///
+    /// This is intended for an embedder whose primary output factory negotiated a
+    /// context configuration but could not start its endpoint. The exact logical
+    /// render format and output-latency value are copied so the context contract
+    /// does not change during failover. They describe the prior negotiation and do
+    /// not claim that the silent endpoint is physical hardware.
+    ///
+    /// The accepted sink identity is deliberately not copied. An empty default
+    /// request remains empty and an explicit `"none"` request remains `"none"`;
+    /// named device requests are rejected. Explicit requested sample rates and
+    /// channel counts must match `negotiated`.
+    pub fn prepare_with_config(
+        &self,
+        request: &AudioOutputRequest,
+        negotiated: &AudioOutputConfig,
+    ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+        let accepted_sink_id = match request.sink_id() {
+            "" => "",
+            "none" => "none",
+            _ => return Err(unsupported_silent_sink()),
+        };
+        let config = AudioOutputConfig::new(
+            negotiated.format(),
+            accepted_sink_id,
+            negotiated.output_latency(),
+        )?;
+        none::prepare_with_config(request, config)
+    }
 }
 
 impl AudioOutputFactory for SilentAudioOutput {
@@ -136,12 +166,16 @@ impl AudioOutputFactory for SilentAudioOutput {
         match request.sink_id() {
             "" => none::prepare_default(request),
             "none" => none::prepare(request),
-            _ => Err(AudioOutputError::new(
-                AudioOutputErrorKind::NotSupported,
-                "emulated silent output supports only the default and none sinks",
-            )),
+            _ => Err(unsupported_silent_sink()),
         }
     }
+}
+
+fn unsupported_silent_sink() -> AudioOutputError {
+    AudioOutputError::new(
+        AudioOutputErrorKind::NotSupported,
+        "emulated silent output supports only the default and none sinks",
+    )
 }
 
 /// Strong callback ownership retained by the endpoint owner.
@@ -516,8 +550,7 @@ mod tests {
     };
     use crate::node::{AudioNode, AudioScheduledSourceNode};
     use crate::output::{
-        audio_render_test_pair, AudioOutputConfig, AudioOutputContextId, AudioRenderFormat,
-        EndpointShutdownConfirmed,
+        audio_render_test_pair, AudioOutputContextId, AudioRenderFormat, EndpointShutdownConfirmed,
     };
 
     fn request(channels: usize, sample_rate: Option<f32>) -> AudioOutputRequest {
@@ -693,6 +726,68 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), AudioOutputErrorKind::NotSupported);
+    }
+
+    #[test]
+    fn public_silent_factory_preserves_exact_negotiated_format_without_device_identity() {
+        let factory = SilentAudioOutput::new();
+        let format = AudioRenderFormat::new(44_100., 2, 441).unwrap();
+        let negotiated =
+            AudioOutputConfig::new(format, "negotiated-physical-device", 0.0125).unwrap();
+
+        for sink_id in ["", "none"] {
+            let requested_sample_rate = (sink_id == "none").then_some(44_100.);
+            let prepared = factory
+                .prepare_with_config(
+                    &request_for_sink(sink_id, 2, requested_sample_rate),
+                    &negotiated,
+                )
+                .unwrap();
+            assert_eq!(prepared.config().format(), format);
+            assert_eq!(prepared.config().accepted_sink_id(), sink_id);
+            assert_eq!(prepared.config().output_latency(), 0.0125);
+            executor::block_on(prepared.abort()).unwrap();
+        }
+        assert_eq!(negotiated.accepted_sink_id(), "negotiated-physical-device");
+
+        for request in [
+            request_for_sink("", 2, Some(48_000.)),
+            request_for_sink("", 1, None),
+            request_for_sink("device-123", 2, None),
+        ] {
+            let error = match factory.prepare_with_config(&request, &negotiated) {
+                Ok(_) => panic!("silent exact-config preparation accepted an invalid request"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), AudioOutputErrorKind::NotSupported);
+        }
+
+        let prepared = factory
+            .prepare_with_config(&request_for_sink("", 2, None), &negotiated)
+            .unwrap();
+        let (events, watcher) = AudioOutputEventSink::bounded(4);
+        let rendered_samples = Arc::new(AtomicUsize::new(0));
+        let observed_samples = Arc::clone(&rendered_samples);
+        let (owner, callback) = audio_render_test_pair(
+            format,
+            events.clone(),
+            move |output| {
+                observed_samples.store(output.len(), AtomicOrdering::Release);
+                output.fill(0.);
+            },
+            || Ok(()),
+        );
+        let running = prepared.start(callback, events).unwrap();
+        let started = std::time::Instant::now();
+        while rendered_samples.load(AtomicOrdering::Acquire) == 0 {
+            assert!(started.elapsed() < Duration::from_secs(1));
+            std::thread::yield_now();
+        }
+        assert_eq!(rendered_samples.load(AtomicOrdering::Acquire), 2 * 441);
+        owner.begin_shutdown();
+        executor::block_on(running.shutdown()).unwrap();
+        assert!(watcher.death_reason().is_none());
+        reclaim(owner);
     }
 
     #[test]
@@ -943,6 +1038,75 @@ mod tests {
         let close = context.request_close().unwrap();
         assert!(matches!(
             close.wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
+        assert_eq!(context.state(), AudioContextState::Closed);
+    }
+
+    #[test]
+    fn public_silent_exact_config_drives_negotiated_graph_cadence_and_lifecycle() {
+        #[derive(Clone)]
+        struct ExactSilentOutput {
+            config: AudioOutputConfig,
+        }
+
+        impl AudioOutputFactory for ExactSilentOutput {
+            fn prepare(
+                &self,
+                request: &AudioOutputRequest,
+            ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+                SilentAudioOutput::new().prepare_with_config(request, &self.config)
+            }
+        }
+
+        let callback_frames = 441_u16;
+        let sample_rate = 44_100_f32;
+        let render_quantum_period = f64::from(128_u16) / f64::from(sample_rate);
+        let output = ExactSilentOutput {
+            config: AudioOutputConfig::new(
+                AudioRenderFormat::new(sample_rate, 2, usize::from(callback_frames)).unwrap(),
+                "negotiated-physical-device",
+                0.0125,
+            )
+            .unwrap(),
+        };
+        let context = AudioContext::builder(Arc::new(output)).build().unwrap();
+        assert_eq!(context.sink_id(), "");
+        assert_eq!(context.sample_rate(), sample_rate);
+        assert_eq!(context.output_latency(), 0.0125);
+
+        let mut oscillator = context.create_oscillator();
+        oscillator.connect(&context.destination());
+        let ended = Arc::new(AtomicBool::new(false));
+        let ended_callback = Arc::clone(&ended);
+        oscillator.set_onended(move |_| {
+            ended_callback.store(true, AtomicOrdering::Release);
+        });
+        let scheduled_at = context.current_time();
+        oscillator.start();
+        oscillator.stop_at(scheduled_at + 0.025);
+        let started = std::time::Instant::now();
+        while !ended.load(AtomicOrdering::Acquire) {
+            assert!(started.elapsed() < Duration::from_secs(1));
+            std::thread::yield_now();
+        }
+        assert!(context.current_time() >= scheduled_at + 0.025);
+        let render_quantum_ticks = context.current_time() / render_quantum_period;
+        assert!(
+            (render_quantum_ticks - render_quantum_ticks.round()).abs() < 1e-6,
+            "current time {} did not follow the 44.1 kHz graph cadence",
+            context.current_time()
+        );
+
+        executor::block_on(context.suspend());
+        assert_eq!(context.state(), AudioContextState::Suspended);
+        let suspended_time = context.current_time();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(context.current_time(), suspended_time);
+        executor::block_on(context.resume());
+        assert_eq!(context.state(), AudioContextState::Running);
+        assert!(matches!(
+            context.request_close().unwrap().wait(),
             AudioContextShutdownOutcome::Confirmed(_)
         ));
         assert_eq!(context.state(), AudioContextState::Closed);
