@@ -27,7 +27,7 @@ use crate::{is_valid_sample_rate, MAX_CHANNELS};
 
 mod system;
 
-pub use system::SystemAudioOutput;
+pub use system::{SilentAudioOutput, SystemAudioOutput};
 
 /// Hard upper bound for frames supplied to one injected output callback invocation.
 pub const MAX_AUDIO_OUTPUT_CALLBACK_FRAMES: usize = 8192;

@@ -94,6 +94,56 @@ impl AudioOutputFactory for SystemAudioOutput {
     }
 }
 
+/// Embedder-selected emulated output for a context with no physical device.
+///
+/// Both the empty default sink request and the explicit `"none"` sink use the
+/// existing joinable silent endpoint. The accepted sink remains empty for a
+/// default request and `"none"` for an explicit no-output request; named device
+/// identifiers are rejected.
+/// This is not a fake device or a physical-output success claim.
+///
+/// Selecting this factory is an explicit embedder policy for unavailable
+/// physical output. It does not change [`SystemAudioOutput`],
+/// [`AudioContext::new`](crate::context::AudioContext::new), or
+/// [`AudioContext::default`](crate::context::AudioContext::default).
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use web_audio_api::context::AudioContext;
+/// use web_audio_api::output::SilentAudioOutput;
+///
+/// let context = AudioContext::builder(Arc::new(SilentAudioOutput::new())).build()?;
+/// assert_eq!(context.sink_id(), "");
+/// # context.close_sync();
+/// # Ok::<(), web_audio_api::context::AudioContextBuildError>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SilentAudioOutput;
+
+impl SilentAudioOutput {
+    /// Constructs a stateless emulated-output factory.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl AudioOutputFactory for SilentAudioOutput {
+    fn prepare(
+        &self,
+        request: &AudioOutputRequest,
+    ) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+        match request.sink_id() {
+            "" => none::prepare_default(request),
+            "none" => none::prepare(request),
+            _ => Err(AudioOutputError::new(
+                AudioOutputErrorKind::NotSupported,
+                "emulated silent output supports only the default and none sinks",
+            )),
+        }
+    }
+}
+
 /// Strong callback ownership retained by the endpoint owner.
 ///
 /// Backend callback closures receive only [`SystemRenderAccess`], which contains a `Weak`. A
@@ -471,9 +521,17 @@ mod tests {
     };
 
     fn request(channels: usize, sample_rate: Option<f32>) -> AudioOutputRequest {
+        request_for_sink("none", channels, sample_rate)
+    }
+
+    fn request_for_sink(
+        sink_id: &str,
+        channels: usize,
+        sample_rate: Option<f32>,
+    ) -> AudioOutputRequest {
         AudioOutputRequest::new(
             AudioOutputContextId::new(1).unwrap(),
-            "none",
+            sink_id,
             sample_rate,
             channels,
             AudioContextLatencyCategory::Interactive,
@@ -616,6 +674,25 @@ mod tests {
         executor::block_on(running.shutdown()).unwrap();
         assert!(watcher.death_reason().is_none());
         reclaim(owner);
+    }
+
+    #[test]
+    fn public_silent_factory_accepts_default_and_none_but_rejects_named_devices() {
+        let factory = SilentAudioOutput::new();
+        for sink_id in ["", "none"] {
+            let prepared = factory
+                .prepare(&request_for_sink(sink_id, 2, Some(44_100.)))
+                .unwrap();
+            assert_eq!(prepared.config().accepted_sink_id(), sink_id);
+            assert_eq!(prepared.config().format().sample_rate(), 44_100.);
+            executor::block_on(prepared.abort()).unwrap();
+        }
+
+        let error = match factory.prepare(&request_for_sink("device-123", 2, None)) {
+            Ok(_) => panic!("silent factory accepted a named physical device"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), AudioOutputErrorKind::NotSupported);
     }
 
     #[test]
@@ -824,6 +901,50 @@ mod tests {
         assert_eq!(context.current_time(), suspended_time);
         executor::block_on(context.resume());
         executor::block_on(context.close());
+        assert_eq!(context.state(), AudioContextState::Closed);
+    }
+
+    #[test]
+    fn public_silent_factory_drives_default_graph_time_and_joined_lifecycle() {
+        let context = AudioContext::builder(Arc::new(SilentAudioOutput::new()))
+            .build()
+            .expect("default emulated output must not synchronously reject construction");
+        assert_eq!(context.sink_id(), "");
+        assert_eq!(context.state(), AudioContextState::Running);
+
+        let gain = context.create_gain();
+        gain.gain().set_value(0.25);
+        let mut oscillator = context.create_oscillator();
+        oscillator.connect(&gain);
+        gain.connect(&context.destination());
+        let ended = Arc::new(AtomicBool::new(false));
+        let ended_callback = Arc::clone(&ended);
+        oscillator.set_onended(move |_| {
+            ended_callback.store(true, AtomicOrdering::Release);
+        });
+        oscillator.start();
+        oscillator.stop_at(context.current_time() + 0.02);
+
+        let started = std::time::Instant::now();
+        while !ended.load(AtomicOrdering::Acquire) {
+            assert!(started.elapsed() < Duration::from_secs(1));
+            std::thread::yield_now();
+        }
+        assert!(context.current_time() > 0.);
+
+        executor::block_on(context.suspend());
+        assert_eq!(context.state(), AudioContextState::Suspended);
+        let suspended_time = context.current_time();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(context.current_time(), suspended_time);
+        executor::block_on(context.resume());
+        assert_eq!(context.state(), AudioContextState::Running);
+
+        let close = context.request_close().unwrap();
+        assert!(matches!(
+            close.wait(),
+            AudioContextShutdownOutcome::Confirmed(_)
+        ));
         assert_eq!(context.state(), AudioContextState::Closed);
     }
 
