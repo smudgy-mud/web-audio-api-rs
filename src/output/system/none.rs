@@ -36,6 +36,13 @@ pub(super) fn prepare_default(
     prepare_inner(request, "", StartBehavior::Normal)
 }
 
+pub(super) fn prepare_with_config(
+    request: &AudioOutputRequest,
+    config: AudioOutputConfig,
+) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
+    prepare_config_inner(request, config, StartBehavior::Normal)
+}
+
 #[cfg(test)]
 pub(super) fn prepare_with_start_failure_for_test(
     request: &AudioOutputRequest,
@@ -70,6 +77,14 @@ fn prepare_inner(
         NONE_CALLBACK_FRAMES,
     )?;
     let config = AudioOutputConfig::new(format, accepted_sink_id, 0.)?;
+    prepare_config_inner(request, config, start_behavior)
+}
+
+fn prepare_config_inner(
+    request: &AudioOutputRequest,
+    config: AudioOutputConfig,
+    start_behavior: StartBehavior,
+) -> Result<Box<dyn PreparedAudioOutput>, AudioOutputError> {
     request.validate_config(&config)?;
 
     let (command_send, command_recv) = crossbeam_channel::bounded(1);
@@ -206,9 +221,12 @@ fn run_owner(
     }
 
     let channels = config.format().number_of_channels();
-    let mut output = vec![0.; NONE_CALLBACK_FRAMES * channels];
+    let callback_frames = config.format().max_frames_per_callback();
+    let mut output = vec![0.; callback_frames * channels];
+    let callback_frames =
+        u32::try_from(callback_frames).expect("validated callback frame bound must fit in u32");
     let callback_period = Duration::from_secs_f64(
-        f64::from(NONE_CALLBACK_FRAMES as u32) / f64::from(config.format().sample_rate()),
+        f64::from(callback_frames) / f64::from(config.format().sample_rate()),
     );
     if response.send(Ok(())).is_err() {
         return Ok(());
