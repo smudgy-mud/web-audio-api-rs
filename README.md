@@ -1,9 +1,46 @@
-# Rust Web Audio API
+# web-audio-api-rs — smudgy fork
 
-[![crates.io](https://img.shields.io/crates/v/web-audio-api.svg)](https://crates.io/crates/web-audio-api)
-[![docs.rs](https://img.shields.io/docsrs/web-audio-api)](https://docs.rs/web-audio-api)
+This is the [smudgy](https://github.com/smudgy-mud/smudgy) project's fork of
+[orottier/web-audio-api-rs](https://github.com/orottier/web-audio-api-rs), a
+pure-Rust implementation of the Web Audio API for non-browser contexts. The
+fork exists for one purpose: to serve as the DSP and rendering engine behind
+[`deno_audio`](https://github.com/smudgy-mud/deno_audio), a Web Audio extension
+for `deno_core`, which smudgy embeds to give sandboxed package scripts a
+budgeted audio API.
 
-A pure Rust implementation of the Web Audio API, for use in non-browser contexts
+> **Status: experimental, AI-authored.** The changes on the
+> `deno-audio-compat` branch (~57,000 lines over upstream v1.7.0) were written
+> primarily by AI coding agents working under human direction and review, to
+> satisfy `deno_audio`'s embedding contract. They carry substantial test
+> coverage but limited real-world exposure, and they are consumed only as a
+> pinned git revision of `deno_audio` — this fork is **not** published to
+> crates.io and is not supported for general use. If you just want the Web
+> Audio API in Rust, use the upstream
+> [`web-audio-api`](https://crates.io/crates/web-audio-api) crate.
+
+What the fork adds on top of upstream v1.7.0, briefly:
+
+- **Embedder-injected output**: an `AudioOutputFactory` contract (with
+  prepared/running output stages and acknowledged retirement) so a host
+  application — rather than this library — owns the physical device and can
+  mix many independent contexts into one stream it controls.
+- **A silent default output factory** that preserves the negotiated stream
+  format, so hosted contexts render deterministically with no audio device.
+- **Bounded resource accounting**: nodes, connections, control-command
+  batches, scheduled sources, and PCM storage take explicit
+  reservation/rollback leases, letting an embedder enforce per-isolate and
+  process-wide quotas on untrusted graphs.
+- **Joinable lifecycle**: render/event threads retire through acknowledged,
+  joinable barriers so an embedder can drain and replace whole runtime
+  generations deterministically.
+
+Branch layout: `main` tracks upstream releases unmodified; `deno-audio-compat`
+carries the fork and is the branch `deno_audio` pins.
+
+Everything below this line is the upstream project's README, kept for
+reference.
+
+---
 
 ## About the Web Audio API
 
