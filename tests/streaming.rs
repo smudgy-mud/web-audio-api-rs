@@ -212,6 +212,65 @@ fn hosted_eof_drains_final_partial_quantum_and_closed_admission_releases_guards(
 }
 
 #[test]
+fn abandoned_connected_paused_source_reclaims_without_context_close() {
+    for writer_first in [false, true] {
+        let context = AudioContext::builder(Arc::new(SilentAudioOutput::new()))
+            .build()
+            .unwrap();
+        let lease = Arc::new(());
+        let (node, mut writer) = PcmSourceNode::with_reservations(
+            &context,
+            Some(AudioNodeLifetimeReservation::new(Arc::clone(&lease))),
+            None,
+        )
+        .unwrap();
+        node.connect(&context.destination());
+        assert_eq!(
+            writer.write(&[[0.5; 2]; PCM_SOURCE_CAPACITY]),
+            PCM_SOURCE_CAPACITY
+        );
+        if writer_first {
+            drop(writer);
+            drop(node);
+        } else {
+            drop(node);
+            wait_for(|| writer.is_stopped());
+            assert_eq!(writer.write(&[[0.5; 2]]), 0);
+            assert_eq!(
+                Arc::strong_count(&lease),
+                2,
+                "writer retains queue accounting"
+            );
+            drop(writer);
+        }
+        wait_for(|| Arc::strong_count(&lease) == 1);
+        context.close_sync();
+    }
+}
+
+#[test]
+fn retained_connected_paused_source_can_start_after_rendering_silence() {
+    let context = AudioContext::builder(Arc::new(SilentAudioOutput::new()))
+        .build()
+        .unwrap();
+    let (node, mut writer) = PcmSourceNode::new(&context).unwrap();
+    node.connect(&context.destination());
+    assert_eq!(writer.write(&[[0.25; 2]; 129]), 129);
+    // Let several render quanta run while the paused source's handle is retained.
+    let deadline = context.current_time() + 0.05;
+    wait_for(|| context.current_time() >= deadline);
+    assert_eq!(node.rendered_frames(), 0);
+    assert!(!node.ended());
+    assert!(!writer.is_stopped());
+    drop(writer);
+    node.start();
+    wait_for(|| node.ended());
+    assert_eq!(node.rendered_frames(), 129);
+    assert_eq!(node.underrun_quanta(), 0);
+    context.close_sync();
+}
+
+#[test]
 fn existing_common_format_fixtures_decode_incrementally() {
     for path in [
         "sample.wav",

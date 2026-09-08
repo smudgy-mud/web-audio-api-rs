@@ -263,7 +263,9 @@ impl AudioProcessor for PcmSourceRenderer {
             return false;
         }
         if !self.state.started.load(Ordering::Acquire) {
-            return true;
+            // A paused source has no tail to keep alive after its control handle
+            // is dropped. The graph still retains it while the handle exists.
+            return false;
         }
         let mut frames = [[0.0; RENDER_QUANTUM_SIZE]; 2];
         let mut count = 0;
