@@ -247,7 +247,8 @@ impl fmt::Debug for AudioControlBatchReservationProvider {
     }
 }
 
-/// Shared only by the fixed set of lifetime cleanups created in one compound transaction.
+/// Shared by the lifetime cleanups created in one transaction and, for PCM sources,
+/// queue handles that may retain storage after physical graph reclamation.
 /// Keeping the payload behind a mutex permits a merely `Send` host guard to be retained by the
 /// `Arc` while cleanup records may move between lifecycle threads.
 #[derive(Clone)]

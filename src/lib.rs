@@ -66,7 +66,7 @@ mod message;
 mod decoding;
 pub use decoding::{
     BaseAudioContextDecodeBudgetExt, BudgetedDecodeError, DecodeBudget, DecodeBudgetError,
-    DecodeBudgetKind, DecodeBudgetRequest, DecodeBudgetReservation,
+    DecodeBudgetKind, DecodeBudgetRequest, DecodeBudgetReservation, MediaFileDecoder,
 };
 
 mod media_element;

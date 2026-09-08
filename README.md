@@ -42,6 +42,11 @@ The hosted-output stack has been rebased onto upstream commit
 which adds borrowed-reader decoding after v1.7.0. The crate version remains 1.7.0;
 consumers must use the exact fork revision recorded in their dependency manifest.
 
+The native streaming work adds a hosted `PcmSourceNode` and worker-side
+`MediaFileDecoder`. See [STREAMING.md](STREAMING.md) for the tested formats,
+resource/lifecycle contract, and remaining embedder work. These are Rust host
+building blocks; they do not by themselves enable a Smudgy scripting API.
+
 Everything below this line is the upstream project's README, kept for
 reference.
 

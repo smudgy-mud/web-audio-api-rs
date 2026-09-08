@@ -48,6 +48,8 @@ mod oscillator;
 pub use oscillator::*;
 mod panner;
 pub use panner::*;
+mod pcm_source;
+pub use pcm_source::*;
 mod script_processor;
 pub use script_processor::*;
 mod stereo_panner;

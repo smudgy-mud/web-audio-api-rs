@@ -24,6 +24,9 @@ use symphonia_common::xiph::audio::flac::StreamInfo;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
+mod streaming;
+pub use streaming::MediaFileDecoder;
+
 #[cfg(test)]
 thread_local! {
     static WRAPPER_PCM_ALLOCATION_COUNT: std::cell::Cell<usize> = const {
