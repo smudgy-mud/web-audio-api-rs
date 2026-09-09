@@ -37,6 +37,16 @@ What the fork adds on top of upstream v1.7.0, briefly:
 Branch layout: `main` tracks upstream releases unmodified; `deno-audio-compat`
 carries the fork and is the branch `deno_audio` pins.
 
+The hosted-output stack has been rebased onto upstream commit
+[`c01bb99712c1a68387d2898cfcbab55caf92d0b1`](https://github.com/orottier/web-audio-api-rs/commit/c01bb99712c1a68387d2898cfcbab55caf92d0b1),
+which adds borrowed-reader decoding after v1.7.0. The crate version remains 1.7.0;
+consumers must use the exact fork revision recorded in their dependency manifest.
+
+The native streaming work adds a hosted `PcmSourceNode` and worker-side
+`MediaFileDecoder`. See [STREAMING.md](STREAMING.md) for the tested formats,
+resource/lifecycle contract, and remaining embedder work. These are Rust host
+building blocks; they do not by themselves enable a Smudgy scripting API.
+
 Everything below this line is the upstream project's README, kept for
 reference.
 

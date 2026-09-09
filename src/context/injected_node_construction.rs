@@ -47,6 +47,8 @@ use crate::param::{
 use crate::render::AudioProcessor;
 use crate::PeriodicWave;
 
+mod pcm_source;
+
 const GAIN_COMMAND_COUNT: usize = 4;
 const GAIN_NODE_COUNT: usize = 2;
 const GAIN_ID_INDEX: usize = 0;

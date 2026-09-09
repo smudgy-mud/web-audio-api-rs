@@ -1,5 +1,10 @@
 # Version History
 
+## Unreleased
+
+- `decode_audio_data` and `decode_audio_data_sync` no longer require the reader to be `'static`,
+  so an audio source that borrows from the stack can be decoded
+
 ## Version 1.7.0 (2026-08-06)
 
 - Fix: Deduplicate connections between the same nodes

@@ -24,6 +24,9 @@ use symphonia_common::xiph::audio::flac::StreamInfo;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
+mod streaming;
+pub use streaming::MediaFileDecoder;
+
 #[cfg(test)]
 thread_local! {
     static WRAPPER_PCM_ALLOCATION_COUNT: std::cell::Cell<usize> = const {
@@ -1041,7 +1044,7 @@ impl BudgetedMediaDecoder {
     }
 }
 
-pub(crate) fn decode_media_data<R: std::io::Read + Send + Sync + 'static>(
+pub(crate) fn decode_media_data<R: std::io::Read + Send + Sync>(
     input: R,
     target_sample_rate: f32,
 ) -> Result<AudioBuffer, Box<dyn std::error::Error + Send + Sync>> {
@@ -1123,20 +1126,20 @@ impl<R: Read + Send + Sync> symphonia::core::io::MediaSource for MediaInput<R> {
 /// Media stream decoder (OGG, WAV, FLAC, ..)
 ///
 /// The current implementation supports Symphonia's audio formats and codecs.
-pub(crate) struct MediaDecoder {
-    format: Box<dyn FormatReader>,
+pub(crate) struct MediaDecoder<'a> {
+    format: Box<dyn FormatReader + 'a>,
     decoder: Box<dyn AudioDecoder>,
     track_index: usize,
     packet_count: usize,
 }
 
-impl MediaDecoder {
+impl<'a> MediaDecoder<'a> {
     /// Try to construct a new instance from a `Read` implementer
     ///
     /// # Errors
     ///
     /// This method returns an Error in various cases (IO, mime sniffing, decoding).
-    pub fn try_new<R: std::io::Read + Send + Sync + 'static>(
+    pub fn try_new<R: std::io::Read + Send + Sync + 'a>(
         input: R,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Symphonia lib needs a Box<dyn MediaSource> - use our own MediaInput
@@ -1217,7 +1220,7 @@ impl std::fmt::Display for UnsupportedAudioCodecError {
 
 impl std::error::Error for UnsupportedAudioCodecError {}
 
-impl Iterator for MediaDecoder {
+impl Iterator for MediaDecoder<'_> {
     type Item = Result<AudioBuffer, Box<dyn Error + Send + Sync>>;
 
     fn next(&mut self) -> Option<Self::Item> {

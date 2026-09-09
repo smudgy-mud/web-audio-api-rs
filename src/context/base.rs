@@ -92,7 +92,7 @@ pub trait BaseAudioContext {
     /// The following example shows how to use a thread pool for audio buffer decoding:
     ///
     /// `cargo run --release --example decode_multithreaded`
-    fn decode_audio_data_sync<R: std::io::Read + Send + Sync + 'static>(
+    fn decode_audio_data_sync<R: std::io::Read + Send + Sync>(
         &self,
         input: R,
     ) -> Result<AudioBuffer, Box<dyn std::error::Error + Send + Sync>> {
@@ -119,12 +119,11 @@ pub trait BaseAudioContext {
     /// This method returns an Error in various cases (IO, mime sniffing, decoding).
     // Use of `async fn` in public traits is discouraged as auto trait bounds cannot be specified,
     // hence we use `-> impl Future + ..` instead.
-    fn decode_audio_data<R: std::io::Read + Send + Sync + 'static>(
+    fn decode_audio_data<'a, R: std::io::Read + Send + Sync + 'a>(
         &self,
         input: R,
-    ) -> impl Future<Output = Result<AudioBuffer, Box<dyn std::error::Error + Send + Sync>>>
-           + Send
-           + 'static {
+    ) -> impl Future<Output = Result<AudioBuffer, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a
+    {
         let sample_rate = self.sample_rate();
         async move { decode_media_data(input, sample_rate) }
     }
@@ -425,6 +424,29 @@ mod tests {
         let file = std::fs::File::open("samples/sample.wav").unwrap();
         let future = context.decode_audio_data(file);
         require_send_sync_static(future);
+    }
+
+    #[test]
+    fn test_decode_audio_data_sync_borrowed_reader() {
+        // the reader may borrow from the stack - it is only read from during the call
+        let bytes = std::fs::read("samples/sample.wav").unwrap();
+        let context = OfflineAudioContext::new(1, 1, 44100.);
+        let audio_buffer = context.decode_audio_data_sync(&bytes[..]).unwrap();
+
+        assert_eq!(audio_buffer.length(), 142_187);
+        assert_eq!(audio_buffer.number_of_channels(), 2);
+    }
+
+    #[test]
+    fn test_decode_audio_data_borrowed_reader() {
+        use futures::executor;
+        // the future borrows `bytes`, so it is not `'static`, but it can still be awaited here
+        let bytes = std::fs::read("samples/sample.wav").unwrap();
+        let context = OfflineAudioContext::new(1, 1, 44100.);
+        let audio_buffer = executor::block_on(context.decode_audio_data(&bytes[..])).unwrap();
+
+        assert_eq!(audio_buffer.length(), 142_187);
+        assert_eq!(audio_buffer.number_of_channels(), 2);
     }
 
     #[test]
